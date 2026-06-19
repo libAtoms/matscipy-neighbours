@@ -253,21 +253,17 @@ __global__ void k_fill(DevCtx c, index_t nat, const int *offset, int *first,
 template <typename T>
 using DBuf = Array<T, CudaSpace>;
 
-}  // namespace
-
-error_t neighbour_list_gpu(int quantities, const real_t cell_origin[3],
+/* Shared kernel pipeline. Runs the whole build and leaves the requested output
+   quantities in `dev` (device memory). Both public entry points wrap this. */
+static error_t build_device(int quantities, const real_t cell_origin[3],
                             const real_t cell[9], const real_t inv_cell[9],
                             const bool pbc[3], index_t nat, const real_t *r,
-                            real_t cutoff, const real_t *per_atom_cutoff,
+                            bool r_is_device, real_t cutoff,
+                            const real_t *per_atom_cutoff,
                             const real_t *per_type_cutoff_sq, index_t ncutoffs,
-                            const index_t *types, NeighbourList &out) {
+                            const index_t *types, NeighbourListDevice &dev) {
     clear_error();
-    out.first.clear();
-    out.secnd.clear();
-    out.distvec.clear();
-    out.absdist.clear();
-    out.shift.clear();
-    out.npairs = 0;
+    dev.npairs = 0;
     if (nat <= 0) return NL_SUCCESS;
 
     /* Geometry: identical to the CPU path. */
@@ -292,19 +288,29 @@ error_t neighbour_list_gpu(int quantities, const real_t cell_origin[3],
     const index_t ncells = static_cast<index_t>(n1) * n2 * n3;
     const int g_at = grid_for(nat);
 
-    /* Upload geometry + positions. */
-    DBuf<real_t> d_origin(3), d_inv(9), d_r(3 * nat);
+    /* Upload geometry (always tiny host arrays). Positions are either uploaded
+       (host input) or used in place (already-on-device input, e.g. cupy) — the
+       latter avoids the input H2D round-trip for a device-native caller. */
+    DBuf<real_t> d_origin(3), d_inv(9);
     GPU_CHECK(gpuMemcpy(d_origin.data(), cell_origin, 3 * sizeof(real_t),
                         gpuMemcpyHostToDevice));
     GPU_CHECK(gpuMemcpy(d_inv.data(), inv_cell, 9 * sizeof(real_t),
                         gpuMemcpyHostToDevice));
-    GPU_CHECK(gpuMemcpy(d_r.data(), r, 3 * nat * sizeof(real_t),
-                        gpuMemcpyHostToDevice));
+    DBuf<real_t> d_r_owned;
+    const real_t *d_r;
+    if (r_is_device) {
+        d_r = r;
+    } else {
+        d_r_owned.resize(3 * nat);
+        GPU_CHECK(gpuMemcpy(d_r_owned.data(), r, 3 * nat * sizeof(real_t),
+                            gpuMemcpyHostToDevice));
+        d_r = d_r_owned.data();
+    }
 
     /* 1. raw (unwrapped) cell index per atom. */
     DBuf<int> d_raw(3 * nat);
-    GPU_LAUNCH(k_cell_index, g_at, BLOCK, d_origin.data(), d_inv.data(),
-               d_r.data(), n1, n2, n3, nat, d_raw.data());
+    GPU_LAUNCH(k_cell_index, g_at, BLOCK, d_origin.data(), d_inv.data(), d_r,
+               n1, n2, n3, nat, d_raw.data());
 
     /* 2. fold -> linear cell + histogram, scan to CSR first index, scatter. */
     DBuf<int> d_lin(nat), d_cell_count(ncells), d_cell_first(ncells);
@@ -337,7 +343,7 @@ error_t neighbour_list_gpu(int quantities, const real_t cell_origin[3],
         GPU_CHECK(gpuMemcpy(d_pt_sq.data(), per_type_cutoff_sq,
                             ncutoffs * ncutoffs * sizeof(real_t),
                             gpuMemcpyHostToDevice));
-    GPU_LAUNCH(k_gather, g_at, BLOCK, d_sorted.data(), d_raw.data(), d_r.data(),
+    GPU_LAUNCH(k_gather, g_at, BLOCK, d_sorted.data(), d_raw.data(), d_r,
                pbc[0], pbc[1], pbc[2], n1, n2, n3, bin1[0], bin1[1], bin1[2],
                bin2[0], bin2[1], bin2[2], bin3[0], bin3[1], bin3[2],
                per_atom_cutoff ? d_per_atom.data() : nullptr,
@@ -375,50 +381,84 @@ error_t neighbour_list_gpu(int quantities, const real_t cell_origin[3],
 
     /* 5. scan counts -> per-atom write offset; total pairs. */
     index_t npairs = device_exclusive_scan(d_cnt.data(), d_offset.data(), nat + 1);
-    out.npairs = npairs;
+    dev.npairs = npairs;
     if (npairs == 0) return NL_SUCCESS;
 
-    /* 6. allocate exact-size outputs, pass 2: fill. */
+    /* 6. allocate exact-size outputs into `dev`, pass 2: fill. The output
+          buffers stay on the device; the caller decides whether to copy back. */
     const bool wf = quantities & QUANTITY_FIRST;
     const bool ws = quantities & QUANTITY_SECOND;
     const bool wD = quantities & QUANTITY_DISTVEC;
     const bool wd = quantities & QUANTITY_ABSDIST;
     const bool wS = quantities & QUANTITY_SHIFT;
-    DBuf<int> d_first(wf ? npairs : 0), d_secnd(ws ? npairs : 0),
-        d_shift(wS ? 3 * npairs : 0);
-    DBuf<real_t> d_distvec(wD ? 3 * npairs : 0), d_absdist(wd ? npairs : 0);
+    if (wf) dev.first.resize(npairs);
+    if (ws) dev.secnd.resize(npairs);
+    if (wD) dev.distvec.resize(3 * npairs);
+    if (wd) dev.absdist.resize(npairs);
+    if (wS) dev.shift.resize(3 * npairs);
     GPU_LAUNCH(k_fill, g_at, BLOCK, ctx, nat, d_offset.data(),
-               wf ? d_first.data() : nullptr, ws ? d_secnd.data() : nullptr,
-               wD ? d_distvec.data() : nullptr, wd ? d_absdist.data() : nullptr,
-               wS ? d_shift.data() : nullptr);
+               wf ? dev.first.data() : nullptr, ws ? dev.secnd.data() : nullptr,
+               wD ? dev.distvec.data() : nullptr,
+               wd ? dev.absdist.data() : nullptr,
+               wS ? dev.shift.data() : nullptr);
     GPU_CHECK(gpuDeviceSynchronize());
+    return NL_SUCCESS;
+}
 
-    /* Copy requested outputs back to the host result. */
-    if (wf) {
-        out.first.resize(npairs);
-        GPU_CHECK(gpuMemcpy(out.first.data(), d_first.data(),
-                            npairs * sizeof(int), gpuMemcpyDeviceToHost));
-    }
-    if (ws) {
-        out.secnd.resize(npairs);
-        GPU_CHECK(gpuMemcpy(out.secnd.data(), d_secnd.data(),
-                            npairs * sizeof(int), gpuMemcpyDeviceToHost));
-    }
-    if (wD) {
-        out.distvec.resize(3 * npairs);
-        GPU_CHECK(gpuMemcpy(out.distvec.data(), d_distvec.data(),
-                            3 * npairs * sizeof(real_t), gpuMemcpyDeviceToHost));
-    }
-    if (wd) {
-        out.absdist.resize(npairs);
-        GPU_CHECK(gpuMemcpy(out.absdist.data(), d_absdist.data(),
-                            npairs * sizeof(real_t), gpuMemcpyDeviceToHost));
-    }
-    if (wS) {
-        out.shift.resize(3 * npairs);
-        GPU_CHECK(gpuMemcpy(out.shift.data(), d_shift.data(),
-                            3 * npairs * sizeof(int), gpuMemcpyDeviceToHost));
-    }
+}  // namespace
+
+error_t neighbour_list_gpu_device(int quantities, const real_t cell_origin[3],
+                                  const real_t cell[9], const real_t inv_cell[9],
+                                  const bool pbc[3], index_t nat, const real_t *r,
+                                  bool r_is_device, real_t cutoff,
+                                  const real_t *per_atom_cutoff,
+                                  const real_t *per_type_cutoff_sq,
+                                  index_t ncutoffs, const index_t *types,
+                                  NeighbourListDevice &out) {
+    return build_device(quantities, cell_origin, cell, inv_cell, pbc, nat, r,
+                        r_is_device, cutoff, per_atom_cutoff, per_type_cutoff_sq,
+                        ncutoffs, types, out);
+}
+
+error_t neighbour_list_gpu(int quantities, const real_t cell_origin[3],
+                           const real_t cell[9], const real_t inv_cell[9],
+                           const bool pbc[3], index_t nat, const real_t *r,
+                           real_t cutoff, const real_t *per_atom_cutoff,
+                           const real_t *per_type_cutoff_sq, index_t ncutoffs,
+                           const index_t *types, NeighbourList &out) {
+    out.first.clear();
+    out.secnd.clear();
+    out.distvec.clear();
+    out.absdist.clear();
+    out.shift.clear();
+    out.npairs = 0;
+
+    NeighbourListDevice dev;
+    error_t e = build_device(quantities, cell_origin, cell, inv_cell, pbc, nat, r,
+                             /*r_is_device=*/false, cutoff, per_atom_cutoff,
+                             per_type_cutoff_sq, ncutoffs, types, dev);
+    if (e != NL_SUCCESS) return e;
+    out.npairs = dev.npairs;
+    if (dev.npairs == 0) return NL_SUCCESS;
+
+    /* D2H the requested quantities (presence inferred from buffer size). */
+    auto d2h_i = [](std::vector<index_t> &h, const Array<index_t, CudaSpace> &d) {
+        if (d.size() == 0) return;
+        h.resize(d.size());
+        GPU_CHECK(gpuMemcpy(h.data(), d.data(), d.size() * sizeof(index_t),
+                            gpuMemcpyDeviceToHost));
+    };
+    auto d2h_r = [](std::vector<real_t> &h, const Array<real_t, CudaSpace> &d) {
+        if (d.size() == 0) return;
+        h.resize(d.size());
+        GPU_CHECK(gpuMemcpy(h.data(), d.data(), d.size() * sizeof(real_t),
+                            gpuMemcpyDeviceToHost));
+    };
+    d2h_i(out.first, dev.first);
+    d2h_i(out.secnd, dev.secnd);
+    d2h_r(out.distvec, dev.distvec);
+    d2h_r(out.absdist, dev.absdist);
+    d2h_i(out.shift, dev.shift);
     return NL_SUCCESS;
 }
 

@@ -5,6 +5,7 @@
 # The extension mixes C (module.c) and C++ (bind_py_neighbours.cc + the core).
 Python_add_library(_matscipy_neighbours MODULE
     bind_py_neighbours.cc
+    bind_py_dlpack.cc
     module.c
 )
 

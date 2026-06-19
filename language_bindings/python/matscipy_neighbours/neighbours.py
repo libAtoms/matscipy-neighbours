@@ -61,6 +61,75 @@ def mic(dr, cell, pbc=None):
     return dr - offset @ cell
 
 
+class _DLPackArray:
+    """Adapt a raw DLPack capsule from the C-extension to the ``from_dlpack``
+    protocol. ``numpy``/``cupy`` ``from_dlpack`` call these two methods, then
+    take ownership of the capsule (zero-copy)."""
+
+    def __init__(self, capsule, device):
+        self._capsule = capsule
+        self._device = device  # (DLDeviceType, device_id)
+
+    def __dlpack__(self, *args, **kwargs):
+        return self._capsule
+
+    def __dlpack_device__(self):
+        return self._device
+
+
+def _is_on_device(x):
+    """True if ``x`` is a GPU array (e.g. cupy) — detected without importing
+    cupy, via the CUDA Array Interface."""
+    return hasattr(x, "__cuda_array_interface__") and not isinstance(x, np.ndarray)
+
+
+def _neighbour_list_device(quantities, positions, cutoff, *, cell, pbc,
+                           numbers, cell_origin):
+    """GPU path: positions stay on the device, results come back as cupy arrays
+    via DLPack (no host round-trip)."""
+    if not getattr(_ext, "_has_gpu", 0):
+        raise RuntimeError(
+            "Device (GPU) positions were given, but the _matscipy_neighbours "
+            "extension was built without a GPU backend (-DENABLE_CUDA=ON).")
+    import cupy as cp
+
+    positions = cp.ascontiguousarray(positions, dtype=cp.float64)
+    nat = int(positions.shape[0])
+    device_ptr = int(positions.data.ptr)
+    device_id = int(positions.device.id)
+
+    if cell is None:
+        rmin = cp.asnumpy(positions.min(axis=0))
+        rmax = cp.asnumpy(positions.max(axis=0))
+        cell_origin = rmin if cell_origin is None else cell_origin
+        cell = np.diag(rmax - rmin)
+    if cell_origin is None:
+        cell_origin = np.zeros(3)
+    if pbc is None:
+        pbc = np.zeros(3, dtype=bool)
+    if numbers is None:
+        numbers = np.ones(nat, dtype=np.int32)
+
+    # All metadata is tiny and lives on the host.
+    cell = np.ascontiguousarray(np.asarray(cell, dtype=float))
+    cell_origin = np.ascontiguousarray(np.asarray(cell_origin, dtype=float))
+    pbc = np.ascontiguousarray(np.broadcast_to(pbc, (3,)), dtype=bool)
+    numbers = np.ascontiguousarray(np.asarray(numbers), dtype=np.int32)
+    resolved_cutoff, numbers = _resolve_cutoff(cutoff, numbers)
+    inv_cell = np.ascontiguousarray(np.linalg.inv(cell.T))
+
+    # The extension reads positions from the device pointer; the host positions
+    # argument is an unused placeholder (nat is passed explicitly).
+    placeholder = np.empty((0, 3), dtype=float)
+    capsules = _ext.neighbour_list_dlpack(
+        quantities, cell_origin, cell, inv_cell, pbc, placeholder,
+        resolved_cutoff, numbers, 1, device_ptr, nat)
+
+    dev = (2, device_id)  # kDLCUDA
+    arrays = tuple(cp.from_dlpack(_DLPackArray(c, dev)) for c in capsules)
+    return arrays[0] if len(quantities) == 1 else arrays
+
+
 def _resolve_cutoff(cutoff, numbers):
     """Turn a scalar / per-atom array / element-pair dict into a value the
     C-extension understands, plus the per-atom type array to pass along."""
@@ -107,6 +176,16 @@ def neighbour_list(quantities, atoms=None, cutoff=None, *, positions=None,
     """
     if cutoff is None:
         raise ValueError("Please provide a value for the cutoff radius.")
+
+    # GPU path: if positions live on the device (e.g. a cupy array), run the
+    # GPU backend and return device arrays without a host round-trip.
+    if positions is not None and _is_on_device(positions):
+        if atoms is not None:
+            raise ValueError("Cannot combine an ASE Atoms object with device "
+                             "positions.")
+        return _neighbour_list_device(quantities, positions, cutoff, cell=cell,
+                                      pbc=pbc, numbers=numbers,
+                                      cell_origin=cell_origin)
 
     if atoms is not None:
         if positions is not None or cell is not None or pbc is not None or \

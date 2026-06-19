@@ -67,6 +67,15 @@ void copy_cuda(void *dst, DeviceType dst_dev, const void *src,
                DeviceType src_dev, std::size_t bytes);
 #endif
 
+}  // namespace detail
+
+#if defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP)
+/* Id of the currently-active GPU device (for the DLPack device tuple). */
+int current_device_id();
+#endif
+
+namespace detail {
+
 #ifdef MATSCIPY_ENABLE_HIP
 void *alloc_hip(std::size_t bytes);
 void free_hip(void *ptr);

@@ -38,4 +38,11 @@ void copy_cuda(void *dst, DeviceType dst_dev, const void *src,
 }
 
 }  // namespace detail
+
+int current_device_id() {
+    int dev = 0;
+    GPU_CHECK(gpuGetDevice(&dev));
+    return dev;
+}
+
 }  // namespace matscipy

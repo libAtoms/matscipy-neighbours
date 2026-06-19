@@ -34,6 +34,7 @@
 #include <stddef.h>
 
 #include "bind_py_neighbours.hh"
+#include "bind_py_dlpack.hh"
 
 #include "module.h"
 
@@ -44,6 +45,10 @@
 static PyMethodDef module_methods[] = {
     { "neighbour_list", (PyCFunction) py_neighbour_list, METH_VARARGS,
       "Compute a neighbour list for an atomic configuration." },
+    { "neighbour_list_dlpack", (PyCFunction) py_neighbour_list_dlpack,
+      METH_VARARGS,
+      "Compute a neighbour list, returning each quantity as a DLPack capsule "
+      "(zero-copy; CPU host or CUDA device)." },
     { "first_neighbours", (PyCFunction) py_first_neighbours, METH_VARARGS,
       "Compute indices of first neighbours in neighbour list array." },
     { "triplet_list", (PyCFunction) py_triplet_list, METH_VARARGS,
@@ -86,6 +91,14 @@ MOD_INIT(_matscipy_neighbours)
 
     MOD_DEF(m, "_matscipy_neighbours", module_methods,
             "Neigbour list for particle simulations.");
+
+    /* Whether this build has the GPU (CUDA/HIP) backend compiled in. The macro
+       is inherited from the `neighbours` core target's interface definitions. */
+#if defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP)
+    PyModule_AddIntConstant(m, "_has_gpu", 1);
+#else
+    PyModule_AddIntConstant(m, "_has_gpu", 0);
+#endif
 
 #if PY_MAJOR_VERSION >= 3
     return m;
