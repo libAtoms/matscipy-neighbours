@@ -120,6 +120,45 @@ TEST(NeighbourList, DistanceVectorAndShiftAreConsistent) {
     }
 }
 
+TEST(NeighbourList, TypedViewsMatchBuffers) {
+    const real_t cell[9] = {2, 0, 0, 0, 2, 0, 0, 0, 2};
+    const real_t inv[9] = {0.5, 0, 0, 0, 0.5, 0, 0, 0, 0.5};
+    const bool pbc[3] = {true, true, true};
+    std::vector<real_t> r;
+    for (int x = 0; x < 2; x++)
+        for (int y = 0; y < 2; y++)
+            for (int z = 0; z < 2; z++) {
+                r.push_back(0.5 + x);
+                r.push_back(0.5 + y);
+                r.push_back(0.5 + z);
+            }
+    NeighbourList nl;
+    ASSERT_EQ(neighbour_list(QUANTITY_FIRST | QUANTITY_SECOND | QUANTITY_DISTVEC |
+                                 QUANTITY_SHIFT,
+                             kOrigin, cell, inv, pbc, 8, r.data(), 1.1, nullptr,
+                             nullptr, 0, nullptr, nl),
+              NL_SUCCESS);
+
+    // Span views alias the underlying buffers (no copy).
+    auto fi = nl.first_view();
+    ASSERT_EQ(fi.size(), (std::size_t)nl.npairs);
+    EXPECT_EQ(fi.data(), nl.first.data());
+    for (index_t p = 0; p < nl.npairs; p++) EXPECT_EQ(fi[p], nl.first[p]);
+
+    // 3-vector accessors read one pair's distance vector / shift.
+    for (index_t p = 0; p < nl.npairs; p++) {
+        auto D = nl.distvec_at(p);
+        EXPECT_EQ(D.x, nl.distvec[3 * p + 0]);
+        EXPECT_EQ(D.y, nl.distvec[3 * p + 1]);
+        EXPECT_EQ(D.z, nl.distvec[3 * p + 2]);
+        auto S = nl.shift_at(p);
+        EXPECT_EQ(S.x, nl.shift[3 * p + 0]);
+        EXPECT_EQ(S.z, nl.shift[3 * p + 2]);
+    }
+    // An unrequested quantity has an empty view.
+    EXPECT_TRUE(nl.absdist_view().empty());
+}
+
 TEST(NeighbourList, PerTypeCutoffs) {
     const real_t cell[9] = {10, 0, 0, 0, 10, 0, 0, 0, 10};
     const real_t inv[9] = {0.1, 0, 0, 0, 0.1, 0, 0, 0, 0.1};

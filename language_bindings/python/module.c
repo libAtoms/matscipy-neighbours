@@ -97,10 +97,15 @@ MOD_INIT(_matscipy_neighbours)
 
     /* Whether this build has the GPU (CUDA/HIP) backend compiled in. The macro
        is inherited from the `neighbours` core target's interface definitions. */
-#if defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP)
+#if defined(MATSCIPY_ENABLE_CUDA)
     PyModule_AddIntConstant(m, "_has_gpu", 1);
+    PyModule_AddIntConstant(m, "_device_type", 2);   /* kDLCUDA */
+#elif defined(MATSCIPY_ENABLE_HIP)
+    PyModule_AddIntConstant(m, "_has_gpu", 1);
+    PyModule_AddIntConstant(m, "_device_type", 10);  /* kDLROCm */
 #else
     PyModule_AddIntConstant(m, "_has_gpu", 0);
+    PyModule_AddIntConstant(m, "_device_type", 1);   /* kDLCPU */
 #endif
 
 #if PY_MAJOR_VERSION >= 3

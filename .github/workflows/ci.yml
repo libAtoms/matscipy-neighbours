@@ -28,7 +28,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install Python dependencies
-        run: python -m pip install --upgrade pip numpy pytest ase
+        # jax[cpu] is installed so the DLPack cross-framework test
+        # (test_host_jax_namespace) actually runs rather than being skipped.
+        run: python -m pip install --upgrade pip numpy pytest ase "jax[cpu]"
 
       - name: Configure
         run: >
@@ -57,7 +59,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install numpy pytest pytest-cov ase gcovr
+          python -m pip install numpy pytest pytest-cov ase gcovr "jax[cpu]"
 
       - name: Configure (with coverage)
         run: >

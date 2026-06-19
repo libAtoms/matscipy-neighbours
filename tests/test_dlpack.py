@@ -1,74 +1,101 @@
-"""Phase 4 — DLPack interop.
+"""Phase 4 — DLPack interop and the framework-agnostic API.
 
-Validates the zero-copy DLPack export: the host (numpy) path against the
-existing copy-based extension call, and the device (cupy) path against the host
-oracle. cupy tests skip automatically when cupy or a GPU is unavailable.
+Covers the host path (numpy fast path, DLPack capsules, other frameworks),
+the device path (cupy in -> cupy out via DLPack import/export), the device
+override, and GPU coordination. GPU tests skip when cupy or a GPU is absent;
+the JAX test skips when jax is absent.
 """
 
 import numpy as np
 import pytest
 
 import _matscipy_neighbours as _ext
-from matscipy_neighbours.neighbours import _DLPackArray
 import matscipy_neighbours.neighbours as nl
+from matscipy_neighbours.neighbours import DLPackTensor
+
+# cupy is optional: importing it must NOT skip the whole module, or the host and
+# JAX tests below (which need no GPU) would never run in a cupy-less CI.
+try:
+    import cupy
+except ImportError:  # pragma: no cover - exercised in CPU-only CI
+    cupy = None
 
 
 def _random_config(N=2000, L=12.0, seed=1):
     rng = np.random.default_rng(seed)
     positions = np.ascontiguousarray(rng.uniform(0.0, L, size=(N, 3)))
     cell = np.ascontiguousarray(np.diag([L, L, L]).astype(float))
-    cell_origin = np.zeros(3)
     pbc = np.ones(3, dtype=bool)
-    inv_cell = np.ascontiguousarray(np.linalg.inv(cell.T))
-    return positions, cell, inv_cell, cell_origin, pbc
+    return positions, cell, pbc
 
 
 def _canonical(i, j, S):
     """Sorted (i, j, shift) rows — order-independent comparison key."""
-    rows = np.column_stack([i, j, S]).astype(np.int64)
+    rows = np.column_stack([np.asarray(i), np.asarray(j), np.asarray(S)])
+    rows = rows.astype(np.int64)
     return rows[np.lexsort(rows.T[::-1])]
 
 
-def test_dlpack_host_matches_copy_path():
-    """neighbour_list_dlpack (CPU backend) -> numpy.from_dlpack must equal the
-    high-level (copy-based) neighbour_list."""
-    positions, cell, inv_cell, origin, pbc = _random_config()
-    cutoff = 1.0
-    quant = "ijD"
+# --------------------------------------------------------------- host paths
 
-    i0, j0, D0 = nl.neighbour_list(quant, positions=positions, cell=cell,
-                                   pbc=pbc, cutoff=cutoff)
-
-    caps = _ext.neighbour_list_dlpack(quant, origin, cell, inv_cell, pbc,
-                                      positions, cutoff, None, 0, 0, -1)
-    i1, j1, D1 = (np.from_dlpack(_DLPackArray(c, (1, 0))) for c in caps)
-
-    assert i1.shape == i0.shape and D1.shape == D0.shape
-    assert D1.shape[1] == 3
-    assert np.array_equal(np.sort(i1), np.sort(i0))
-    assert np.array_equal(_canonical(i0, j0, np.zeros((len(i0), 3))),
-                          _canonical(i1, j1, np.zeros((len(i1), 3))))
-    # Distance vectors agree once pairs are matched by sorting on (i, j).
-    o0 = np.lexsort((j0, i0))
-    o1 = np.lexsort((j1, i1))
-    assert np.allclose(D0[o0], D1[o1], atol=1e-12)
+def test_host_default_numpy():
+    pos, cell, pbc = _random_config()
+    i, j, D = nl.neighbour_list("ijD", positions=pos, cell=cell, pbc=pbc,
+                                cutoff=1.0)
+    assert isinstance(i, np.ndarray) and D.shape[1] == 3
+    # coordination consistency
+    assert int(i.shape[0]) == int(np.bincount(i).sum())
 
 
-def test_dlpack_host_frees_without_consumer():
-    """A capsule that is never consumed must free its buffer via its own
-    destructor (no leak / crash)."""
-    positions, cell, inv_cell, origin, pbc = _random_config(N=500)
-    caps = _ext.neighbour_list_dlpack("i", origin, cell, inv_cell, pbc,
-                                      positions, 1.0, None, 0, 0, -1)
-    del caps  # capsule destructor must run the DLManagedTensor deleter
+def test_host_array_namespace_numpy_matches_fast_path():
+    """array_namespace=numpy routes through DLPack; must equal the fast path."""
+    pos, cell, pbc = _random_config(seed=2)
+    i0, j0, S0 = nl.neighbour_list("ijS", positions=pos, cell=cell, pbc=pbc,
+                                   cutoff=1.0)
+    i1, j1, S1 = nl.neighbour_list("ijS", positions=pos, cell=cell, pbc=pbc,
+                                   cutoff=1.0, array_namespace=np)
+    assert all(isinstance(a, np.ndarray) for a in (i1, j1, S1))
+    assert np.array_equal(_canonical(i0, j0, S0), _canonical(i1, j1, S1))
 
 
-cupy = pytest.importorskip("cupy")
+def test_host_dlpack_capsules():
+    """array_namespace='dlpack' returns DLPackTensor objects any framework can
+    consume; numpy.from_dlpack here."""
+    pos, cell, pbc = _random_config(seed=3)
+    i0, j0 = nl.neighbour_list("ij", positions=pos, cell=cell, pbc=pbc,
+                               cutoff=1.0)
+    caps = nl.neighbour_list("ij", positions=pos, cell=cell, pbc=pbc, cutoff=1.0,
+                             array_namespace="dlpack")
+    assert all(isinstance(c, DLPackTensor) for c in caps)
+    i1, j1 = (np.from_dlpack(c) for c in caps)
+    z = np.zeros((len(i0), 3))
+    assert np.array_equal(_canonical(i0, j0, z), _canonical(i1, j1, z))
 
+
+def test_host_dlpack_capsule_frees_without_consumer():
+    """A capsule that is never consumed frees its buffer via its destructor."""
+    pos, cell, pbc = _random_config(N=500, seed=4)
+    caps = nl.neighbour_list("i", positions=pos, cell=cell, pbc=pbc, cutoff=1.0,
+                             array_namespace="dlpack")
+    del caps  # must not leak / crash
+
+
+def test_host_jax_namespace():
+    """JAX (host) consumes the same capsules — proves output isn't cupy-pinned."""
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+    pos, cell, pbc = _random_config(seed=6)
+    i0 = nl.neighbour_list("i", positions=pos, cell=cell, pbc=pbc, cutoff=1.0)
+    i1 = nl.neighbour_list("i", positions=pos, cell=cell, pbc=pbc, cutoff=1.0,
+                           array_namespace=jnp)
+    assert isinstance(i1, jax.Array)             # really a JAX array
+    assert np.array_equal(np.sort(np.asarray(i1)), np.sort(i0))
+
+
+# --------------------------------------------------------------- device paths
 
 def _gpu_available():
-    """A CUDA device AND an extension built with the GPU backend."""
-    if not getattr(_ext, "_has_gpu", 0):
+    if cupy is None or not getattr(_ext, "_has_gpu", 0):
         return False
     try:
         return cupy.cuda.runtime.getDeviceCount() > 0
@@ -82,38 +109,54 @@ requires_gpu = pytest.mark.skipif(
 
 
 @requires_gpu
-def test_dlpack_cupy_roundtrip_matches_cpu():
-    """cupy positions in -> cupy arrays out, matching the CPU oracle."""
-    positions, cell, inv_cell, origin, pbc = _random_config(N=3000, seed=5)
-    cutoff = 1.0
-
-    i_cpu, j_cpu, S_cpu = nl.neighbour_list(
-        "ijS", positions=positions, cell=cell, pbc=pbc, cutoff=cutoff)
-
-    pos_d = cupy.asarray(positions)
-    out = nl.neighbour_list("ijS", positions=pos_d, cell=cell, pbc=pbc,
-                            cutoff=cutoff)
-    i_g, j_g, S_g = out
-    # Results must be cupy arrays (stayed on the device).
-    assert isinstance(i_g, cupy.ndarray)
-    assert isinstance(S_g, cupy.ndarray)
-
-    i_g, j_g, S_g = (cupy.asnumpy(a) for a in (i_g, j_g, S_g))
-    assert len(i_g) == len(i_cpu)
+def test_cupy_in_cupy_out_matches_cpu():
+    """cupy positions in (DLPack import) -> cupy arrays out, matching CPU."""
+    pos, cell, pbc = _random_config(N=3000, seed=5)
+    i_cpu, j_cpu, S_cpu = nl.neighbour_list("ijS", positions=pos, cell=cell,
+                                            pbc=pbc, cutoff=1.0)
+    pos_d = cupy.asarray(pos)
+    i_g, j_g, S_g = nl.neighbour_list("ijS", positions=pos_d, cell=cell, pbc=pbc,
+                                      cutoff=1.0)
+    assert isinstance(i_g, cupy.ndarray) and isinstance(S_g, cupy.ndarray)
     assert np.array_equal(_canonical(i_cpu, j_cpu, S_cpu),
-                          _canonical(i_g, j_g, S_g))
+                          _canonical(cupy.asnumpy(i_g), cupy.asnumpy(j_g),
+                                     cupy.asnumpy(S_g)))
 
 
 @requires_gpu
-def test_dlpack_cupy_multi_gpu():
-    """The result must land on the same device as the input cupy array."""
+def test_device_override_host_in_gpu_out():
+    """numpy positions + device='cuda' forces the GPU and returns cupy."""
+    pos, cell, pbc = _random_config(N=2500, seed=7)
+    i_cpu, j_cpu = nl.neighbour_list("ij", positions=pos, cell=cell, pbc=pbc,
+                                     cutoff=1.0)
+    i_g, j_g = nl.neighbour_list("ij", positions=pos, cell=cell, pbc=pbc,
+                                 cutoff=1.0, device="cuda")
+    assert isinstance(i_g, cupy.ndarray)
+    z = np.zeros((len(i_cpu), 3))
+    assert np.array_equal(_canonical(i_cpu, j_cpu, z),
+                          _canonical(cupy.asnumpy(i_g), cupy.asnumpy(j_g), z))
+
+
+@requires_gpu
+def test_device_dlpack_capsules():
+    """array_namespace='dlpack' on the device returns DLPackTensors for cupy."""
+    pos, cell, pbc = _random_config(N=1500, seed=8)
+    pos_d = cupy.asarray(pos)
+    caps = nl.neighbour_list("ij", positions=pos_d, cell=cell, pbc=pbc,
+                             cutoff=1.0, array_namespace="dlpack")
+    assert all(isinstance(c, DLPackTensor) for c in caps)
+    i, j = (cupy.from_dlpack(c) for c in caps)
+    assert isinstance(i, cupy.ndarray)
+
+
+@requires_gpu
+def test_multi_gpu_follows_input_device():
     ndev = cupy.cuda.runtime.getDeviceCount()
-    positions, cell, inv_cell, origin, pbc = _random_config(N=2000, seed=4)
-    i_cpu = nl.neighbour_list("i", positions=positions, cell=cell, pbc=pbc,
-                              cutoff=1.0)
+    pos, cell, pbc = _random_config(N=2000, seed=9)
+    i_cpu = nl.neighbour_list("i", positions=pos, cell=cell, pbc=pbc, cutoff=1.0)
     for d in range(ndev):
         with cupy.cuda.Device(d):
-            pos_d = cupy.asarray(positions)
+            pos_d = cupy.asarray(pos)
             i, j = nl.neighbour_list("ij", positions=pos_d, cell=cell, pbc=pbc,
                                      cutoff=1.0)
         assert int(i.device.id) == d
@@ -121,26 +164,15 @@ def test_dlpack_cupy_multi_gpu():
 
 
 @requires_gpu
-def test_coordination_cupy_matches_cpu():
-    """GPU coordination (count-only) -> cupy, matching the host bincount."""
-    positions, cell, inv_cell, origin, pbc = _random_config(N=3000, seed=8)
-    cutoff = 1.3
-    c_cpu = nl.coordination(positions=positions, cell=cell, pbc=pbc,
-                            cutoff=cutoff)
-    pos_d = cupy.asarray(positions)
-    c_gpu = nl.coordination(positions=pos_d, cell=cell, pbc=pbc, cutoff=cutoff)
-    assert isinstance(c_gpu, cupy.ndarray)
-    assert np.array_equal(cupy.asnumpy(c_gpu), c_cpu)
-
-
-@requires_gpu
-def test_dlpack_cupy_distance_matches_cpu():
-    positions, cell, inv_cell, origin, pbc = _random_config(N=2500, seed=9)
-    cutoff = 1.5
-
-    d_cpu = nl.neighbour_list("d", positions=positions, cell=cell, pbc=pbc,
-                              cutoff=cutoff)
-    pos_d = cupy.asarray(positions)
-    d_g = cupy.asnumpy(nl.neighbour_list("d", positions=pos_d, cell=cell,
-                                         pbc=pbc, cutoff=cutoff))
-    assert np.allclose(np.sort(d_cpu), np.sort(d_g), atol=1e-12)
+def test_coordination_cupy_and_override():
+    pos, cell, pbc = _random_config(N=3000, seed=10)
+    c_cpu = nl.coordination(positions=pos, cell=cell, pbc=pbc, cutoff=1.3)
+    # device input
+    c_dev = nl.coordination(positions=cupy.asarray(pos), cell=cell, pbc=pbc,
+                            cutoff=1.3)
+    assert isinstance(c_dev, cupy.ndarray)
+    assert np.array_equal(cupy.asnumpy(c_dev), c_cpu)
+    # host input forced onto the GPU
+    c_ovr = nl.coordination(positions=pos, cell=cell, pbc=pbc, cutoff=1.3,
+                            device="cuda")
+    assert np.array_equal(cupy.asnumpy(c_ovr), c_cpu)

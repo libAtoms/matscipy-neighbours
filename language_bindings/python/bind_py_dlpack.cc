@@ -7,12 +7,12 @@
  *                       Lars Pastewka, University of Freiburg
  *                       and others (see toplevel AUTHORS file)
  *
- * Phase 4 — DLPack export. Builds the neighbour list on the requested backend
- * and hands each output array to Python as a DLPack "dltensor" capsule that
- * OWNS the underlying buffer (host std::vector or device Array<T, CudaSpace>).
- * numpy/cupy `from_dlpack` then wrap it zero-copy; the consumer takes ownership
- * and our deleter frees the buffer when the consumer is done. No host round-trip
- * for the device path — results stay on the GPU.
+ * Phase 4 — DLPack import/export. Builds the neighbour list on the requested
+ * backend and hands each output array to Python as a DLPack "dltensor" capsule
+ * that OWNS its buffer (host std::vector or device Array<T, DeviceSpace>); any
+ * DLPack consumer (numpy/cupy/torch/jax) then wraps it zero-copy. Device input
+ * is read the same way — via the array's __dlpack__ — so the GPU path is not
+ * tied to cupy and never round-trips positions through the host.
  */
 
 #include <Python.h>
@@ -38,6 +38,8 @@
 using namespace matscipy;
 
 namespace {
+
+/* ----------------------------------------------------------- DLPack export */
 
 /* Owns the buffer behind a DLManagedTensor and the shape array. `keep` holds a
    shared_ptr to the std::vector / Array, released when the manager is deleted. */
@@ -107,21 +109,133 @@ PyObject *device_capsule(Array<T, DeviceSpace> &&a, int ndim, int64_t d0,
 }
 #endif
 
+/* ----------------------------------------------------------- DLPack import */
+
+/* A device positions array imported through DLPack. Owns the consumed managed
+   tensor; call release() once the (synchronous) build has read the data. */
+struct ImportedDLPack {
+    DLManagedTensor *mt = nullptr;
+    const real_t *data = nullptr;
+    int device_type = 0;
+    int device_id = 0;
+    npy_intp nat = 0;
+    void release() {
+        if (mt && mt->deleter) mt->deleter(mt);
+        mt = nullptr;
+    }
+};
+
+/* Import an (n, 3) float64 device array via its __dlpack__. Returns 0 and fills
+   `imp` (owning the tensor) on success; -1 with a Python error set otherwise. */
+int import_positions_dlpack(PyObject *arr, ImportedDLPack *imp) {
+    PyObject *cap = PyObject_CallMethod(arr, "__dlpack__", NULL);
+    if (!cap) return -1;
+    if (!PyCapsule_IsValid(cap, "dltensor")) {
+        PyErr_SetString(PyExc_TypeError,
+                        "device positions did not yield an unversioned DLPack "
+                        "capsule");
+        Py_DECREF(cap);
+        return -1;
+    }
+    auto *mt = static_cast<DLManagedTensor *>(
+        PyCapsule_GetPointer(cap, "dltensor"));
+    if (!mt) {
+        Py_DECREF(cap);
+        return -1;
+    }
+    const DLTensor &t = mt->dl_tensor;
+    bool ok_dtype =
+        t.dtype.code == kDLFloat && t.dtype.bits == 64 && t.dtype.lanes == 1;
+    bool ok_shape = t.ndim == 2 && t.shape[1] == 3;
+    bool ok_contig = t.strides == nullptr ||
+                     (t.strides[0] == 3 && t.strides[1] == 1);
+    if (!ok_dtype || !ok_shape || !ok_contig) {
+        PyErr_SetString(PyExc_TypeError,
+                        "device positions must be a C-contiguous float64 array "
+                        "of shape (n, 3)");
+        if (mt->deleter) mt->deleter(mt);  /* release the just-produced tensor */
+        Py_DECREF(cap);
+        return -1;
+    }
+    imp->mt = mt;
+    imp->data = reinterpret_cast<const real_t *>(
+        static_cast<char *>(t.data) + t.byte_offset);
+    imp->device_type = static_cast<int>(t.device.device_type);
+    imp->device_id = t.device.device_id;
+    imp->nat = t.shape[0];
+    /* Consume: the producer's capsule destructor must not also free it. */
+    PyCapsule_SetName(cap, "used_dltensor");
+    Py_DECREF(cap);
+    return 0;
+}
+
+/* ----------------------------------------------------------- shared parsing */
+
+/* Resolve the cutoff argument (scalar / per-atom 1d / per-type 2d). On the array
+   forms `*a_cut` is set to a new reference the caller must DECREF. */
+int resolve_cutoff(PyObject *py_cut, PyObject **a_cut, real_t *cutoff,
+                   const real_t **per_atom, const real_t **per_type_sq,
+                   index_t *ncutoffs, std::vector<real_t> &storage) {
+    *cutoff = 0.0;
+    *per_atom = nullptr;
+    *per_type_sq = nullptr;
+    *ncutoffs = 0;
+    if (PyFloat_Check(py_cut)) {
+        *cutoff = PyFloat_AsDouble(py_cut);
+        return 0;
+    }
+    *a_cut = PyArray_FROMANY(py_cut, NPY_DOUBLE, 1, 2, NPY_ARRAY_C_CONTIGUOUS);
+    if (!*a_cut) return -1;
+    int ndim = PyArray_NDIM((PyArrayObject *)*a_cut);
+    npy_intp dim0 = PyArray_DIM((PyArrayObject *)*a_cut, 0);
+    const real_t *cd = (const real_t *)PyArray_DATA((PyArrayObject *)*a_cut);
+    if (ndim == 1) {
+        for (npy_intp k = 0; k < dim0; k++) *cutoff = std::max(*cutoff, 2 * cd[k]);
+        *per_atom = cd;
+    } else {
+        *ncutoffs = (index_t)dim0;
+        storage.resize((size_t)*ncutoffs * *ncutoffs);
+        for (size_t k = 0; k < storage.size(); k++) {
+            *cutoff = std::max(*cutoff, cd[k]);
+            storage[k] = cd[k] * cd[k];
+        }
+        *per_type_sq = storage.data();
+    }
+    return 0;
+}
+
+int quantity_flags(const char *q, int *flags) {
+    *flags = 0;
+    for (; *q; q++) {
+        switch (*q) {
+            case 'i': *flags |= QUANTITY_FIRST; break;
+            case 'j': *flags |= QUANTITY_SECOND; break;
+            case 'D': *flags |= QUANTITY_DISTVEC; break;
+            case 'd': *flags |= QUANTITY_ABSDIST; break;
+            case 'S': *flags |= QUANTITY_SHIFT; break;
+            default:
+                PyErr_SetString(PyExc_ValueError, "Unsupported quantity specified.");
+                return -1;
+        }
+    }
+    return 0;
+}
+
 }  // namespace
 
 PyObject *py_neighbour_list_dlpack(PyObject *self, PyObject *args) {
     PyObject *py_quant, *py_origin, *py_cell, *py_inv, *py_pbc, *py_pos, *py_cut;
     PyObject *py_types = NULL;
-    int backend = 0;                  /* 0 = CPU/host, 1 = GPU/device */
-    unsigned long long r_device_ptr = 0;  /* nonzero => device positions ptr */
-    int nat_override = -1;
-    int device_id = -1;               /* GPU to run on / report; -1 = current */
+    int backend = 0;          /* 0 = CPU/host, 1 = GPU/device */
+    PyObject *py_in = NULL;   /* device positions object (has __dlpack__) or None */
+    int device_id = -1;       /* GPU to run on / report; -1 = current */
 
-    if (!PyArg_ParseTuple(args, "O!OOOOOO|OiKii", &PyUnicode_Type, &py_quant,
+    if (!PyArg_ParseTuple(args, "O!OOOOOO|OiOi", &PyUnicode_Type, &py_quant,
                           &py_origin, &py_cell, &py_inv, &py_pbc, &py_pos,
-                          &py_cut, &py_types, &backend, &r_device_ptr,
-                          &nat_override, &device_id))
+                          &py_cut, &py_types, &backend, &py_in, &device_id))
         return NULL;
+
+    const bool device_in = py_in && py_in != Py_None;
 
 #if !(defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP))
     if (backend != 0) {
@@ -135,6 +249,7 @@ PyObject *py_neighbour_list_dlpack(PyObject *self, PyObject *args) {
     PyObject *a_origin = NULL, *a_cell = NULL, *a_inv = NULL, *a_pbc = NULL;
     PyObject *a_pos = NULL, *a_cut = NULL, *a_types = NULL, *py_ret = NULL;
     PyObject *py_bquant = NULL;
+    ImportedDLPack imp;
 
     a_origin = PyArray_FROMANY(py_origin, NPY_DOUBLE, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
     a_cell = PyArray_FROMANY(py_cell, NPY_DOUBLE, 2, 2, NPY_ARRAY_C_CONTIGUOUS);
@@ -146,62 +261,25 @@ PyObject *py_neighbour_list_dlpack(PyObject *self, PyObject *args) {
         a_types = PyArray_FROMANY(py_types, NPY_INT, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
         if (!a_types) goto fail;
     }
+    if (device_in && import_positions_dlpack(py_in, &imp) != 0) goto fail;
 
     {
-        index_t nat = nat_override >= 0
-                          ? (index_t)nat_override
-                          : (index_t)PyArray_DIM((PyArrayObject *)a_pos, 0);
+        index_t nat = device_in ? (index_t)imp.nat
+                                : (index_t)PyArray_DIM((PyArrayObject *)a_pos, 0);
 
-        /* Resolve the cutoff (scalar / per-atom 1d / per-type 2d), as in the
-           numpy binding. */
         real_t cutoff = 0.0;
-        const real_t *per_atom = NULL;
-        const real_t *per_type_sq = NULL;
+        const real_t *per_atom = NULL, *per_type_sq = NULL;
         index_t ncutoffs = 0;
         std::vector<real_t> per_type_storage;
-        if (PyFloat_Check(py_cut)) {
-            cutoff = PyFloat_AsDouble(py_cut);
-        } else {
-            a_cut = PyArray_FROMANY(py_cut, NPY_DOUBLE, 1, 2,
-                                    NPY_ARRAY_C_CONTIGUOUS);
-            if (!a_cut) goto fail;
-            int ndim = PyArray_NDIM((PyArrayObject *)a_cut);
-            npy_intp dim0 = PyArray_DIM((PyArrayObject *)a_cut, 0);
-            const real_t *cdata =
-                (const real_t *)PyArray_DATA((PyArrayObject *)a_cut);
-            if (ndim == 1) {
-                for (npy_intp k = 0; k < dim0; k++)
-                    cutoff = std::max(cutoff, 2 * cdata[k]);
-                per_atom = cdata;
-            } else {
-                ncutoffs = (index_t)dim0;
-                per_type_storage.resize((size_t)ncutoffs * ncutoffs);
-                for (size_t k = 0; k < per_type_storage.size(); k++) {
-                    cutoff = std::max(cutoff, cdata[k]);
-                    per_type_storage[k] = cdata[k] * cdata[k];
-                }
-                per_type_sq = per_type_storage.data();
-            }
-        }
+        if (resolve_cutoff(py_cut, &a_cut, &cutoff, &per_atom, &per_type_sq,
+                           &ncutoffs, per_type_storage) != 0)
+            goto fail;
 
-        /* Quantity flags + the requested character order. */
         py_bquant = PyUnicode_AsASCIIString(py_quant);
         if (!py_bquant) goto fail;
         const char *quantities = PyBytes_AS_STRING(py_bquant);
         int flags = 0;
-        for (const char *q = quantities; *q; q++) {
-            switch (*q) {
-                case 'i': flags |= QUANTITY_FIRST; break;
-                case 'j': flags |= QUANTITY_SECOND; break;
-                case 'D': flags |= QUANTITY_DISTVEC; break;
-                case 'd': flags |= QUANTITY_ABSDIST; break;
-                case 'S': flags |= QUANTITY_SHIFT; break;
-                default:
-                    PyErr_SetString(PyExc_ValueError,
-                                    "Unsupported quantity specified.");
-                    goto fail;
-            }
-        }
+        if (quantity_flags(quantities, &flags) != 0) goto fail;
 
         const real_t *origin =
             (const real_t *)PyArray_DATA((PyArrayObject *)a_origin);
@@ -215,7 +293,7 @@ PyObject *py_neighbour_list_dlpack(PyObject *self, PyObject *args) {
             a_types ? (const index_t *)PyArray_DATA((PyArrayObject *)a_types)
                     : NULL;
 
-        const int nq = (int)Py_SAFE_DOWNCAST(strlen(quantities), size_t, int);
+        const int nq = (int)strlen(quantities);
         py_ret = PyTuple_New(nq);
         if (!py_ret) goto fail;
 
@@ -249,20 +327,34 @@ PyObject *py_neighbour_list_dlpack(PyObject *self, PyObject *args) {
             }
         } else {
 #if defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP)
-            /* GPU backend: results stay on the device, wrapped as kDLCUDA. */
-            const real_t *r = r_device_ptr ? (const real_t *)(uintptr_t)r_device_ptr
-                                            : r_host;
-            const bool r_is_dev = r_device_ptr != 0;
+            /* GPU backend: results stay on the device, wrapped as device capsules.
+               Device input is used in place; otherwise host positions upload. */
+            NeighbourListRequest req;
+            req.quantities = flags;
+            req.cell_origin = origin;
+            req.cell = cell;
+            req.inv_cell = inv;
+            req.pbc = pbc;
+            req.nat = nat;
+            req.positions = device_in ? imp.data : r_host;
+            req.positions_on_device = device_in;
+            req.cutoff = cutoff;
+            req.per_atom_cutoff = per_atom;
+            req.per_type_cutoff_sq = per_type_sq;
+            req.ncutoffs = ncutoffs;
+            req.types = types;
+            req.device_id = device_in ? imp.device_id : device_id;
+
             NeighbourListDevice dev;
-            if (neighbour_list_gpu_device(flags, origin, cell, inv, pbc, nat, r,
-                                          r_is_dev, cutoff, per_atom, per_type_sq,
-                                          ncutoffs, types, CellOrder::Linear,
-                                          device_id, dev) != NL_SUCCESS) {
+            error_t st = neighbour_list_gpu_device(req, dev);
+            imp.release();  /* input consumed; result lives in `dev` */
+            if (st != NL_SUCCESS) {
                 if (has_error) PyErr_SetString(PyExc_RuntimeError, error_string);
                 goto fail;
             }
             const int64_t np = dev.npairs;
-            const int dev_id = device_id >= 0 ? device_id : current_device_id();
+            const int dev_id = req.device_id >= 0 ? req.device_id
+                                                  : current_device_id();
             int pos = 0;
             for (const char *q = quantities; *q; q++, pos++) {
                 PyObject *cap = NULL;
@@ -285,6 +377,7 @@ PyObject *py_neighbour_list_dlpack(PyObject *self, PyObject *args) {
         }
     }
 
+    imp.release();
     Py_XDECREF(py_bquant);
     Py_XDECREF(a_cut);
     Py_XDECREF(a_origin);
@@ -296,6 +389,7 @@ PyObject *py_neighbour_list_dlpack(PyObject *self, PyObject *args) {
     return py_ret;
 
 fail:
+    imp.release();
     Py_XDECREF(py_ret);
     Py_XDECREF(py_bquant);
     Py_XDECREF(a_cut);
@@ -316,17 +410,20 @@ PyObject *py_coordination_dlpack(PyObject *self, PyObject *args) {
     return NULL;
 #else
     PyObject *py_origin, *py_cell, *py_inv, *py_pbc, *py_pos, *py_cut;
-    PyObject *py_types = NULL;
-    unsigned long long r_device_ptr = 0;
-    int nat_override = -1, device_id = -1;
+    PyObject *py_types = NULL, *py_in = NULL;
+    int device_id = -1;
 
-    if (!PyArg_ParseTuple(args, "OOOOOO|OKii", &py_origin, &py_cell, &py_inv,
-                          &py_pbc, &py_pos, &py_cut, &py_types, &r_device_ptr,
-                          &nat_override, &device_id))
+    if (!PyArg_ParseTuple(args, "OOOOOO|OOi", &py_origin, &py_cell, &py_inv,
+                          &py_pbc, &py_pos, &py_cut, &py_types, &py_in,
+                          &device_id))
         return NULL;
+
+    const bool device_in = py_in && py_in != Py_None;
 
     PyObject *a_origin = NULL, *a_cell = NULL, *a_inv = NULL, *a_pbc = NULL;
     PyObject *a_pos = NULL, *a_cut = NULL, *a_types = NULL, *ret = NULL;
+    ImportedDLPack imp;
+
     a_origin = PyArray_FROMANY(py_origin, NPY_DOUBLE, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
     a_cell = PyArray_FROMANY(py_cell, NPY_DOUBLE, 2, 2, NPY_ARRAY_C_CONTIGUOUS);
     a_inv = PyArray_FROMANY(py_inv, NPY_DOUBLE, 2, 2, NPY_ARRAY_C_CONTIGUOUS);
@@ -337,55 +434,50 @@ PyObject *py_coordination_dlpack(PyObject *self, PyObject *args) {
         a_types = PyArray_FROMANY(py_types, NPY_INT, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
         if (!a_types) goto cfail;
     }
+    if (device_in && import_positions_dlpack(py_in, &imp) != 0) goto cfail;
     {
-        index_t nat = nat_override >= 0
-                          ? (index_t)nat_override
-                          : (index_t)PyArray_DIM((PyArrayObject *)a_pos, 0);
+        index_t nat = device_in ? (index_t)imp.nat
+                                : (index_t)PyArray_DIM((PyArrayObject *)a_pos, 0);
         real_t cutoff = 0.0;
         const real_t *per_atom = NULL, *per_type_sq = NULL;
         index_t ncutoffs = 0;
         std::vector<real_t> pt_storage;
-        if (PyFloat_Check(py_cut)) {
-            cutoff = PyFloat_AsDouble(py_cut);
-        } else {
-            a_cut = PyArray_FROMANY(py_cut, NPY_DOUBLE, 1, 2, NPY_ARRAY_C_CONTIGUOUS);
-            if (!a_cut) goto cfail;
-            int ndim = PyArray_NDIM((PyArrayObject *)a_cut);
-            npy_intp dim0 = PyArray_DIM((PyArrayObject *)a_cut, 0);
-            const real_t *cd = (const real_t *)PyArray_DATA((PyArrayObject *)a_cut);
-            if (ndim == 1) {
-                for (npy_intp k = 0; k < dim0; k++) cutoff = std::max(cutoff, 2 * cd[k]);
-                per_atom = cd;
-            } else {
-                ncutoffs = (index_t)dim0;
-                pt_storage.resize((size_t)ncutoffs * ncutoffs);
-                for (size_t k = 0; k < pt_storage.size(); k++) {
-                    cutoff = std::max(cutoff, cd[k]);
-                    pt_storage[k] = cd[k] * cd[k];
-                }
-                per_type_sq = pt_storage.data();
-            }
-        }
+        if (resolve_cutoff(py_cut, &a_cut, &cutoff, &per_atom, &per_type_sq,
+                           &ncutoffs, pt_storage) != 0)
+            goto cfail;
+
         const real_t *origin = (const real_t *)PyArray_DATA((PyArrayObject *)a_origin);
         const real_t *cell = (const real_t *)PyArray_DATA((PyArrayObject *)a_cell);
         const real_t *inv = (const real_t *)PyArray_DATA((PyArrayObject *)a_inv);
         const npy_bool *pb = (const npy_bool *)PyArray_DATA((PyArrayObject *)a_pbc);
         bool pbc[3] = {(bool)pb[0], (bool)pb[1], (bool)pb[2]};
-        const real_t *r = r_device_ptr
-                              ? (const real_t *)(uintptr_t)r_device_ptr
-                              : (const real_t *)PyArray_DATA((PyArrayObject *)a_pos);
+        const real_t *r_host = (const real_t *)PyArray_DATA((PyArrayObject *)a_pos);
         const index_t *types =
             a_types ? (const index_t *)PyArray_DATA((PyArrayObject *)a_types) : NULL;
 
+        NeighbourListRequest req;
+        req.cell_origin = origin;
+        req.cell = cell;
+        req.inv_cell = inv;
+        req.pbc = pbc;
+        req.nat = nat;
+        req.positions = device_in ? imp.data : r_host;
+        req.positions_on_device = device_in;
+        req.cutoff = cutoff;
+        req.per_atom_cutoff = per_atom;
+        req.per_type_cutoff_sq = per_type_sq;
+        req.ncutoffs = ncutoffs;
+        req.types = types;
+        req.device_id = device_in ? imp.device_id : device_id;
+
         NeighbourListDevice dev;
-        if (neighbour_count_gpu_device(origin, cell, inv, pbc, nat, r,
-                                       r_device_ptr != 0, cutoff, per_atom,
-                                       per_type_sq, ncutoffs, types, device_id,
-                                       dev) != NL_SUCCESS) {
+        error_t st = neighbour_count_gpu_device(req, dev);
+        imp.release();
+        if (st != NL_SUCCESS) {
             if (has_error) PyErr_SetString(PyExc_RuntimeError, error_string);
             goto cfail;
         }
-        const int dev_id = device_id >= 0 ? device_id : current_device_id();
+        const int dev_id = req.device_id >= 0 ? req.device_id : current_device_id();
         ret = device_capsule(std::move(dev.counts), 1, nat, 1, kDLInt, kIntBits,
                              dev_id);
         if (!ret) goto cfail;
@@ -400,6 +492,7 @@ PyObject *py_coordination_dlpack(PyObject *self, PyObject *args) {
     return ret;
 
 cfail:
+    imp.release();
     Py_XDECREF(ret);
     Py_XDECREF(a_cut);
     Py_XDECREF(a_origin);

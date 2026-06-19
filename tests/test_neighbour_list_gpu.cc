@@ -150,11 +150,16 @@ TEST(NeighbourListGpu, CoordinationMatchesCpu) {
     for (index_t p = 0; p < cpu.npairs; p++) want[cpu.first[p]]++;
 
     /* GPU count-only path. */
+    NeighbourListRequest req;
+    req.cell_origin = origin;
+    req.cell = cell;
+    req.inv_cell = inv;
+    req.pbc = pbc;
+    req.nat = N;
+    req.positions = r.data();
+    req.cutoff = cutoff;
     NeighbourListDevice dev;
-    ASSERT_EQ(neighbour_count_gpu_device(origin, cell, inv, pbc, N, r.data(),
-                                         false, cutoff, nullptr, nullptr, 0,
-                                         nullptr, -1, dev),
-              NL_SUCCESS);
+    ASSERT_EQ(neighbour_count_gpu_device(req, dev), NL_SUCCESS);
     ASSERT_EQ(dev.counts.size(), (size_t)N);
     std::vector<index_t> got(N);
     cudaMemcpy(got.data(), dev.counts.data(), N * sizeof(index_t),

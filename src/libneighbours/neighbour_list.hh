@@ -11,6 +11,7 @@
 #ifndef MATSCIPY_NEIGHBOUR_LIST_HH
 #define MATSCIPY_NEIGHBOUR_LIST_HH
 
+#include <cstddef>
 #include <vector>
 
 #include "cell_list.hh"
@@ -18,10 +19,34 @@
 
 namespace matscipy {
 
+/* Minimal non-owning view over a contiguous buffer (a pointer + length). Works
+   for host buffers and device pointers alike; on a device pointer only size()
+   / data() are meaningful on the host (indexing happens in kernels). */
+template <typename T>
+struct Span {
+    T *ptr = nullptr;
+    std::size_t len = 0;
+    T *data() const { return ptr; }
+    std::size_t size() const { return len; }
+    bool empty() const { return len == 0; }
+    T &operator[](std::size_t i) const { return ptr[i]; }
+    T *begin() const { return ptr; }
+    T *end() const { return ptr + len; }
+};
+
+/* A 3-vector value (distance vector or shift) read out of a flattened buffer. */
+template <typename T>
+struct Vec3 {
+    T x, y, z;
+};
+
 /* Result of a neighbour-list computation. Only the buffers whose quantity flag
    was requested are filled; the rest stay empty. `npairs` is the number of
    neighbour pairs found. Distance vectors and shifts are stored row-major with
-   three entries per pair. */
+   three entries per pair.
+
+   The *_view() accessors give typed, bounds-free Spans over the buffers instead
+   of raw .data(); distvec_at()/shift_at() read one pair's 3-vector. */
 struct NeighbourList {
     std::vector<index_t> first;    /* [npairs]      i indices */
     std::vector<index_t> secnd;    /* [npairs]      j indices */
@@ -29,6 +54,23 @@ struct NeighbourList {
     std::vector<real_t> absdist;   /* [npairs]      absolute distances */
     std::vector<index_t> shift;    /* [3 * npairs]  cell shifts */
     index_t npairs = 0;
+
+    Span<const index_t> first_view() const { return {first.data(), first.size()}; }
+    Span<const index_t> secnd_view() const { return {secnd.data(), secnd.size()}; }
+    Span<const real_t> distvec_view() const {
+        return {distvec.data(), distvec.size()};
+    }
+    Span<const real_t> absdist_view() const {
+        return {absdist.data(), absdist.size()};
+    }
+    Span<const index_t> shift_view() const { return {shift.data(), shift.size()}; }
+
+    Vec3<real_t> distvec_at(index_t p) const {
+        return {distvec[3 * p], distvec[3 * p + 1], distvec[3 * p + 2]};
+    }
+    Vec3<index_t> shift_at(index_t p) const {
+        return {shift[3 * p], shift[3 * p + 1], shift[3 * p + 2]};
+    }
 };
 
 /*

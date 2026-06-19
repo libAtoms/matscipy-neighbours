@@ -457,14 +457,25 @@ static error_t count_and_fill(const DevCtx &ctx, const Query &q, index_t nat,
 
 /* Shared kernel pipeline. Runs the whole build and leaves the requested output
    quantities in `dev` (device memory). Both public entry points wrap this. */
-static error_t build_device(int quantities, const real_t cell_origin[3],
-                            const real_t cell[9], const real_t inv_cell[9],
-                            const bool pbc[3], index_t nat, const real_t *r,
-                            bool r_is_device, real_t cutoff,
-                            const real_t *per_atom_cutoff,
-                            const real_t *per_type_cutoff_sq, index_t ncutoffs,
-                            const index_t *types, CellOrder order, int device_id,
-                            bool want_pairs, NeighbourListDevice &dev) {
+static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
+                            NeighbourListDevice &dev) {
+    /* Unpack the request into the local names the body uses. */
+    const int quantities = req.quantities;
+    const real_t *cell_origin = req.cell_origin;
+    const real_t *cell = req.cell;
+    const real_t *inv_cell = req.inv_cell;
+    const bool *pbc = req.pbc;
+    const index_t nat = req.nat;
+    const real_t *r = req.positions;
+    const bool r_is_device = req.positions_on_device;
+    const real_t cutoff = req.cutoff;
+    const real_t *per_atom_cutoff = req.per_atom_cutoff;
+    const real_t *per_type_cutoff_sq = req.per_type_cutoff_sq;
+    const index_t ncutoffs = req.ncutoffs;
+    const index_t *types = req.types;
+    const CellOrder order = req.order;
+    const int device_id = req.device_id;
+
     clear_error();
     dev.npairs = 0;
     if (nat <= 0) return NL_SUCCESS;
@@ -642,34 +653,15 @@ static error_t build_device(int quantities, const real_t cell_origin[3],
 
 }  // namespace
 
-error_t neighbour_list_gpu_device(int quantities, const real_t cell_origin[3],
-                                  const real_t cell[9], const real_t inv_cell[9],
-                                  const bool pbc[3], index_t nat, const real_t *r,
-                                  bool r_is_device, real_t cutoff,
-                                  const real_t *per_atom_cutoff,
-                                  const real_t *per_type_cutoff_sq,
-                                  index_t ncutoffs, const index_t *types,
-                                  CellOrder order, int device_id,
+error_t neighbour_list_gpu_device(const NeighbourListRequest &req,
                                   NeighbourListDevice &out) {
-    return build_device(quantities, cell_origin, cell, inv_cell, pbc, nat, r,
-                        r_is_device, cutoff, per_atom_cutoff, per_type_cutoff_sq,
-                        ncutoffs, types, order, device_id, /*want_pairs=*/true,
-                        out);
+    return build_device(req, /*want_pairs=*/true, out);
 }
 
-error_t neighbour_count_gpu_device(const real_t cell_origin[3],
-                                   const real_t cell[9], const real_t inv_cell[9],
-                                   const bool pbc[3], index_t nat, const real_t *r,
-                                   bool r_is_device, real_t cutoff,
-                                   const real_t *per_atom_cutoff,
-                                   const real_t *per_type_cutoff_sq,
-                                   index_t ncutoffs, const index_t *types,
-                                   int device_id, NeighbourListDevice &out) {
+error_t neighbour_count_gpu_device(const NeighbourListRequest &req,
+                                   NeighbourListDevice &out) {
     /* Phase 3.4: per-atom neighbour counts without materialising the pairs. */
-    return build_device(0, cell_origin, cell, inv_cell, pbc, nat, r, r_is_device,
-                        cutoff, per_atom_cutoff, per_type_cutoff_sq, ncutoffs,
-                        types, CellOrder::Linear, device_id, /*want_pairs=*/false,
-                        out);
+    return build_device(req, /*want_pairs=*/false, out);
 }
 
 error_t neighbour_list_gpu(int quantities, const real_t cell_origin[3],
@@ -686,11 +678,25 @@ error_t neighbour_list_gpu(int quantities, const real_t cell_origin[3],
     out.shift.clear();
     out.npairs = 0;
 
+    NeighbourListRequest req;
+    req.quantities = quantities;
+    req.cell_origin = cell_origin;
+    req.cell = cell;
+    req.inv_cell = inv_cell;
+    req.pbc = pbc;
+    req.nat = nat;
+    req.positions = r;
+    req.positions_on_device = false;
+    req.cutoff = cutoff;
+    req.per_atom_cutoff = per_atom_cutoff;
+    req.per_type_cutoff_sq = per_type_cutoff_sq;
+    req.ncutoffs = ncutoffs;
+    req.types = types;
+    req.order = order;
+    req.device_id = -1;
+
     NeighbourListDevice dev;
-    error_t e = build_device(quantities, cell_origin, cell, inv_cell, pbc, nat, r,
-                             /*r_is_device=*/false, cutoff, per_atom_cutoff,
-                             per_type_cutoff_sq, ncutoffs, types, order,
-                             /*device_id=*/-1, /*want_pairs=*/true, dev);
+    error_t e = build_device(req, /*want_pairs=*/true, dev);
     if (e != NL_SUCCESS) return e;
     out.npairs = dev.npairs;
     if (dev.npairs == 0) return NL_SUCCESS;
