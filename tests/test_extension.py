@@ -93,7 +93,7 @@ def brute_force(cell, positions, pbc, cutoff):
 
 
 # ---------------------------------------------------------------------------
-# neighbour_list: small cell / periodic images (mirrors upstream test_small_cell)
+# neighbour_list: small cell / periodic images
 # ---------------------------------------------------------------------------
 
 CUBIC = np.eye(3)
@@ -275,7 +275,6 @@ def _fn(n, i):
 
 
 def test_first_neighbours_reference_values():
-    # values taken from the upstream matscipy test suite
     np.testing.assert_array_equal(_fn(5, [1, 1, 1, 1, 3, 3, 3]),
                                   [-1, 0, 4, 4, 7, 7])
     np.testing.assert_array_equal(_fn(6, [0, 1, 2, 3, 4, 5]),

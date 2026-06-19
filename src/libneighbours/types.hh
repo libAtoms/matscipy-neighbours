@@ -22,9 +22,9 @@
 
 namespace matscipy {
 
-/* Integer and floating-point types used throughout the core. Kept as plain
-   aliases so the core never needs to include the NumPy headers. `index_t` must
-   match the integer type the Python layer hands across (NumPy NPY_INT). */
+/* Integer and floating-point types used throughout the core. Plain aliases so
+   the core never needs to include the NumPy headers. `index_t` matches the
+   integer type the Python layer hands across (NumPy NPY_INT). */
 using index_t = int;
 using real_t = double;
 

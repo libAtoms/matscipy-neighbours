@@ -12,11 +12,10 @@ add_library(neighbours STATIC
     triplet_list.cc
 )
 
-# GPU backend sources (single-source kernels + device memory backend). Added to
-# the same target and compiled by nvcc/hipcc; the CPU build omits them entirely.
-# Single-source GPU backend: one .cc body per file, compiled by nvcc or hipcc
-# (CMake assigns the CUDA/HIP language below — the source is backend-neutral, so
-# it is NOT named .cu). The CPU build omits these entirely.
+# GPU backend sources (single-source kernels + device memory backend). One .cc
+# body per file, compiled by nvcc or hipcc (CMake assigns the CUDA/HIP language
+# below — the source is backend-neutral, so it is not named .cu). Added to the
+# same target; the CPU build omits them entirely.
 set(_gpu_sources
     memory_space_gpu.cc
     device_primitives.cc

@@ -7,11 +7,11 @@
  *                       Lars Pastewka, University of Freiburg
  *                       and others (see toplevel AUTHORS file)
  *
- * Thin single-source GPU shim (Phase 3.2). The same kernel body compiles under
- * nvcc (CUDA) or hipcc (HIP); this header maps the vendor runtime onto common
- * names so the algorithm code below contains no <<<>>> / hipLaunchKernelGGL
- * spelled out by hand. Included only from the GPU backend sources (the .cc
- * files CMake compiles with nvcc/hipcc).
+ * Thin single-source GPU shim. The same kernel body compiles under nvcc (CUDA)
+ * or hipcc (HIP); this header maps the vendor runtime onto common names so the
+ * algorithm code contains no <<<>>> / hipLaunchKernelGGL spelled out by hand.
+ * Included only from the GPU backend sources (the .cc files CMake compiles with
+ * nvcc/hipcc).
  */
 
 #ifndef MATSCIPY_DEVICE_HH
@@ -62,9 +62,9 @@ using gpuError_t = hipError_t;
 
 namespace matscipy {
 
-/* Abort with a diagnostic on a failed runtime call. The core contract forbids
-   exceptions on the device path; for unrecoverable runtime/allocation failures
-   (out of memory, no device) aborting with a message is the honest option. */
+/* Abort with a diagnostic on a failed runtime call. The device path uses no
+   exceptions; unrecoverable runtime/allocation failures (out of memory, no
+   device) abort with a message. */
 inline void gpu_check(gpuError_t err, const char *file, int line) {
     if (err != gpuSuccess) {
         std::fprintf(stderr, "[matscipy] GPU error at %s:%d: %s\n", file, line,

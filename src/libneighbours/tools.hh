@@ -23,8 +23,8 @@ void cross_product(const real_t *a, const real_t *b, real_t *c);
 /* Euclidean norm (length) of a 3-vector. */
 real_t norm(const real_t *a);
 
-/* The cell-indexing leaf helpers are shared by the CPU loops and the GPU
-   kernels (host+device, header-inline) — keeping one definition each. */
+/* The cell-indexing leaf helpers below are host+device header-inline functions,
+   shared by the CPU loops and the GPU kernels from a single definition each. */
 
 /* vout = mat . vin, with mat a row-major 3x3 matrix. */
 MATSCIPY_HD inline void mat_mul_vec(const real_t *mat, const real_t *vin,

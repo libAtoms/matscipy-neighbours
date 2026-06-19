@@ -42,11 +42,12 @@ struct Vec3 {
 
 /* Result of a neighbour-list computation. Only the buffers whose quantity flag
    was requested are filled; the rest stay empty. `npairs` is the number of
-   neighbour pairs found. Distance vectors and shifts are stored row-major with
-   three entries per pair.
+   neighbour pairs found, sorted by the first index i. Distance vectors and
+   shifts are stored row-major with three entries per pair.
 
-   The *_view() accessors give typed, bounds-free Spans over the buffers instead
-   of raw .data(); distvec_at()/shift_at() read one pair's 3-vector. */
+   The *_view() accessors give typed Spans aliasing the buffers instead of raw
+   .data(); distvec_at()/shift_at() read one pair's 3-vector. For each pair the
+   distance vector satisfies D == r[j] - r[i] + S @ cell, where S is the shift. */
 struct NeighbourList {
     std::vector<index_t> first;    /* [npairs]      i indices */
     std::vector<index_t> secnd;    /* [npairs]      j indices */
@@ -74,7 +75,8 @@ struct NeighbourList {
 };
 
 /*
- * Build a neighbour list by spatial binning. Python-free.
+ * Build a neighbour list by spatial binning. Output pairs are sorted by the
+ * first index i; for each pair the distance vector D == r[j] - r[i] + S @ cell.
  *
  * quantities          bitwise-or of Quantity flags selecting outputs
  * cell_origin[3]      lower-left corner of the simulation cell

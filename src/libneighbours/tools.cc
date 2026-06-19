@@ -24,7 +24,7 @@ real_t norm(const real_t *a) {
     return std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
 }
 
-/* mat_mul_vec, bin_wrap, bin_trunc and position_to_cell_index are now
-   host+device header-inline functions in tools.hh (shared with the GPU). */
+/* mat_mul_vec, bin_wrap, bin_trunc and position_to_cell_index are host+device
+   header-inline functions in tools.hh, shared by the CPU and GPU paths. */
 
 }  // namespace matscipy

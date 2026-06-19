@@ -4,7 +4,7 @@
  *
  * SPDX-License-Identifier: MIT
  *
- * Phase 3.2 validation: the GPU neighbour list must agree with the CPU oracle
+ * Validation that the GPU neighbour list agrees with the CPU result
  * pair-for-pair. Within-row order differs (GPU scatter is unordered), so pairs
  * are compared as sorted (i, j, shift) multisets plus the distance multiset.
  * Built only with the CUDA backend; skips if no device is present.
@@ -125,7 +125,7 @@ TEST(NeighbourListGpu, MatchesCpuSparseVacuum) {
             CellOrder::Linear, /*fill=*/Lc);
 }
 
-/* --- Phase 3.4 coordination (count without materialising pairs) ------------ */
+/* --- coordination (count without materialising pairs) --------------------- */
 
 TEST(NeighbourListGpu, CoordinationMatchesCpu) {
     if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
@@ -167,7 +167,7 @@ TEST(NeighbourListGpu, CoordinationMatchesCpu) {
     EXPECT_EQ(got, want);
 }
 
-/* --- Phase 3.3 primitives -------------------------------------------------- */
+/* --- device primitives ----------------------------------------------------- */
 
 TEST(DevicePrimitives, ExclusiveScan) {
     if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";

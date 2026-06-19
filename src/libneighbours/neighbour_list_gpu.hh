@@ -7,15 +7,13 @@
  *                       Lars Pastewka, University of Freiburg
  *                       and others (see toplevel AUTHORS file)
  *
- * Phase 3.2 — GPU neighbour-list backend (CUDA/HIP single-source kernels).
- * Same algorithm as the CPU path (binning -> CSR cell list -> two-pass
- * count/fill), expressed as kernels over the Phase-3.3 sort/scan primitives.
+ * GPU neighbour-list backend (CUDA/HIP single-source kernels). Binning -> CSR
+ * cell list -> two-pass count/fill, expressed as kernels over device sort/scan
+ * primitives. The traversal and query are shared with the CPU path.
  *
- * Available only when a GPU backend is compiled in. The signature mirrors the
- * CPU neighbour_list(); for now the dense periodic / global-or-per-type cutoff
- * path is implemented (the path the benchmark and oracle exercise). Inputs are
- * host pointers; the result is returned on the host (NeighbourList), so this is
- * a drop-in oracle/benchmark target. Device-resident results land in Phase 4.
+ * Available only when a GPU backend is compiled in. neighbour_list_gpu() takes
+ * the same arguments as the CPU neighbour_list() and returns the result on the
+ * host (NeighbourList): inputs are host pointers and the output is copied back.
  */
 
 #ifndef MATSCIPY_NEIGHBOUR_LIST_GPU_HH
@@ -67,8 +65,8 @@ struct NeighbourListRequest {
 };
 
 /*
- * Device-resident result (Phase 4). Each requested quantity stays in device
- * memory as an Array<T, DeviceSpace>; unrequested ones are empty. Layout matches
+ * Device-resident result. Each requested quantity stays in device memory as an
+ * Array<T, DeviceSpace>; unrequested ones are empty. Layout matches
  * NeighbourList: distvec/shift are 3*npairs (logically npairs x 3). The *_view()
  * accessors give typed device Spans (valid as kernel/deep_copy arguments). The
  * Python layer exports these as DLPack tensors for zero-copy hand-off.
@@ -100,9 +98,9 @@ struct NeighbourListDevice {
 error_t neighbour_list_gpu_device(const NeighbourListRequest &req,
                                   NeighbourListDevice &out);
 
-/* Phase 3.4 (store vs recompute): per-atom neighbour counts left on the device
-   in `out.counts` (size nat), without materialising the O(npairs) pair arrays —
-   the basis for a GPU coordination number. (req.quantities is ignored.) */
+/* Leaves per-atom neighbour counts on the device in `out.counts` (size nat)
+   without materialising the O(npairs) pair arrays — a GPU coordination number.
+   (req.quantities is ignored.) */
 error_t neighbour_count_gpu_device(const NeighbourListRequest &req,
                                    NeighbourListDevice &out);
 #endif

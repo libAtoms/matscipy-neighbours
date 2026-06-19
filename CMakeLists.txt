@@ -19,7 +19,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(ENABLE_COVERAGE "Build with coverage instrumentation (gcov/llvm-cov)" OFF)
 option(BUILD_TESTING "Build the test suites" ON)
 
-# GPU backends (Phase 3). Off by default so the CPU build needs no toolkit.
+# GPU backends. Off by default so the CPU build needs no toolkit.
 # Exactly one may be enabled at a time; both share the single-source kernels.
 option(ENABLE_CUDA "Build the CUDA GPU backend (needs nvcc)" OFF)
 option(ENABLE_HIP "Build the HIP GPU backend (needs hipcc)" OFF)

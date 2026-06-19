@@ -7,9 +7,10 @@
  *                       Lars Pastewka, University of Freiburg
  *                       and others (see toplevel AUTHORS file)
  *
- * Phase 3.3 — CUB-backed device sort/scan. The HIP build uses hipCUB, AMD's
- * CUB-compatible wrapper over rocPRIM, so the call sites (DeviceScan::ExclusiveSum,
- * DeviceRadixSort::SortPairs, DoubleBuffer) are identical on both backends.
+ * CUB-backed device sort/scan. The CUDA build uses CUB; the HIP build uses
+ * hipCUB, AMD's CUB-compatible wrapper over rocPRIM, so the call sites
+ * (DeviceScan::ExclusiveSum, DeviceRadixSort::SortPairs, DoubleBuffer) are
+ * identical on both backends.
  */
 
 #include "device_primitives.hh"

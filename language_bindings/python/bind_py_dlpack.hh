@@ -17,14 +17,14 @@
 extern "C" {
 #endif
 
-/* Phase 4: compute a neighbour list and return each requested quantity as a
-   DLPack "dltensor" PyCapsule (zero-copy). The CPU backend yields host (kDLCPU)
+/* Compute a neighbour list and return each requested quantity as a DLPack
+   "dltensor" PyCapsule (zero-copy). The CPU backend yields host (kDLCPU)
    capsules for numpy.from_dlpack; the GPU backend yields device (kDLCUDA)
    capsules for cupy.from_dlpack, with results left on the device. */
 PyObject *py_neighbour_list_dlpack(PyObject *self, PyObject *args);
 
-/* Phase 3.4: per-atom neighbour counts (coordination) as a single DLPack
-   capsule, computed on the GPU without materialising the pair arrays. */
+/* Per-atom neighbour counts (coordination) as a single DLPack capsule, computed
+   on the GPU without materialising the pair arrays. */
 PyObject *py_coordination_dlpack(PyObject *self, PyObject *args);
 
 #ifdef __cplusplus

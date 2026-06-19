@@ -9,8 +9,7 @@
  *
  * Minimal DLPack ABI (the stable, unversioned `DLManagedTensor` layout that
  * numpy.from_dlpack / cupy.from_dlpack consume). These are plain C structs that
- * must match the published DLPack ABI exactly; written fresh here rather than
- * vendoring the upstream (Apache-2.0) header, to keep the tree MIT-clean.
+ * must match the published DLPack ABI exactly.
  */
 
 #ifndef MATSCIPY_DLPACK_H

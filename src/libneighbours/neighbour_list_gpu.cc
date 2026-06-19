@@ -7,11 +7,11 @@
  *                       Lars Pastewka, University of Freiburg
  *                       and others (see toplevel AUTHORS file)
  *
- * Phase 3.2 — GPU neighbour-list kernels. The CPU pipeline (neighbour_list.cc)
- * ported one-to-one onto the device: compute cell index, atomic-histogram the
- * cells, exclusive-scan to a CSR (Phase-3.3 primitive), scatter atoms into
- * cell-sorted order, gather per-atom data, then the two independent passes
- * (count, scan, fill). Every per-atom pass is one thread per atom.
+ * GPU neighbour-list kernels: compute cell index, atomic-histogram the cells,
+ * exclusive-scan to a CSR, scatter atoms into cell-sorted order, gather per-atom
+ * data, then the two passes (count, scan, fill). Every per-atom pass is one
+ * thread per atom. The traversal and query are shared with the CPU path; the
+ * requested quantities are left in device memory unless copied back to the host.
  */
 
 #include "neighbour_list_gpu.hh"
@@ -36,8 +36,8 @@ inline int grid_for(index_t n) { return static_cast<int>((n + BLOCK - 1) / BLOCK
    and Morton keys (cell_hash/morton3), the Dense/SparseQuery lookups, and the
    NeighbourContext + visit_neighbours traversal are all host+device functions
    shared with the CPU path (tools.hh / cell_list.hh / neighbour_visit.hh). The
-   kernels below only add the GPU-specific build (atomic histogram / hash) and
-   the two-pass driver. */
+   kernels below add the GPU-specific build (atomic histogram / hash) and the
+   two-pass driver. */
 
 /* RAII: switch to `dev` for the duration of the build, restore on exit. A
    negative id means "use the current device, don't switch" (host-input path). */
@@ -152,8 +152,8 @@ __global__ void k_cell_first_from_runs(const int *sorted_atom, const int *lin,
 
 /* --- sparse (hashed compact) cell list, for huge/sparse grids --------------
    Open addressing keyed by the 64-bit linear cell index; built in parallel with
-   atomicCAS inserts. The dense histogram/array path would need O(ncells) memory
-   (or overflow a 32-bit index) here. Mirrors cell_list.cc's build_sparse. */
+   atomicCAS inserts. Used when the dense histogram/array path would need
+   O(ncells) memory (or overflow a 32-bit index). */
 
 __global__ void k_fold_key64(const int *raw, int pbc0, int pbc1, int pbc2,
                             int n1, int n2, int n3, index_t nat,
@@ -254,13 +254,13 @@ __global__ void k_fill(NeighbourContext c, Query q, index_t nat, const int *offs
     visit_neighbours(c, q, static_cast<int>(si), f);
 }
 
-/* Device buffer alias (RAII via the Phase-3.1 Array). */
+/* Device buffer alias (RAII via Array). */
 template <typename T>
 using DBuf = Array<T, DeviceSpace>;
 
 /* Two-pass output, parameterised on the cell-lookup policy (dense or sparse).
-   Always fills `dev.counts` (per-atom neighbour count — Phase 3.4 coordination,
-   no pair materialisation); fills the pair arrays only when `want_pairs`. */
+   Always fills `dev.counts` (per-atom neighbour count, no pair materialisation);
+   fills the pair arrays only when `want_pairs`. */
 template <typename Query>
 static error_t count_and_fill(const NeighbourContext &ctx, const Query &q, index_t nat,
                               int quantities, bool want_pairs,
@@ -330,9 +330,9 @@ static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
     if (nat <= 0) return NL_SUCCESS;
     DeviceGuard guard(device_id);  /* run on the input's device; restore on exit */
 
-    /* Grid definition (resolution, bins, box widths) via the shared helper —
-       same computation as the CPU path. The binning vectors of `grid` stay
-       empty; the GPU builds its cell list in device memory below. */
+    /* Grid definition (resolution, bins, box widths) via the shared helper. The
+       binning vectors of `grid` stay empty; the GPU builds its cell list in
+       device memory below. */
     CellGrid grid;
     if (!cell_grid_geometry(cell_origin, cell, inv_cell, pbc, cutoff, grid))
         return set_error("Zero cell volume.");
@@ -342,7 +342,7 @@ static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
 
     /* Cell count in 64-bit: a huge/sparse grid can exceed a 32-bit index, which
        is exactly when the hashed compact backend is used instead of dense
-       arrays (mirrors cell_list.cc's threshold). */
+       arrays. */
     const std::int64_t ncells = static_cast<std::int64_t>(n1) * n2 * n3;
     const std::int64_t budget =
         std::max<std::int64_t>(1 << 20, 8 * static_cast<std::int64_t>(nat));
@@ -398,7 +398,7 @@ static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
             GPU_LAUNCH(k_morton_key, g_at, BLOCK, d_raw.data(), pbc[0], pbc[1],
                        pbc[2], n1, n2, n3, nat, d_key.data());
             GPU_LAUNCH(k_iota, g_at, BLOCK, d_sorted.data(), nat);
-            device_sort_pairs(d_key.data(), d_sorted.data(), nat);  /* Phase 3.3 */
+            device_sort_pairs(d_key.data(), d_sorted.data(), nat);
             /* Empty cells keep count 0, so their cell_first is unused. */
             GPU_LAUNCH(k_cell_first_from_runs, g_at, BLOCK, d_sorted.data(),
                        d_lin.data(), nat, d_cell_first.data());
@@ -500,7 +500,7 @@ error_t neighbour_list_gpu_device(const NeighbourListRequest &req,
 
 error_t neighbour_count_gpu_device(const NeighbourListRequest &req,
                                    NeighbourListDevice &out) {
-    /* Phase 3.4: per-atom neighbour counts without materialising the pairs. */
+    /* Per-atom neighbour counts without materialising the pairs. */
     return build_device(req, /*want_pairs=*/false, out);
 }
 

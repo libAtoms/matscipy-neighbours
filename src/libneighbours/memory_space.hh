@@ -19,16 +19,14 @@
 namespace matscipy {
 
 /*
- * Memory-space abstraction (Phase 3.1 of the refresh roadmap). A buffer lives
- * in exactly one space; `Array<T, Space>` owns it and `deep_copy` moves bytes
- * between spaces. The same algorithm code can then run on host (OpenMP) or
- * device (CUDA/HIP) by choosing the Space tag.
+ * Memory-space abstraction. A buffer lives in exactly one space;
+ * `Array<T, Space>` owns it and `deep_copy` moves bytes between spaces. The
+ * same algorithm code runs on host (OpenMP) or device (CUDA/HIP) by choosing
+ * the Space tag. Provides the operations the neighbour-list pipeline needs:
+ * own, resize, deep-copy.
  *
- * This is a clean MIT reimplementation, not a copy of muGrid/Kokkos. It is the
- * minimum needed for the neighbour-list pipeline: own, resize, deep-copy.
- *
- * The device-type codes match DLPack (kDLCPU=1, kDLCUDA=2, kDLROCm=10) so the
- * Phase-4 DLPack export is a direct tag read with no translation table.
+ * The device-type codes match DLPack (kDLCPU=1, kDLCUDA=2, kDLROCm=10) so a
+ * DLPack export is a direct tag read with no translation table.
  */
 enum class DeviceType : int {
     CPU = 1,    /* kDLCPU  */
@@ -49,7 +47,7 @@ struct HipSpace {
     static constexpr const char *name = "hip";
 };
 
-/* The active GPU space — `Array<T, DeviceSpace>` is the device buffer type the
+/* The active GPU space. `Array<T, DeviceSpace>` is the device buffer type the
    backend code uses, so the same source compiles under CUDA or HIP. */
 #if defined(MATSCIPY_ENABLE_CUDA)
 using DeviceSpace = CudaSpace;
@@ -61,9 +59,9 @@ namespace detail {
 
 /* Raw byte-level hooks, one set per backend. Host is always linked; the device
    hooks live in a backend translation unit compiled only when that backend is
-   enabled. Keeping them non-template free functions means Array<> stays
-   header-only while the actual cudaMalloc/cudaMemcpy calls sit in the GPU
-   backend source (memory_space_gpu.cc, compiled by nvcc/hipcc). */
+   enabled. They are non-template free functions, so Array<> stays header-only
+   while the actual cudaMalloc/cudaMemcpy calls sit in the GPU backend source
+   (memory_space_gpu.cc, compiled by nvcc/hipcc). */
 void *alloc_host(std::size_t bytes);
 void free_host(void *ptr);
 
@@ -140,15 +138,15 @@ inline void space_free(void *ptr) {
 }  // namespace detail
 
 /*
- * Owning, move-only buffer of `T` in `Space`. Deliberately minimal: it is a
- * sized allocation, not a std::vector — no per-element construction (T is a
- * trivial numeric type), no copy ctor (deep copies are explicit, via
- * deep_copy, so a device round-trip is never silent).
+ * Owning, move-only buffer of `T` in `Space`. A sized allocation, not a
+ * std::vector: no per-element construction (T is a trivial numeric type) and no
+ * copy ctor, so deep copies are explicit via deep_copy and a device round-trip
+ * is never silent.
  *
- * resize() that grows DISCARDS existing contents (the pipeline always allocates
- * to an exact size and then fills); shrinking keeps the buffer and just lowers
- * the logical size. data() on a device array is a device pointer — only valid
- * in kernels / as a deep_copy argument, never dereferenced on the host.
+ * resize() that grows DISCARDS existing contents; shrinking keeps the buffer
+ * and just lowers the logical size. data() on a device array is a device
+ * pointer, only valid in kernels or as a deep_copy argument, never dereferenced
+ * on the host.
  */
 template <typename T, typename Space = HostSpace>
 class Array {

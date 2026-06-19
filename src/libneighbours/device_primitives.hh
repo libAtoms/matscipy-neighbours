@@ -7,14 +7,14 @@
  *                       Lars Pastewka, University of Freiburg
  *                       and others (see toplevel AUTHORS file)
  *
- * Phase 3.3 — data-parallel primitives (radix sort, exclusive scan) on the
- * device, wrapping CUB (CUDA) / rocPRIM (HIP). These are the parallel
- * equivalents of the serial counting-sort prefix-sum + scatter the CPU path
- * uses; they unblock the key-sorted (Morton) build and the count->offset scan.
+ * Data-parallel primitives (radix sort, exclusive scan) on the device,
+ * wrapping CUB (CUDA) / rocPRIM (HIP). These are the parallel equivalents of
+ * the serial counting-sort prefix-sum + scatter the CPU path uses, and drive
+ * the key-sorted (Morton) build and the count->offset scan.
  *
  * Declarations only; the implementation is in device_primitives.cc, compiled by
- * nvcc/hipcc (CMake assigns it the CUDA/HIP language). Header is plain C++ so
- * host translation units may call these.
+ * nvcc/hipcc (CMake assigns it the CUDA/HIP language). The header is plain C++
+ * so host translation units may call these.
  */
 
 #ifndef MATSCIPY_DEVICE_PRIMITIVES_HH

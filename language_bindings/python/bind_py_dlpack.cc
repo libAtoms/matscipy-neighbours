@@ -7,12 +7,12 @@
  *                       Lars Pastewka, University of Freiburg
  *                       and others (see toplevel AUTHORS file)
  *
- * Phase 4 — DLPack import/export. Builds the neighbour list on the requested
- * backend and hands each output array to Python as a DLPack "dltensor" capsule
- * that OWNS its buffer (host std::vector or device Array<T, DeviceSpace>); any
- * DLPack consumer (numpy/cupy/torch/jax) then wraps it zero-copy. Device input
- * is read the same way — via the array's __dlpack__ — so the GPU path is not
- * tied to cupy and never round-trips positions through the host.
+ * DLPack import/export. Builds the neighbour list on the requested backend and
+ * hands each output array to Python as a DLPack "dltensor" capsule that OWNS its
+ * buffer (host std::vector or device Array<T, DeviceSpace>); any DLPack consumer
+ * (numpy/cupy/torch/jax) then wraps it zero-copy. Device input is read the same
+ * way — via the array's __dlpack__ — so the GPU path is framework-agnostic and
+ * never round-trips positions through the host.
  */
 
 #include <Python.h>

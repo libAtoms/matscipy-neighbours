@@ -96,8 +96,8 @@ static index_t run_gpu(const char *label, int flags, int N, const real_t cell[9]
     return pairs;
 }
 
-/* Phase-3.1 baseline: just the PCIe round-trip for one call's data
-   (H2D 3N positions + D2H 3*pairs distance components). No compute. */
+/* Just the PCIe round-trip for one call's data (H2D 3N positions + D2H
+   3*pairs distance components). No compute. */
 static void run_transfer(int N, index_t pairs) {
     Array<real_t> h_pos(3 * N), h_out(3 * (size_t)pairs);
     Array<real_t, CudaSpace> d_pos(3 * N), d_out(3 * (size_t)pairs);
@@ -154,8 +154,7 @@ int main(int argc, char **argv) {
 
     /* Sparse scenario: atoms clustered in a corner of a box with lots of
        vacuum (50x larger per side). The grid has ~1.2e5x more cells than the
-       dense case, so the hashed compact backend is selected; the old code would
-       have collapsed the bin count and degraded toward O(N^2). For reference we
+       dense case, so the hashed compact backend is selected. For reference we
        run the *same atoms* in a tight box (dense) too. */
     {
         const int N = 50000;

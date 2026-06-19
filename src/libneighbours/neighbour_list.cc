@@ -7,15 +7,14 @@
  *                       Lars Pastewka, University of Freiburg
  *                       and others (see toplevel AUTHORS file)
  *
- * Binning neighbour-list construction as data-parallel primitives (Ihmsen et
- * al. 2010, Band et al. 2019):
+ * Binning neighbour-list construction as data-parallel primitives:
  *   - the per-atom cell index is computed once (cell_origin/inv_cell);
  *   - atoms are sorted into a CSR cell list (cell_list.{hh,cc}), dense or, for
  *     huge/sparse grids, a hashed compact table;
  *   - per-atom data is stored in cell-sorted order so the inner pair loop reads
  *     contiguous memory and does no matrix-vector products;
  *   - pairs are produced in two passes (count, then fill into exactly-sized
- *     buffers); each atom's work is independent — OpenMP here, GPU later.
+ *     buffers); each atom's work is independent and parallelised with OpenMP.
  */
 
 #include "neighbour_list.hh"
@@ -34,8 +33,10 @@ namespace matscipy {
 namespace {
 
 /* The two passes (count, then fill) for a chosen cell backend. The traversal
-   itself (visit_neighbours) and NeighbourContext are shared with the GPU path
-   in neighbour_visit.hh. */
+   (visit_neighbours) and NeighbourContext in neighbour_visit.hh are shared with
+   the GPU path. The first pass counts each atom's neighbours; the counts are
+   prefix-summed into write offsets, the output buffers are sized exactly, and
+   the second pass fills them. Pairs come out sorted by the first index i. */
 template <typename Query>
 void build_pairs(const NeighbourContext &ctx, const Query &q, index_t nat,
                  int quantities, NeighbourList &out) {

@@ -1,10 +1,8 @@
 """Compatibility tests: the public ``matscipy_neighbours`` API against ASE.
 
-These mirror the scenarios covered by upstream matscipy's neighbour-list test
-suite (graphite coordination, FCC bulk, element-pair dict cutoffs, atoms
-outside the box, supercell consistency, the minimum-image convention). They are
-reimplemented here (matscipy is GPL; this project is MIT) and exercise the
-MIT wrapper that gives matscipy API compatibility.
+These cover graphite coordination, FCC bulk, element-pair dict cutoffs, atoms
+outside the box, supercell consistency, and the minimum-image convention,
+exercising the wrapper that provides matscipy API compatibility.
 """
 
 import numpy as np

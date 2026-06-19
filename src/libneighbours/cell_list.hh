@@ -25,17 +25,15 @@ namespace matscipy {
 enum class CellOrder { Linear, Morton };
 
 /*
- * Atoms binned into an n1 x n2 x n3 grid (Ihmsen et al. 2010, Band et al.
- * 2019). A CellGrid bundles two cohesive things:
+ * Atoms binned into an n1 x n2 x n3 grid. A CellGrid bundles two things:
  *
  *  - the *grid definition* — the spatial partition itself: cell matrix/origin,
  *    its inverse, the resolution n1/n2/n3, the per-cell edge vectors, the box
  *    widths `len`, and periodicity. This is what makes the cell indices and
- *    `sorted_atom` meaningful, so it lives with the binning rather than in the
- *    caller. (The query *cutoff* is deliberately NOT here — it is a property of
- *    a neighbour search, not of the grid; the grid only bounds the usable
- *    cutoff via its resolution.)
- *  - the *binning* — atoms grouped per cell. Atoms of one cell are a contiguous
+ *    `sorted_atom` meaningful. The query *cutoff* is not part of it: the cutoff
+ *    is a property of a neighbour search, and the grid only bounds the usable
+ *    cutoff via its resolution.
+ *  - the *binning* — atoms grouped per cell. Atoms of one cell form a contiguous
  *    slice of `sorted_atom`, via one of two backends:
  *      dense  — `cell_first[c]` / `cell_count[c]` indexed by linear cell index
  *               c = c1 + n1*(c2 + n2*c3). O(ncells) memory.
@@ -67,8 +65,8 @@ struct CellGrid {
     std::int64_t hmask = 0;            /* cap - 1 */
 };
 
-/* These leaf helpers (hash, Morton key, cell lookup) are shared host+device:
-   one definition serves the CPU loops and the GPU kernels. */
+/* These leaf helpers (hash, Morton key, cell lookup) are host+device: one
+   definition serves both the CPU loops and the GPU kernels. */
 
 /* 64-bit hash used by both the sparse build and query (Fibonacci hashing). */
 MATSCIPY_HD inline std::int64_t cell_hash(std::int64_t key) {

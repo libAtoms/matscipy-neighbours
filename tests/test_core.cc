@@ -4,9 +4,9 @@
  *
  * SPDX-License-Identifier: MIT
  *
- * GoogleTest unit tests for the Python-free C++ core. These prove the core
- * links and runs with no Python at all. Exhaustive brute-force validation of
- * the algorithm over many cell shapes lives in the Python suite.
+ * GoogleTest unit tests for the Python-free C++ core. They check that the core
+ * links and runs without Python. Exhaustive brute-force validation of the
+ * algorithm over many cell shapes lives in the Python suite.
  */
 
 #include <gtest/gtest.h>

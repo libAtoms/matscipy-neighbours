@@ -23,7 +23,8 @@
 using namespace matscipy;
 
 TEST(MemorySpace, DeviceTypeCodesMatchDLPack) {
-    /* DLPack: kDLCPU=1, kDLCUDA=2, kDLROCm=10. Phase 4 reads these directly. */
+    /* Each space's device code matches the DLPack device type:
+       kDLCPU=1, kDLCUDA=2, kDLROCm=10. */
     EXPECT_EQ(static_cast<int>(HostSpace::device), 1);
     EXPECT_EQ(static_cast<int>(CudaSpace::device), 2);
     EXPECT_EQ(static_cast<int>(HipSpace::device), 10);

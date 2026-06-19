@@ -1,4 +1,4 @@
-"""Phase 4 — DLPack interop and the framework-agnostic API.
+"""DLPack interop and the framework-agnostic API.
 
 Covers the host path (numpy fast path, DLPack capsules, other frameworks),
 the device path (cupy in -> cupy out via DLPack import/export), the device

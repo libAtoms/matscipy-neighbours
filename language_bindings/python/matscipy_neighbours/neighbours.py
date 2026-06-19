@@ -1,9 +1,9 @@
 """Public neighbour-list API, compatible with ``matscipy.neighbours``.
 
-Independent, MIT-licensed reimplementation on top of the ``_matscipy_neighbours``
-C-extension. The C-extension signature (``neighbour_list(quantities,
-cell_origin, cell, inv_cell, pbc, positions, cutoff, numbers)``) is the same one
-matscipy's ``_matscipy`` backend exposes, so the two are interchangeable.
+Built on the ``_matscipy_neighbours`` C-extension. The C-extension signature
+(``neighbour_list(quantities, cell_origin, cell, inv_cell, pbc, positions,
+cutoff, numbers)``) matches the one matscipy's ``_matscipy`` backend exposes, so
+the two are interchangeable.
 """
 
 import numpy as np
