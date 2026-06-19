@@ -54,7 +54,8 @@ namespace detail {
 /* Raw byte-level hooks, one set per backend. Host is always linked; the device
    hooks live in a backend translation unit compiled only when that backend is
    enabled. Keeping them non-template free functions means Array<> stays
-   header-only while the actual cudaMalloc/cudaMemcpy calls sit in a .cu. */
+   header-only while the actual cudaMalloc/cudaMemcpy calls sit in the GPU
+   backend source (memory_space_gpu.cc, compiled by nvcc/hipcc). */
 void *alloc_host(std::size_t bytes);
 void free_host(void *ptr);
 

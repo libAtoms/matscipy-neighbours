@@ -109,9 +109,26 @@ if(BUILD_TESTING)
                                     PROPERTIES LANGUAGE HIP)
     endif()
 
+    # GPU neighbour-list validation (only meaningful with a GPU backend).
+    if(ENABLE_CUDA OR ENABLE_HIP)
+        add_executable(test_neighbour_list_gpu tests/test_neighbour_list_gpu.cc)
+        target_link_libraries(test_neighbour_list_gpu
+                              PRIVATE neighbours GTest::gtest_main)
+        if(ENABLE_CUDA)
+            set_source_files_properties(tests/test_neighbour_list_gpu.cc
+                                        PROPERTIES LANGUAGE CUDA)
+        else()
+            set_source_files_properties(tests/test_neighbour_list_gpu.cc
+                                        PROPERTIES LANGUAGE HIP)
+        endif()
+    endif()
+
     include(GoogleTest)
     gtest_discover_tests(test_core)
     gtest_discover_tests(test_memory_space)
+    if(ENABLE_CUDA OR ENABLE_HIP)
+        gtest_discover_tests(test_neighbour_list_gpu)
+    endif()
 
     # --- Python tests (pytest) ---------------------------------------------
     execute_process(

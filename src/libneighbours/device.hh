@@ -10,7 +10,8 @@
  * Thin single-source GPU shim (Phase 3.2). The same kernel body compiles under
  * nvcc (CUDA) or hipcc (HIP); this header maps the vendor runtime onto common
  * names so the algorithm code below contains no <<<>>> / hipLaunchKernelGGL
- * spelled out by hand. Included only from .cu/.hip translation units.
+ * spelled out by hand. Included only from the GPU backend sources (the .cc
+ * files CMake compiles with nvcc/hipcc).
  */
 
 #ifndef MATSCIPY_DEVICE_HH
@@ -29,6 +30,7 @@ using gpuError_t = cudaError_t;
 #define gpuSuccess cudaSuccess
 #define gpuMalloc cudaMalloc
 #define gpuFree cudaFree
+#define gpuMemset cudaMemset
 #define gpuMemcpy cudaMemcpy
 #define gpuMemcpyHostToDevice cudaMemcpyHostToDevice
 #define gpuMemcpyDeviceToHost cudaMemcpyDeviceToHost
@@ -43,6 +45,7 @@ using gpuError_t = hipError_t;
 #define gpuSuccess hipSuccess
 #define gpuMalloc hipMalloc
 #define gpuFree hipFree
+#define gpuMemset hipMemset
 #define gpuMemcpy hipMemcpy
 #define gpuMemcpyHostToDevice hipMemcpyHostToDevice
 #define gpuMemcpyDeviceToHost hipMemcpyDeviceToHost

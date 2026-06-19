@@ -14,16 +14,26 @@ add_library(neighbours STATIC
 
 # GPU backend sources (single-source kernels + device memory backend). Added to
 # the same target and compiled by nvcc/hipcc; the CPU build omits them entirely.
+# Single-source GPU backend: one .cc body per file, compiled by nvcc or hipcc
+# (CMake assigns the CUDA/HIP language below — the source is backend-neutral, so
+# it is NOT named .cu). The CPU build omits these entirely.
+set(_gpu_sources
+    memory_space_gpu.cc
+    device_primitives.cc
+    neighbour_list_gpu.cc
+)
 if(ENABLE_CUDA)
-    target_sources(neighbours PRIVATE memory_space_cuda.cu)
-    set_source_files_properties(memory_space_cuda.cu PROPERTIES LANGUAGE CUDA)
+    target_sources(neighbours PRIVATE ${_gpu_sources})
+    set_source_files_properties(${_gpu_sources} PROPERTIES LANGUAGE CUDA)
     # The header guards device code on MATSCIPY_ENABLE_CUDA; PUBLIC so every
     # consumer (extension, tests) sees the same Array<T, CudaSpace> definition.
     target_compile_definitions(neighbours PUBLIC MATSCIPY_ENABLE_CUDA)
+    # Separable compilation: device_primitives.cc defines functions called from
+    # neighbour_list_gpu.cc's host code (device-link across TUs).
     set_target_properties(neighbours PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 elseif(ENABLE_HIP)
-    target_sources(neighbours PRIVATE memory_space_cuda.cu)
-    set_source_files_properties(memory_space_cuda.cu PROPERTIES LANGUAGE HIP)
+    target_sources(neighbours PRIVATE ${_gpu_sources})
+    set_source_files_properties(${_gpu_sources} PROPERTIES LANGUAGE HIP)
     target_compile_definitions(neighbours PUBLIC MATSCIPY_ENABLE_HIP)
 endif()
 
