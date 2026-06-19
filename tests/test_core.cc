@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cmath>
 #include <vector>
 
 #include "first_neighbours.hh"
