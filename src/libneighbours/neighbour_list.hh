@@ -13,6 +13,7 @@
 
 #include <vector>
 
+#include "cell_list.hh"
 #include "types.hh"
 
 namespace matscipy {
@@ -55,7 +56,8 @@ error_t neighbour_list(int quantities, const real_t cell_origin[3],
                        const bool pbc[3], index_t nat, const real_t *positions,
                        real_t cutoff, const real_t *per_atom_cutoff,
                        const real_t *per_type_cutoff_sq, index_t ncutoffs,
-                       const index_t *types, NeighbourList &out);
+                       const index_t *types, NeighbourList &out,
+                       CellOrder order = CellOrder::Linear);
 
 }  // namespace matscipy
 

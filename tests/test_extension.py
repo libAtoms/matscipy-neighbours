@@ -148,6 +148,18 @@ def test_brute_force_triclinic(pbc):
     assert got == brute_force(cell, pos, pbc, 1.6)
 
 
+@pytest.mark.parametrize("pbc", [True, False, (True, False, True)])
+def test_sparse_backend_vacuum(pbc):
+    """A small cluster in a big box has a huge cell grid -> hashed (compact)
+    backend. Results must still match brute force."""
+    rng = np.random.default_rng(3)
+    cell = 120.0 * np.eye(3)          # ~1.7e6 cells >> 8*natoms -> sparse path
+    pos = rng.uniform(0, 6.0, size=(250, 3))
+    i, j = neighbour_list("ij", cell, pos, 1.5, pbc=pbc)
+    got = sorted(zip(i.tolist(), j.tolist()))
+    assert got == brute_force(cell, pos, pbc, 1.5)
+
+
 def test_atoms_outside_box_match_brute_force():
     """Atoms displaced far outside the cell must still be handled (wrap/trunc)."""
     rng = np.random.default_rng(99)
