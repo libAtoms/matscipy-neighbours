@@ -39,6 +39,15 @@ find_package(Python REQUIRED
 add_subdirectory(language_bindings/python)
 
 # ----------------------------------------------------------------------
+# Benchmarks
+# ----------------------------------------------------------------------
+option(BUILD_BENCHMARKS "Build the core benchmark executable" ON)
+if(BUILD_BENCHMARKS)
+    add_executable(bench_core benchmarks/bench_core.cc)
+    target_link_libraries(bench_core PRIVATE neighbours)
+endif()
+
+# ----------------------------------------------------------------------
 # Tests
 # ----------------------------------------------------------------------
 if(BUILD_TESTING)
