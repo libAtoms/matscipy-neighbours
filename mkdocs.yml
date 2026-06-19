@@ -1,0 +1,55 @@
+site_name: matscipy-neighbours
+site_description: Fast neighbour lists for particle simulations (CPU + CUDA/HIP, DLPack interop)
+site_url: https://libatoms.github.io/matscipy-neighbours/
+repo_url: https://github.com/libAtoms/matscipy-neighbours
+repo_name: libAtoms/matscipy-neighbours
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+    - toc.follow
+
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - tables
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Python API: python.md
+  - C++ API: cpp.md
+  - Algorithm & references: algorithm.md
+
+# REFRESH.md is a development roadmap, not part of the user-facing docs; keep it
+# in the tree but leave it out of the published site.
+exclude_docs: |
+  REFRESH.md
+  requirements.txt
