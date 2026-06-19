@@ -33,10 +33,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#include "angle_distribution.h"
-#include "islands.h"
-#include "neighbours.h"
-#include "ring_statistics.h"
+#include "bind_py_neighbours.hh"
 
 #include "module.h"
 
@@ -81,7 +78,7 @@ static PyMethodDef module_methods[] = {
         ob = Py_InitModule3(name, methods, doc);
 #endif
 
-MOD_INIT(_matscipy)
+MOD_INIT(_matscipy_neighbours)
 {
     PyObject* m;
 

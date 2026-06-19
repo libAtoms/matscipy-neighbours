@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip numpy pytest ase
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DPython_EXECUTABLE=$(which python)
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test (C++ core + Python)
+        run: ctest --test-dir build --output-on-failure
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pytest pytest-cov ase gcovr
+
+      - name: Configure (with coverage)
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DENABLE_COVERAGE=ON
+          -DPython_EXECUTABLE=$(which python)
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run tests (populates coverage data)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: C++ coverage report (core)
+        run: >
+          gcovr --root . --filter 'src/libneighbours/'
+          --xml-pretty -o coverage-cpp.xml
+          --print-summary build
+
+      - name: Python coverage report (wrapper)
+        run: >
+          PYTHONPATH=build:language_bindings/python
+          python -m pytest tests
+          --cov=matscipy_neighbours --cov-report=xml:coverage-py.xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage-cpp.xml,coverage-py.xml
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
