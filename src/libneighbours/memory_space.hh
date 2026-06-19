@@ -49,6 +49,14 @@ struct HipSpace {
     static constexpr const char *name = "hip";
 };
 
+/* The active GPU space — `Array<T, DeviceSpace>` is the device buffer type the
+   backend code uses, so the same source compiles under CUDA or HIP. */
+#if defined(MATSCIPY_ENABLE_CUDA)
+using DeviceSpace = CudaSpace;
+#elif defined(MATSCIPY_ENABLE_HIP)
+using DeviceSpace = HipSpace;
+#endif
+
 namespace detail {
 
 /* Raw byte-level hooks, one set per backend. Host is always linked; the device

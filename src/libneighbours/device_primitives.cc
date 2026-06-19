@@ -7,8 +7,9 @@
  *                       Lars Pastewka, University of Freiburg
  *                       and others (see toplevel AUTHORS file)
  *
- * Phase 3.3 — CUB-backed device sort/scan. The HIP build maps these onto
- * rocPRIM (same call shapes); guarded include below.
+ * Phase 3.3 — CUB-backed device sort/scan. The HIP build uses hipCUB, AMD's
+ * CUB-compatible wrapper over rocPRIM, so the call sites (DeviceScan::ExclusiveSum,
+ * DeviceRadixSort::SortPairs, DoubleBuffer) are identical on both backends.
  */
 
 #include "device_primitives.hh"
@@ -20,8 +21,8 @@
 #include <cub/device/device_scan.cuh>
 namespace gpuprim = cub;
 #elif defined(MATSCIPY_ENABLE_HIP)
-#include <rocprim/rocprim.hpp>
-namespace gpuprim = rocprim;
+#include <hipcub/hipcub.hpp>
+namespace gpuprim = hipcub;
 #endif
 
 namespace matscipy {

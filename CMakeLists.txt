@@ -45,7 +45,12 @@ if(ENABLE_HIP)
     enable_language(HIP)
     set(CMAKE_HIP_STANDARD 17)
     set(CMAKE_HIP_STANDARD_REQUIRED ON)
-    message(STATUS "matscipy-neighbours: HIP backend ON")
+    if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
+        set(CMAKE_HIP_ARCHITECTURES "gfx906;gfx908;gfx90a"
+            CACHE STRING "HIP architectures to compile for")
+    endif()
+    message(STATUS "matscipy-neighbours: HIP backend ON "
+                   "(arch ${CMAKE_HIP_ARCHITECTURES})")
 endif()
 
 if(ENABLE_COVERAGE)

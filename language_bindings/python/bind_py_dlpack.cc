@@ -97,11 +97,13 @@ PyObject *host_capsule(std::vector<T> &&v, int ndim, int64_t d0, int64_t d1,
 
 #if defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP)
 template <typename T>
-PyObject *device_capsule(Array<T, CudaSpace> &&a, int ndim, int64_t d0,
+PyObject *device_capsule(Array<T, DeviceSpace> &&a, int ndim, int64_t d0,
                          int64_t d1, uint8_t code, uint8_t bits, int dev_id) {
-    auto keep = std::make_shared<Array<T, CudaSpace>>(std::move(a));
+    auto keep = std::make_shared<Array<T, DeviceSpace>>(std::move(a));
     void *data = keep->data();
-    return make_capsule(keep, data, ndim, d0, d1, code, bits, kDLCUDA, dev_id);
+    /* DeviceType codes equal the DLPack device codes by construction. */
+    const auto dev = static_cast<DLDeviceType>(static_cast<int>(DeviceSpace::device));
+    return make_capsule(keep, data, ndim, d0, d1, code, bits, dev, dev_id);
 }
 #endif
 
@@ -113,11 +115,12 @@ PyObject *py_neighbour_list_dlpack(PyObject *self, PyObject *args) {
     int backend = 0;                  /* 0 = CPU/host, 1 = GPU/device */
     unsigned long long r_device_ptr = 0;  /* nonzero => device positions ptr */
     int nat_override = -1;
+    int device_id = -1;               /* GPU to run on / report; -1 = current */
 
-    if (!PyArg_ParseTuple(args, "O!OOOOOO|OiKi", &PyUnicode_Type, &py_quant,
+    if (!PyArg_ParseTuple(args, "O!OOOOOO|OiKii", &PyUnicode_Type, &py_quant,
                           &py_origin, &py_cell, &py_inv, &py_pbc, &py_pos,
                           &py_cut, &py_types, &backend, &r_device_ptr,
-                          &nat_override))
+                          &nat_override, &device_id))
         return NULL;
 
 #if !(defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP))
@@ -253,12 +256,13 @@ PyObject *py_neighbour_list_dlpack(PyObject *self, PyObject *args) {
             NeighbourListDevice dev;
             if (neighbour_list_gpu_device(flags, origin, cell, inv, pbc, nat, r,
                                           r_is_dev, cutoff, per_atom, per_type_sq,
-                                          ncutoffs, types, dev) != NL_SUCCESS) {
+                                          ncutoffs, types, CellOrder::Linear,
+                                          device_id, dev) != NL_SUCCESS) {
                 if (has_error) PyErr_SetString(PyExc_RuntimeError, error_string);
                 goto fail;
             }
             const int64_t np = dev.npairs;
-            const int dev_id = current_device_id();
+            const int dev_id = device_id >= 0 ? device_id : current_device_id();
             int pos = 0;
             for (const char *q = quantities; *q; q++, pos++) {
                 PyObject *cap = NULL;
@@ -302,4 +306,108 @@ fail:
     Py_XDECREF(a_pos);
     Py_XDECREF(a_types);
     return NULL;
+}
+
+PyObject *py_coordination_dlpack(PyObject *self, PyObject *args) {
+#if !(defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP))
+    (void)args;
+    PyErr_SetString(PyExc_RuntimeError,
+                    "GPU coordination requires a GPU backend (-DENABLE_CUDA=ON).");
+    return NULL;
+#else
+    PyObject *py_origin, *py_cell, *py_inv, *py_pbc, *py_pos, *py_cut;
+    PyObject *py_types = NULL;
+    unsigned long long r_device_ptr = 0;
+    int nat_override = -1, device_id = -1;
+
+    if (!PyArg_ParseTuple(args, "OOOOOO|OKii", &py_origin, &py_cell, &py_inv,
+                          &py_pbc, &py_pos, &py_cut, &py_types, &r_device_ptr,
+                          &nat_override, &device_id))
+        return NULL;
+
+    PyObject *a_origin = NULL, *a_cell = NULL, *a_inv = NULL, *a_pbc = NULL;
+    PyObject *a_pos = NULL, *a_cut = NULL, *a_types = NULL, *ret = NULL;
+    a_origin = PyArray_FROMANY(py_origin, NPY_DOUBLE, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
+    a_cell = PyArray_FROMANY(py_cell, NPY_DOUBLE, 2, 2, NPY_ARRAY_C_CONTIGUOUS);
+    a_inv = PyArray_FROMANY(py_inv, NPY_DOUBLE, 2, 2, NPY_ARRAY_C_CONTIGUOUS);
+    a_pbc = PyArray_FROMANY(py_pbc, NPY_BOOL, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
+    a_pos = PyArray_FROMANY(py_pos, NPY_DOUBLE, 2, 2, NPY_ARRAY_C_CONTIGUOUS);
+    if (!a_origin || !a_cell || !a_inv || !a_pbc || !a_pos) goto cfail;
+    if (py_types && py_types != Py_None) {
+        a_types = PyArray_FROMANY(py_types, NPY_INT, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
+        if (!a_types) goto cfail;
+    }
+    {
+        index_t nat = nat_override >= 0
+                          ? (index_t)nat_override
+                          : (index_t)PyArray_DIM((PyArrayObject *)a_pos, 0);
+        real_t cutoff = 0.0;
+        const real_t *per_atom = NULL, *per_type_sq = NULL;
+        index_t ncutoffs = 0;
+        std::vector<real_t> pt_storage;
+        if (PyFloat_Check(py_cut)) {
+            cutoff = PyFloat_AsDouble(py_cut);
+        } else {
+            a_cut = PyArray_FROMANY(py_cut, NPY_DOUBLE, 1, 2, NPY_ARRAY_C_CONTIGUOUS);
+            if (!a_cut) goto cfail;
+            int ndim = PyArray_NDIM((PyArrayObject *)a_cut);
+            npy_intp dim0 = PyArray_DIM((PyArrayObject *)a_cut, 0);
+            const real_t *cd = (const real_t *)PyArray_DATA((PyArrayObject *)a_cut);
+            if (ndim == 1) {
+                for (npy_intp k = 0; k < dim0; k++) cutoff = std::max(cutoff, 2 * cd[k]);
+                per_atom = cd;
+            } else {
+                ncutoffs = (index_t)dim0;
+                pt_storage.resize((size_t)ncutoffs * ncutoffs);
+                for (size_t k = 0; k < pt_storage.size(); k++) {
+                    cutoff = std::max(cutoff, cd[k]);
+                    pt_storage[k] = cd[k] * cd[k];
+                }
+                per_type_sq = pt_storage.data();
+            }
+        }
+        const real_t *origin = (const real_t *)PyArray_DATA((PyArrayObject *)a_origin);
+        const real_t *cell = (const real_t *)PyArray_DATA((PyArrayObject *)a_cell);
+        const real_t *inv = (const real_t *)PyArray_DATA((PyArrayObject *)a_inv);
+        const npy_bool *pb = (const npy_bool *)PyArray_DATA((PyArrayObject *)a_pbc);
+        bool pbc[3] = {(bool)pb[0], (bool)pb[1], (bool)pb[2]};
+        const real_t *r = r_device_ptr
+                              ? (const real_t *)(uintptr_t)r_device_ptr
+                              : (const real_t *)PyArray_DATA((PyArrayObject *)a_pos);
+        const index_t *types =
+            a_types ? (const index_t *)PyArray_DATA((PyArrayObject *)a_types) : NULL;
+
+        NeighbourListDevice dev;
+        if (neighbour_count_gpu_device(origin, cell, inv, pbc, nat, r,
+                                       r_device_ptr != 0, cutoff, per_atom,
+                                       per_type_sq, ncutoffs, types, device_id,
+                                       dev) != NL_SUCCESS) {
+            if (has_error) PyErr_SetString(PyExc_RuntimeError, error_string);
+            goto cfail;
+        }
+        const int dev_id = device_id >= 0 ? device_id : current_device_id();
+        ret = device_capsule(std::move(dev.counts), 1, nat, 1, kDLInt, kIntBits,
+                             dev_id);
+        if (!ret) goto cfail;
+    }
+    Py_XDECREF(a_cut);
+    Py_XDECREF(a_origin);
+    Py_XDECREF(a_cell);
+    Py_XDECREF(a_inv);
+    Py_XDECREF(a_pbc);
+    Py_XDECREF(a_pos);
+    Py_XDECREF(a_types);
+    return ret;
+
+cfail:
+    Py_XDECREF(ret);
+    Py_XDECREF(a_cut);
+    Py_XDECREF(a_origin);
+    Py_XDECREF(a_cell);
+    Py_XDECREF(a_inv);
+    Py_XDECREF(a_pbc);
+    Py_XDECREF(a_pos);
+    Py_XDECREF(a_types);
+    return NULL;
+#endif
 }

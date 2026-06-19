@@ -105,6 +105,35 @@ def test_dlpack_cupy_roundtrip_matches_cpu():
 
 
 @requires_gpu
+def test_dlpack_cupy_multi_gpu():
+    """The result must land on the same device as the input cupy array."""
+    ndev = cupy.cuda.runtime.getDeviceCount()
+    positions, cell, inv_cell, origin, pbc = _random_config(N=2000, seed=4)
+    i_cpu = nl.neighbour_list("i", positions=positions, cell=cell, pbc=pbc,
+                              cutoff=1.0)
+    for d in range(ndev):
+        with cupy.cuda.Device(d):
+            pos_d = cupy.asarray(positions)
+            i, j = nl.neighbour_list("ij", positions=pos_d, cell=cell, pbc=pbc,
+                                     cutoff=1.0)
+        assert int(i.device.id) == d
+        assert len(i) == len(i_cpu)
+
+
+@requires_gpu
+def test_coordination_cupy_matches_cpu():
+    """GPU coordination (count-only) -> cupy, matching the host bincount."""
+    positions, cell, inv_cell, origin, pbc = _random_config(N=3000, seed=8)
+    cutoff = 1.3
+    c_cpu = nl.coordination(positions=positions, cell=cell, pbc=pbc,
+                            cutoff=cutoff)
+    pos_d = cupy.asarray(positions)
+    c_gpu = nl.coordination(positions=pos_d, cell=cell, pbc=pbc, cutoff=cutoff)
+    assert isinstance(c_gpu, cupy.ndarray)
+    assert np.array_equal(cupy.asnumpy(c_gpu), c_cpu)
+
+
+@requires_gpu
 def test_dlpack_cupy_distance_matches_cpu():
     positions, cell, inv_cell, origin, pbc = _random_config(N=2500, seed=9)
     cutoff = 1.5

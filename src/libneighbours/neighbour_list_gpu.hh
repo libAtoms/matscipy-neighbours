@@ -32,7 +32,8 @@ error_t neighbour_list_gpu(int quantities, const real_t cell_origin[3],
                             const bool pbc[3], index_t nat, const real_t *r,
                             real_t cutoff, const real_t *per_atom_cutoff,
                             const real_t *per_type_cutoff_sq, index_t ncutoffs,
-                            const index_t *types, NeighbourList &out);
+                            const index_t *types, NeighbourList &out,
+                            CellOrder order = CellOrder::Linear);
 
 #if defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP)
 }  // namespace matscipy
@@ -48,17 +49,19 @@ namespace matscipy {
  * layer exports these as DLPack tensors for zero-copy hand-off to cupy.
  */
 struct NeighbourListDevice {
-    Array<index_t, CudaSpace> first;    /* [npairs] */
-    Array<index_t, CudaSpace> secnd;    /* [npairs] */
-    Array<real_t, CudaSpace> distvec;   /* [3*npairs] */
-    Array<real_t, CudaSpace> absdist;   /* [npairs] */
-    Array<index_t, CudaSpace> shift;    /* [3*npairs] */
+    Array<index_t, DeviceSpace> first;    /* [npairs] */
+    Array<index_t, DeviceSpace> secnd;    /* [npairs] */
+    Array<real_t, DeviceSpace> distvec;   /* [3*npairs] */
+    Array<real_t, DeviceSpace> absdist;   /* [npairs] */
+    Array<index_t, DeviceSpace> shift;    /* [3*npairs] */
+    Array<index_t, DeviceSpace> counts;   /* [nat] per-atom neighbour count */
     index_t npairs = 0;
 };
 
 /* Device-out: results left on the GPU (no D2H copy). When `r_is_device` is
    true, `r` is a device pointer (e.g. a cupy array's data) and is used in place
-   — no input H2D copy; otherwise `r` is a host pointer and is uploaded. */
+   — no input H2D copy; otherwise `r` is a host pointer and is uploaded.
+   `device_id` selects the GPU to run on (the input's device); -1 = current. */
 error_t neighbour_list_gpu_device(int quantities, const real_t cell_origin[3],
                                   const real_t cell[9], const real_t inv_cell[9],
                                   const bool pbc[3], index_t nat, const real_t *r,
@@ -66,7 +69,20 @@ error_t neighbour_list_gpu_device(int quantities, const real_t cell_origin[3],
                                   const real_t *per_atom_cutoff,
                                   const real_t *per_type_cutoff_sq,
                                   index_t ncutoffs, const index_t *types,
+                                  CellOrder order, int device_id,
                                   NeighbourListDevice &out);
+
+/* Phase 3.4 (store vs recompute): per-atom neighbour counts left on the device
+   in `out.counts` (size nat), without materialising the O(npairs) pair arrays —
+   the basis for a GPU coordination number. */
+error_t neighbour_count_gpu_device(const real_t cell_origin[3],
+                                   const real_t cell[9], const real_t inv_cell[9],
+                                   const bool pbc[3], index_t nat, const real_t *r,
+                                   bool r_is_device, real_t cutoff,
+                                   const real_t *per_atom_cutoff,
+                                   const real_t *per_type_cutoff_sq,
+                                   index_t ncutoffs, const index_t *types,
+                                   int device_id, NeighbourListDevice &out);
 #endif
 
 }  // namespace matscipy

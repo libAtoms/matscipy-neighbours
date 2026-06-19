@@ -123,7 +123,7 @@ def _neighbour_list_device(quantities, positions, cutoff, *, cell, pbc,
     placeholder = np.empty((0, 3), dtype=float)
     capsules = _ext.neighbour_list_dlpack(
         quantities, cell_origin, cell, inv_cell, pbc, placeholder,
-        resolved_cutoff, numbers, 1, device_ptr, nat)
+        resolved_cutoff, numbers, 1, device_ptr, nat, device_id)
 
     dev = (2, device_id)  # kDLCUDA
     arrays = tuple(cp.from_dlpack(_DLPackArray(c, dev)) for c in capsules)
@@ -241,7 +241,62 @@ def triplet_list(first_neighbours, abs_dr_p=None, cutoff=None):
     return _ext.triplet_list(first_neighbours)
 
 
-def coordination(atoms, cutoff):
-    """Number of neighbours of each atom within ``cutoff``."""
+def _coordination_device(positions, cutoff, *, cell, pbc, numbers, cell_origin):
+    """GPU coordination: per-atom neighbour counts as a cupy array, computed
+    without materialising the pair list."""
+    if not getattr(_ext, "_has_gpu", 0):
+        raise RuntimeError(
+            "Device positions given, but the extension was built without a GPU "
+            "backend (-DENABLE_CUDA=ON).")
+    import cupy as cp
+
+    positions = cp.ascontiguousarray(positions, dtype=cp.float64)
+    nat = int(positions.shape[0])
+    device_ptr = int(positions.data.ptr)
+    device_id = int(positions.device.id)
+
+    if cell is None:
+        rmin = cp.asnumpy(positions.min(axis=0))
+        rmax = cp.asnumpy(positions.max(axis=0))
+        cell_origin = rmin if cell_origin is None else cell_origin
+        cell = np.diag(rmax - rmin)
+    if cell_origin is None:
+        cell_origin = np.zeros(3)
+    if pbc is None:
+        pbc = np.zeros(3, dtype=bool)
+    if numbers is None:
+        numbers = np.ones(nat, dtype=np.int32)
+
+    cell = np.ascontiguousarray(np.asarray(cell, dtype=float))
+    cell_origin = np.ascontiguousarray(np.asarray(cell_origin, dtype=float))
+    pbc = np.ascontiguousarray(np.broadcast_to(pbc, (3,)), dtype=bool)
+    numbers = np.ascontiguousarray(np.asarray(numbers), dtype=np.int32)
+    resolved_cutoff, numbers = _resolve_cutoff(cutoff, numbers)
+    inv_cell = np.ascontiguousarray(np.linalg.inv(cell.T))
+
+    placeholder = np.empty((0, 3), dtype=float)
+    capsule = _ext.coordination_dlpack(cell_origin, cell, inv_cell, pbc,
+                                       placeholder, resolved_cutoff, numbers,
+                                       device_ptr, nat, device_id)
+    return cp.from_dlpack(_DLPackArray(capsule, (2, device_id)))
+
+
+def coordination(atoms=None, cutoff=None, *, positions=None, cell=None,
+                 pbc=None, numbers=None, cell_origin=None):
+    """Number of neighbours of each atom within ``cutoff``.
+
+    With device (cupy) ``positions`` this runs the GPU count-only path and
+    returns a cupy array, never building the pair list; otherwise it counts the
+    host neighbour list."""
+    if positions is not None and _is_on_device(positions):
+        if atoms is not None:
+            raise ValueError("Cannot combine an ASE Atoms object with device "
+                             "positions.")
+        return _coordination_device(positions, cutoff, cell=cell, pbc=pbc,
+                                    numbers=numbers, cell_origin=cell_origin)
+    if positions is not None:
+        i = neighbour_list("i", cutoff=cutoff, positions=positions, cell=cell,
+                           pbc=pbc, numbers=numbers, cell_origin=cell_origin)
+        return np.bincount(i, minlength=len(positions))
     i = neighbour_list("i", atoms, cutoff)
     return np.bincount(i, minlength=len(atoms))

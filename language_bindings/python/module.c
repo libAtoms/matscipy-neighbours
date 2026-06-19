@@ -49,6 +49,9 @@ static PyMethodDef module_methods[] = {
       METH_VARARGS,
       "Compute a neighbour list, returning each quantity as a DLPack capsule "
       "(zero-copy; CPU host or CUDA device)." },
+    { "coordination_dlpack", (PyCFunction) py_coordination_dlpack, METH_VARARGS,
+      "Per-atom neighbour counts (coordination) on the GPU as a DLPack capsule, "
+      "without materialising the pair arrays." },
     { "first_neighbours", (PyCFunction) py_first_neighbours, METH_VARARGS,
       "Compute indices of first neighbours in neighbour list array." },
     { "triplet_list", (PyCFunction) py_triplet_list, METH_VARARGS,

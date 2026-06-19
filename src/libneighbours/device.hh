@@ -40,6 +40,7 @@ using gpuError_t = cudaError_t;
 #define gpuDeviceSynchronize cudaDeviceSynchronize
 #define gpuGetLastError cudaGetLastError
 #define gpuGetDevice cudaGetDevice
+#define gpuSetDevice cudaSetDevice
 #elif defined(MATSCIPY_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 using gpuError_t = hipError_t;
@@ -56,6 +57,7 @@ using gpuError_t = hipError_t;
 #define gpuDeviceSynchronize hipDeviceSynchronize
 #define gpuGetLastError hipGetLastError
 #define gpuGetDevice hipGetDevice
+#define gpuSetDevice hipSetDevice
 #endif
 
 namespace matscipy {

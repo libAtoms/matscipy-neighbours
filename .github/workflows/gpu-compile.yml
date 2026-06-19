@@ -1,0 +1,120 @@
+name: GPU compile
+
+# Compile-only smoke tests for the GPU backends. No GPU is needed (and none is
+# present on the standard runners): these jobs prove the CUDA and HIP single-
+# source kernels, the device memory backend, and the DLPack glue still build
+# with nvcc / hipcc. Actually running the device kernels happens on a machine
+# with a GPU. Modeled on muGrid's cuda-compile / hip-compile jobs.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: gpu-compile-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cuda-compile:
+    name: CUDA compile (nvcc)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda-toolkit
+        with:
+          cuda: '12.6.3'
+          method: 'network'
+          # nvcc + cudart-dev pull in the CUB/Thrust headers we use.
+          sub-packages: '["nvcc", "cudart-dev"]'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip numpy
+          sudo apt-get update -qy
+          sudo apt-get install -y ninja-build
+
+      - name: Configure (CUDA enabled)
+        # Pin explicit architectures: the project default includes "native",
+        # which needs a present GPU to resolve. BUILD_TESTING=ON so the GPU
+        # GoogleTest sources are compiled too; PRE_TEST discovery keeps the
+        # build from trying to execute them on this GPU-less runner.
+        run: >
+          nvcc --version &&
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DENABLE_CUDA=ON
+          -DCMAKE_CUDA_ARCHITECTURES="70;80"
+          -DBUILD_TESTING=ON
+          -DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST
+          -DPython_EXECUTABLE=$(which python)
+
+      - name: Build
+        run: cmake --build build --parallel
+
+  hip-compile:
+    name: HIP compile (hipcc)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ROCm / HIP (compile-only; no driver/runtime needed)
+        run: |
+          sudo mkdir -p --mode=0755 /etc/apt/keyrings
+          curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+            | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.2.4 jammy main" \
+            | sudo tee /etc/apt/sources.list.d/rocm.list > /dev/null
+          echo -e 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' \
+            | sudo tee /etc/apt/preferences.d/rocm-pin-600
+          sudo apt-get update -qy
+          # hipcc: compiler; hip-dev: headers; hipcub-dev/rocprim-dev: the CUB-
+          # compatible sort/scan primitives; rocm-device-libs: device bitcode.
+          sudo apt-get install -y \
+            hipcc \
+            hip-dev \
+            hipcub-dev \
+            rocprim-dev \
+            rocm-device-libs \
+            rocm-cmake \
+            ninja-build
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip numpy
+
+      - name: Configure (HIP enabled)
+        # BUILD_TESTING=OFF: the GoogleTest GPU sources call the CUDA runtime
+        # directly (cudaMemcpy/cudaGetDeviceCount) and are not HIP-portable; the
+        # shippable library + Python extension are what this job compiles.
+        run: |
+          export HIP_PATH=/opt/rocm
+          export PATH=$HIP_PATH/bin:$PATH
+          export CMAKE_PREFIX_PATH=$HIP_PATH:$CMAKE_PREFIX_PATH
+          /opt/rocm/bin/hipcc --version
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_HIP=ON \
+            -DCMAKE_HIP_ARCHITECTURES="gfx906;gfx908;gfx90a" \
+            -DCMAKE_PREFIX_PATH=/opt/rocm \
+            -DBUILD_TESTING=OFF \
+            -DPython_EXECUTABLE=$(which python)
+
+      - name: Build
+        run: cmake --build build --parallel

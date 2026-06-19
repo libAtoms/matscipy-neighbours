@@ -53,15 +53,18 @@ std::vector<std::array<index_t, 5>> canonical(const NeighbourList &nl) {
     return v;
 }
 
-void compare(int N, double L, double cutoff, unsigned seed) {
+void compare(int N, double L, double cutoff, unsigned seed,
+             CellOrder order = CellOrder::Linear, double fill = -1.0) {
     const real_t cell[9] = {(real_t)L, 0, 0, 0, (real_t)L, 0, 0, 0, (real_t)L};
     const real_t inv[9] = {(real_t)(1 / L), 0, 0, 0, (real_t)(1 / L), 0,
                            0, 0, (real_t)(1 / L)};
     const real_t origin[3] = {0, 0, 0};
     const bool pbc[3] = {true, true, true};
 
+    /* fill < 0 => spread atoms over the whole box; otherwise cluster them in
+       [0, fill)^3, leaving the rest of an L-box as vacuum (sparse-grid path). */
     std::mt19937 rng(seed);
-    std::uniform_real_distribution<real_t> U(0.0, L);
+    std::uniform_real_distribution<real_t> U(0.0, fill < 0 ? L : fill);
     std::vector<real_t> r(3 * N);
     for (int k = 0; k < 3 * N; k++) r[k] = U(rng);
 
@@ -72,7 +75,7 @@ void compare(int N, double L, double cutoff, unsigned seed) {
                              nullptr, nullptr, 0, nullptr, cpu),
               NL_SUCCESS);
     ASSERT_EQ(neighbour_list_gpu(flags, origin, cell, inv, pbc, N, r.data(),
-                                 cutoff, nullptr, nullptr, 0, nullptr, gpu),
+                                 cutoff, nullptr, nullptr, 0, nullptr, gpu, order),
               NL_SUCCESS);
 
     ASSERT_EQ(gpu.npairs, cpu.npairs);
@@ -103,6 +106,60 @@ TEST(NeighbourListGpu, MatchesCpuFewLargeCells) {
 TEST(NeighbourListGpu, MatchesCpuLargerCutoff) {
     if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
     compare(/*N=*/3000, /*L=*/15.0, /*cutoff=*/2.0, /*seed=*/3);
+}
+
+TEST(NeighbourListGpu, MatchesCpuMortonOrder) {
+    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    compare(/*N=*/2000, /*L=*/12.0, /*cutoff=*/1.0, /*seed=*/1,
+            CellOrder::Morton);
+    compare(/*N=*/3000, /*L=*/15.0, /*cutoff=*/2.0, /*seed=*/3,
+            CellOrder::Morton);
+}
+
+TEST(NeighbourListGpu, MatchesCpuSparseVacuum) {
+    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    /* A cluster of atoms in a box 40x larger per side: the grid has ~6e7 cells
+       (>> 2^20 and >> 8*nat), so the GPU takes the hashed compact backend. */
+    const double Lc = std::cbrt(4000 / 12.0);
+    compare(/*N=*/4000, /*L=*/Lc * 40.0, /*cutoff=*/1.0, /*seed=*/11,
+            CellOrder::Linear, /*fill=*/Lc);
+}
+
+/* --- Phase 3.4 coordination (count without materialising pairs) ------------ */
+
+TEST(NeighbourListGpu, CoordinationMatchesCpu) {
+    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    const int N = 3000;
+    const double L = 14.0, cutoff = 1.2;
+    const real_t cell[9] = {(real_t)L, 0, 0, 0, (real_t)L, 0, 0, 0, (real_t)L};
+    const real_t inv[9] = {(real_t)(1 / L), 0, 0, 0, (real_t)(1 / L), 0,
+                           0, 0, (real_t)(1 / L)};
+    const real_t origin[3] = {0, 0, 0};
+    const bool pbc[3] = {true, true, true};
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<real_t> U(0.0, L);
+    std::vector<real_t> r(3 * N);
+    for (int k = 0; k < 3 * N; k++) r[k] = U(rng);
+
+    /* CPU reference: count occurrences of each i in the pair list. */
+    NeighbourList cpu;
+    ASSERT_EQ(neighbour_list(QUANTITY_FIRST, origin, cell, inv, pbc, N, r.data(),
+                             cutoff, nullptr, nullptr, 0, nullptr, cpu),
+              NL_SUCCESS);
+    std::vector<index_t> want(N, 0);
+    for (index_t p = 0; p < cpu.npairs; p++) want[cpu.first[p]]++;
+
+    /* GPU count-only path. */
+    NeighbourListDevice dev;
+    ASSERT_EQ(neighbour_count_gpu_device(origin, cell, inv, pbc, N, r.data(),
+                                         false, cutoff, nullptr, nullptr, 0,
+                                         nullptr, -1, dev),
+              NL_SUCCESS);
+    ASSERT_EQ(dev.counts.size(), (size_t)N);
+    std::vector<index_t> got(N);
+    cudaMemcpy(got.data(), dev.counts.data(), N * sizeof(index_t),
+               cudaMemcpyDeviceToHost);
+    EXPECT_EQ(got, want);
 }
 
 /* --- Phase 3.3 primitives -------------------------------------------------- */

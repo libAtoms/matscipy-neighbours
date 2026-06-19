@@ -52,7 +52,86 @@ __device__ inline void d_pos_to_cell(const real_t *origin, const real_t *inv,
     *c3 = static_cast<int>(floor(s2 * n3));
 }
 
-/* Per-kernel context, passed by value (small, all device pointers). */
+/* Morton (Z-curve) key of a cell, mirroring cell_list.cc's host version. */
+__device__ inline std::uint64_t d_part1by2(std::uint64_t x) {
+    x &= 0x1fffffull;
+    x = (x | (x << 32)) & 0x1f00000000ffffull;
+    x = (x | (x << 16)) & 0x1f0000ff0000ffull;
+    x = (x | (x << 8)) & 0x100f00f00f00f00full;
+    x = (x | (x << 4)) & 0x10c30c30c30c30c3ull;
+    x = (x | (x << 2)) & 0x1249249249249249ull;
+    return x;
+}
+__device__ inline std::uint64_t d_morton3(int a, int b, int c) {
+    return d_part1by2(a) | (d_part1by2(b) << 1) | (d_part1by2(c) << 2);
+}
+
+/* RAII: switch to `dev` for the duration of the build, restore on exit. A
+   negative id means "use the current device, don't switch" (host-input path). */
+struct DeviceGuard {
+    int prev = -1;
+    explicit DeviceGuard(int dev) {
+        if (dev >= 0) {
+            int cur = 0;
+            GPU_CHECK(gpuGetDevice(&cur));
+            if (dev != cur) {
+                GPU_CHECK(gpuSetDevice(dev));
+                prev = cur;
+            }
+        }
+    }
+    ~DeviceGuard() {
+        if (prev >= 0) gpuSetDevice(prev);
+    }
+};
+
+/* 64-bit cell hash (Fibonacci), mirroring cell_list.cc's host version. */
+__device__ inline std::int64_t d_cell_hash(std::int64_t key) {
+    std::uint64_t h = static_cast<std::uint64_t>(key) * 0x9E3779B97F4A7C15ull;
+    return static_cast<std::int64_t>(h >> 1);
+}
+
+/* Cell-lookup policies: map neighbour-cell coords -> [b, e) slice of
+   sorted_atom. Dense indexes arrays by linear cell; sparse probes a hash table
+   keyed by the 64-bit linear cell index (for huge/sparse grids). The kernels
+   are templated on the policy, exactly like the CPU visit_neighbours. */
+struct DenseQueryDev {
+    int n1, n2;
+    const int *cell_first;
+    const int *cell_count;
+    __device__ void slice(int c1, int c2, int c3, int &b, int &e) const {
+        int c = c1 + n1 * (c2 + n2 * c3);
+        b = cell_first[c];
+        e = b + cell_count[c];
+    }
+};
+struct SparseQueryDev {
+    int n1, n2;
+    std::int64_t mask;
+    const std::int64_t *hkey;
+    const int *hfirst;
+    const int *hcount;
+    __device__ void slice(int c1, int c2, int c3, int &b, int &e) const {
+        std::int64_t key = static_cast<std::int64_t>(c1) +
+                           static_cast<std::int64_t>(n1) *
+                               (static_cast<std::int64_t>(c2) +
+                                static_cast<std::int64_t>(n2) * c3);
+        std::int64_t h = d_cell_hash(key) & mask;
+        while (hkey[h] != -1) {
+            if (hkey[h] == key) {
+                b = hfirst[h];
+                e = b + hcount[h];
+                return;
+            }
+            h = (h + 1) & mask;
+        }
+        b = 0;
+        e = 0;
+    }
+};
+
+/* Per-kernel context, passed by value (small, all device pointers). The cell
+   lookup lives in a separate Query (dense or sparse) passed alongside. */
 struct DevCtx {
     int n1, n2, n3, nx, ny, nz;
     int pbc0, pbc1, pbc2;
@@ -66,14 +145,12 @@ struct DevCtx {
     const int *sorted_atom;    /* nat */
     const real_t *per_atom;    /* nat sorted or null */
     const int *types;          /* nat sorted or null */
-    const int *cell_first;     /* ncells */
-    const int *cell_count;     /* ncells */
 };
 
 /* Visit every neighbour of sorted atom `si`, calling f(sj, dr[3], r2, shift[3]).
    Byte-for-byte the same traversal/pair test as the host visit_neighbours. */
-template <typename F>
-__device__ inline void d_visit(const DevCtx &c, int si, F &f) {
+template <typename Query, typename F>
+__device__ inline void d_visit(const DevCtx &c, const Query &q, int si, F &f) {
     const int n1 = c.n1, n2 = c.n2, n3 = c.n3;
     const int *raw_i = &c.raw_cell[3 * si];
     const real_t *dri = &c.rel_pos[3 * si];
@@ -101,9 +178,8 @@ __device__ inline void d_visit(const DevCtx &c, int si, F &f) {
                 real_t off[3] = {off2[0] + x * c.bin1[0], off2[1] + x * c.bin1[1],
                                  off2[2] + x * c.bin1[2]};
 
-                int cc = cj1 + n1 * (cj2 + n2 * cj3);
-                int begin = c.cell_first[cc];
-                int end = begin + c.cell_count[cc];
+                int begin, end;
+                q.slice(cj1, cj2, cj3, begin, end);
                 for (int sj = begin; sj < end; sj++) {
                     if (sj == si && x == 0 && y == 0 && z == 0) continue;
                     const real_t *drj = &c.rel_pos[3 * sj];
@@ -197,6 +273,83 @@ __global__ void k_scatter(const int *lin, index_t nat, int *cursor,
     sorted_atom[pos] = a;
 }
 
+__global__ void k_iota(int *v, index_t n) {
+    index_t a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (a < n) v[a] = static_cast<int>(a);
+}
+
+/* Morton key (Z-curve) of each atom's wrapped cell — the radix-sort key for the
+   Morton (coalesced) layout. */
+__global__ void k_morton_key(const int *raw, int pbc0, int pbc1, int pbc2,
+                            int n1, int n2, int n3, index_t nat,
+                            std::uint64_t *key) {
+    index_t a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (a >= nat) return;
+    int c1 = pbc0 ? d_bin_wrap(raw[3 * a], n1) : d_bin_trunc(raw[3 * a], n1);
+    int c2 = pbc1 ? d_bin_wrap(raw[3 * a + 1], n2) : d_bin_trunc(raw[3 * a + 1], n2);
+    int c3 = pbc2 ? d_bin_wrap(raw[3 * a + 2], n3) : d_bin_trunc(raw[3 * a + 2], n3);
+    key[a] = d_morton3(c1, c2, c3);
+}
+
+/* After a Morton sort, atoms of one cell are a contiguous run in `sorted_atom`
+   (the key is unique per cell). Record where each run starts: cell_first[lin]. */
+__global__ void k_cell_first_from_runs(const int *sorted_atom, const int *lin,
+                                       index_t nat, int *cell_first) {
+    index_t s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= nat) return;
+    int c = lin[sorted_atom[s]];
+    if (s == 0 || lin[sorted_atom[s - 1]] != c) cell_first[c] = s;
+}
+
+/* --- sparse (hashed compact) cell list, for huge/sparse grids --------------
+   Open addressing keyed by the 64-bit linear cell index; built in parallel with
+   atomicCAS inserts. The dense histogram/array path would need O(ncells) memory
+   (or overflow a 32-bit index) here. Mirrors cell_list.cc's build_sparse. */
+
+__global__ void k_fold_key64(const int *raw, int pbc0, int pbc1, int pbc2,
+                            int n1, int n2, int n3, index_t nat,
+                            std::int64_t *key) {
+    index_t a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (a >= nat) return;
+    int c1 = pbc0 ? d_bin_wrap(raw[3 * a], n1) : d_bin_trunc(raw[3 * a], n1);
+    int c2 = pbc1 ? d_bin_wrap(raw[3 * a + 1], n2) : d_bin_trunc(raw[3 * a + 1], n2);
+    int c3 = pbc2 ? d_bin_wrap(raw[3 * a + 2], n3) : d_bin_trunc(raw[3 * a + 2], n3);
+    key[a] = static_cast<std::int64_t>(c1) +
+             static_cast<std::int64_t>(n1) *
+                 (static_cast<std::int64_t>(c2) + static_cast<std::int64_t>(n2) * c3);
+}
+
+__global__ void k_hash_insert(const std::int64_t *key, index_t nat,
+                             std::int64_t mask, std::int64_t *hkey, int *hcount) {
+    index_t a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (a >= nat) return;
+    std::int64_t k = key[a];
+    std::int64_t h = d_cell_hash(k) & mask;
+    auto *slot = reinterpret_cast<unsigned long long *>(hkey);
+    const unsigned long long empty = static_cast<unsigned long long>(-1);
+    while (true) {
+        unsigned long long old =
+            atomicCAS(&slot[h], empty, static_cast<unsigned long long>(k));
+        if (old == empty || static_cast<std::int64_t>(old) == k) {
+            atomicAdd(&hcount[h], 1);
+            return;
+        }
+        h = (h + 1) & mask;
+    }
+}
+
+__global__ void k_hash_scatter(const std::int64_t *key, index_t nat,
+                              std::int64_t mask, const std::int64_t *hkey,
+                              int *cursor, int *sorted_atom) {
+    index_t a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (a >= nat) return;
+    std::int64_t k = key[a];
+    std::int64_t h = d_cell_hash(k) & mask;
+    while (hkey[h] != k) h = (h + 1) & mask;  /* key is guaranteed present */
+    int pos = atomicAdd(&cursor[h], 1);
+    sorted_atom[pos] = static_cast<int>(a);
+}
+
 __global__ void k_gather(const int *sorted_atom, const int *raw, const real_t *r,
                         int pbc0, int pbc1, int pbc2, int n1, int n2, int n3,
                         real_t b1x, real_t b1y, real_t b1z, real_t b2x,
@@ -224,16 +377,19 @@ __global__ void k_gather(const int *sorted_atom, const int *raw, const real_t *r
     if (types_s) types_s[s] = types[a];
 }
 
-__global__ void k_count(DevCtx c, index_t nat, int *cnt) {
+template <typename Query>
+__global__ void k_count(DevCtx c, Query q, index_t nat, int *cnt) {
     index_t si = blockIdx.x * blockDim.x + threadIdx.x;
     if (si >= nat) return;
     Counter f;
-    d_visit(c, static_cast<int>(si), f);
+    d_visit(c, q, static_cast<int>(si), f);
     cnt[c.sorted_atom[si]] = f.n;
 }
 
-__global__ void k_fill(DevCtx c, index_t nat, const int *offset, int *first,
-                      int *secnd, real_t *distvec, real_t *absdist, int *shift) {
+template <typename Query>
+__global__ void k_fill(DevCtx c, Query q, index_t nat, const int *offset,
+                      int *first, int *secnd, real_t *distvec, real_t *absdist,
+                      int *shift) {
     index_t si = blockIdx.x * blockDim.x + threadIdx.x;
     if (si >= nat) return;
     int i = c.sorted_atom[si];
@@ -246,12 +402,58 @@ __global__ void k_fill(DevCtx c, index_t nat, const int *offset, int *first,
     f.distvec = distvec;
     f.absdist = absdist;
     f.shift = shift;
-    d_visit(c, static_cast<int>(si), f);
+    d_visit(c, q, static_cast<int>(si), f);
 }
 
 /* Device buffer alias (RAII via the Phase-3.1 Array). */
 template <typename T>
-using DBuf = Array<T, CudaSpace>;
+using DBuf = Array<T, DeviceSpace>;
+
+/* Two-pass output, parameterised on the cell-lookup policy (dense or sparse).
+   Always fills `dev.counts` (per-atom neighbour count — Phase 3.4 coordination,
+   no pair materialisation); fills the pair arrays only when `want_pairs`. */
+template <typename Query>
+static error_t count_and_fill(const DevCtx &ctx, const Query &q, index_t nat,
+                              int quantities, bool want_pairs,
+                              NeighbourListDevice &dev) {
+    const int g_at = grid_for(nat);
+
+    /* pass 1: count neighbours per (original) atom; cnt[nat] = 0 sentinel. */
+    DBuf<int> d_cnt(nat + 1), d_offset(nat + 1);
+    GPU_CHECK(gpuMemset(d_cnt.data() + nat, 0, sizeof(int)));
+    GPU_LAUNCH(k_count, g_at, BLOCK, ctx, q, nat, d_cnt.data());
+
+    dev.counts.resize(nat);
+    GPU_CHECK(gpuMemcpy(dev.counts.data(), d_cnt.data(), nat * sizeof(index_t),
+                        gpuMemcpyDeviceToDevice));
+
+    /* scan counts -> per-atom write offset; total pairs. */
+    index_t npairs = device_exclusive_scan(d_cnt.data(), d_offset.data(), nat + 1);
+    dev.npairs = npairs;
+    if (!want_pairs || npairs == 0) {
+        GPU_CHECK(gpuDeviceSynchronize());
+        return NL_SUCCESS;
+    }
+
+    /* allocate exact-size outputs into `dev`, pass 2: fill. */
+    const bool wf = quantities & QUANTITY_FIRST;
+    const bool ws = quantities & QUANTITY_SECOND;
+    const bool wD = quantities & QUANTITY_DISTVEC;
+    const bool wd = quantities & QUANTITY_ABSDIST;
+    const bool wS = quantities & QUANTITY_SHIFT;
+    if (wf) dev.first.resize(npairs);
+    if (ws) dev.secnd.resize(npairs);
+    if (wD) dev.distvec.resize(3 * npairs);
+    if (wd) dev.absdist.resize(npairs);
+    if (wS) dev.shift.resize(3 * npairs);
+    GPU_LAUNCH(k_fill, g_at, BLOCK, ctx, q, nat, d_offset.data(),
+               wf ? dev.first.data() : nullptr, ws ? dev.secnd.data() : nullptr,
+               wD ? dev.distvec.data() : nullptr,
+               wd ? dev.absdist.data() : nullptr,
+               wS ? dev.shift.data() : nullptr);
+    GPU_CHECK(gpuDeviceSynchronize());
+    return NL_SUCCESS;
+}
 
 /* Shared kernel pipeline. Runs the whole build and leaves the requested output
    quantities in `dev` (device memory). Both public entry points wrap this. */
@@ -261,10 +463,12 @@ static error_t build_device(int quantities, const real_t cell_origin[3],
                             bool r_is_device, real_t cutoff,
                             const real_t *per_atom_cutoff,
                             const real_t *per_type_cutoff_sq, index_t ncutoffs,
-                            const index_t *types, NeighbourListDevice &dev) {
+                            const index_t *types, CellOrder order, int device_id,
+                            bool want_pairs, NeighbourListDevice &dev) {
     clear_error();
     dev.npairs = 0;
     if (nat <= 0) return NL_SUCCESS;
+    DeviceGuard guard(device_id);  /* run on the input's device; restore on exit */
 
     /* Geometry: identical to the CPU path. */
     const real_t *c1 = &cell[0], *c2 = &cell[3], *c3 = &cell[6];
@@ -285,7 +489,13 @@ static error_t build_device(int quantities, const real_t cell_origin[3],
         bin2[k] = c2[k] / n2;
         bin3[k] = c3[k] / n3;
     }
-    const index_t ncells = static_cast<index_t>(n1) * n2 * n3;
+    /* Cell count in 64-bit: a huge/sparse grid can exceed a 32-bit index, which
+       is exactly when the hashed compact backend is used instead of dense
+       arrays (mirrors cell_list.cc's threshold). */
+    const std::int64_t ncells = static_cast<std::int64_t>(n1) * n2 * n3;
+    const std::int64_t budget =
+        std::max<std::int64_t>(1 << 20, 8 * static_cast<std::int64_t>(nat));
+    const bool sparse = ncells > budget;
     const int g_at = grid_for(nat);
 
     /* Upload geometry (always tiny host arrays). Positions are either uploaded
@@ -312,18 +522,66 @@ static error_t build_device(int quantities, const real_t cell_origin[3],
     GPU_LAUNCH(k_cell_index, g_at, BLOCK, d_origin.data(), d_inv.data(), d_r,
                n1, n2, n3, nat, d_raw.data());
 
-    /* 2. fold -> linear cell + histogram, scan to CSR first index, scatter. */
-    DBuf<int> d_lin(nat), d_cell_count(ncells), d_cell_first(ncells);
-    GPU_CHECK(gpuMemset(d_cell_count.data(), 0, ncells * sizeof(int)));
-    GPU_LAUNCH(k_fold_lin_hist, g_at, BLOCK, d_raw.data(), pbc[0], pbc[1], pbc[2],
-               n1, n2, n3, nat, d_lin.data(), d_cell_count.data());
-    device_exclusive_scan(d_cell_count.data(), d_cell_first.data(), ncells);
+    /* 2. build the CSR cell list -> d_sorted plus a dense or sparse lookup.
+          The dense backends (Linear scan+scatter / Morton radix-sort+runs) need
+          O(ncells) arrays; for a huge/sparse grid we build a hashed compact
+          table instead. */
+    DBuf<int> d_sorted(nat);
+    /* Dense backend buffers (empty for the sparse path). */
+    DBuf<int> d_cell_first, d_cell_count;
+    /* Sparse backend buffers (empty for the dense path). */
+    DBuf<std::int64_t> d_hkey;
+    DBuf<int> d_hfirst, d_hcount;
+    std::int64_t hmask = 0;
 
-    DBuf<int> d_cursor(ncells), d_sorted(nat);
-    GPU_CHECK(gpuMemcpy(d_cursor.data(), d_cell_first.data(),
-                        ncells * sizeof(int), gpuMemcpyDeviceToDevice));
-    GPU_LAUNCH(k_scatter, g_at, BLOCK, d_lin.data(), nat, d_cursor.data(),
-               d_sorted.data());
+    if (!sparse) {
+        const index_t nc = static_cast<index_t>(ncells);
+        DBuf<int> d_lin(nat);
+        d_cell_count.resize(nc);
+        d_cell_first.resize(nc);
+        GPU_CHECK(gpuMemset(d_cell_count.data(), 0, nc * sizeof(int)));
+        GPU_LAUNCH(k_fold_lin_hist, g_at, BLOCK, d_raw.data(), pbc[0], pbc[1],
+                   pbc[2], n1, n2, n3, nat, d_lin.data(), d_cell_count.data());
+        if (order == CellOrder::Morton) {
+            DBuf<std::uint64_t> d_key(nat);
+            GPU_LAUNCH(k_morton_key, g_at, BLOCK, d_raw.data(), pbc[0], pbc[1],
+                       pbc[2], n1, n2, n3, nat, d_key.data());
+            GPU_LAUNCH(k_iota, g_at, BLOCK, d_sorted.data(), nat);
+            device_sort_pairs(d_key.data(), d_sorted.data(), nat);  /* Phase 3.3 */
+            /* Empty cells keep count 0, so their cell_first is unused. */
+            GPU_LAUNCH(k_cell_first_from_runs, g_at, BLOCK, d_sorted.data(),
+                       d_lin.data(), nat, d_cell_first.data());
+        } else {
+            device_exclusive_scan(d_cell_count.data(), d_cell_first.data(), nc);
+            DBuf<int> d_cursor(nc);
+            GPU_CHECK(gpuMemcpy(d_cursor.data(), d_cell_first.data(),
+                                nc * sizeof(int), gpuMemcpyDeviceToDevice));
+            GPU_LAUNCH(k_scatter, g_at, BLOCK, d_lin.data(), nat,
+                       d_cursor.data(), d_sorted.data());
+        }
+    } else {
+        /* Hashed compact: power-of-two capacity, load factor <= 0.5. */
+        std::int64_t cap = 1;
+        while (cap < 2 * static_cast<std::int64_t>(nat) + 1) cap <<= 1;
+        hmask = cap - 1;
+        d_hkey.resize(cap);
+        d_hfirst.resize(cap);
+        d_hcount.resize(cap);
+        GPU_CHECK(gpuMemset(d_hkey.data(), 0xFF, cap * sizeof(std::int64_t)));
+        GPU_CHECK(gpuMemset(d_hcount.data(), 0, cap * sizeof(int)));
+        DBuf<std::int64_t> d_key(nat);
+        GPU_LAUNCH(k_fold_key64, g_at, BLOCK, d_raw.data(), pbc[0], pbc[1], pbc[2],
+                   n1, n2, n3, nat, d_key.data());
+        GPU_LAUNCH(k_hash_insert, g_at, BLOCK, d_key.data(), nat, hmask,
+                   d_hkey.data(), d_hcount.data());
+        device_exclusive_scan(d_hcount.data(), d_hfirst.data(),
+                              static_cast<index_t>(cap));
+        DBuf<int> d_cursor(cap);
+        GPU_CHECK(gpuMemcpy(d_cursor.data(), d_hfirst.data(),
+                            cap * sizeof(int), gpuMemcpyDeviceToDevice));
+        GPU_LAUNCH(k_hash_scatter, g_at, BLOCK, d_key.data(), nat, hmask,
+                   d_hkey.data(), d_cursor.data(), d_sorted.data());
+    }
 
     /* 3. gather per-atom data into cell-sorted order. */
     DBuf<int> d_raw_s(3 * nat), d_rel_s(3 * nat);
@@ -371,38 +629,15 @@ static error_t build_device(int quantities, const real_t cell_origin[3],
     ctx.sorted_atom = d_sorted.data();
     ctx.per_atom = per_atom_cutoff ? d_per_atom_s.data() : nullptr;
     ctx.types = types ? d_types_s.data() : nullptr;
-    ctx.cell_first = d_cell_first.data();
-    ctx.cell_count = d_cell_count.data();
 
-    /* 4. pass 1: count neighbours per (original) atom; cnt[nat] = 0 sentinel. */
-    DBuf<int> d_cnt(nat + 1), d_offset(nat + 1);
-    GPU_CHECK(gpuMemset(d_cnt.data() + nat, 0, sizeof(int)));
-    GPU_LAUNCH(k_count, g_at, BLOCK, ctx, nat, d_cnt.data());
-
-    /* 5. scan counts -> per-atom write offset; total pairs. */
-    index_t npairs = device_exclusive_scan(d_cnt.data(), d_offset.data(), nat + 1);
-    dev.npairs = npairs;
-    if (npairs == 0) return NL_SUCCESS;
-
-    /* 6. allocate exact-size outputs into `dev`, pass 2: fill. The output
-          buffers stay on the device; the caller decides whether to copy back. */
-    const bool wf = quantities & QUANTITY_FIRST;
-    const bool ws = quantities & QUANTITY_SECOND;
-    const bool wD = quantities & QUANTITY_DISTVEC;
-    const bool wd = quantities & QUANTITY_ABSDIST;
-    const bool wS = quantities & QUANTITY_SHIFT;
-    if (wf) dev.first.resize(npairs);
-    if (ws) dev.secnd.resize(npairs);
-    if (wD) dev.distvec.resize(3 * npairs);
-    if (wd) dev.absdist.resize(npairs);
-    if (wS) dev.shift.resize(3 * npairs);
-    GPU_LAUNCH(k_fill, g_at, BLOCK, ctx, nat, d_offset.data(),
-               wf ? dev.first.data() : nullptr, ws ? dev.secnd.data() : nullptr,
-               wD ? dev.distvec.data() : nullptr,
-               wd ? dev.absdist.data() : nullptr,
-               wS ? dev.shift.data() : nullptr);
-    GPU_CHECK(gpuDeviceSynchronize());
-    return NL_SUCCESS;
+    /* 4. two-pass count/fill, dispatched on the chosen cell-lookup policy. */
+    if (!sparse) {
+        DenseQueryDev q{n1, n2, d_cell_first.data(), d_cell_count.data()};
+        return count_and_fill(ctx, q, nat, quantities, want_pairs, dev);
+    }
+    SparseQueryDev q{n1,  n2,           hmask, d_hkey.data(),
+                     d_hfirst.data(), d_hcount.data()};
+    return count_and_fill(ctx, q, nat, quantities, want_pairs, dev);
 }
 
 }  // namespace
@@ -414,10 +649,27 @@ error_t neighbour_list_gpu_device(int quantities, const real_t cell_origin[3],
                                   const real_t *per_atom_cutoff,
                                   const real_t *per_type_cutoff_sq,
                                   index_t ncutoffs, const index_t *types,
+                                  CellOrder order, int device_id,
                                   NeighbourListDevice &out) {
     return build_device(quantities, cell_origin, cell, inv_cell, pbc, nat, r,
                         r_is_device, cutoff, per_atom_cutoff, per_type_cutoff_sq,
-                        ncutoffs, types, out);
+                        ncutoffs, types, order, device_id, /*want_pairs=*/true,
+                        out);
+}
+
+error_t neighbour_count_gpu_device(const real_t cell_origin[3],
+                                   const real_t cell[9], const real_t inv_cell[9],
+                                   const bool pbc[3], index_t nat, const real_t *r,
+                                   bool r_is_device, real_t cutoff,
+                                   const real_t *per_atom_cutoff,
+                                   const real_t *per_type_cutoff_sq,
+                                   index_t ncutoffs, const index_t *types,
+                                   int device_id, NeighbourListDevice &out) {
+    /* Phase 3.4: per-atom neighbour counts without materialising the pairs. */
+    return build_device(0, cell_origin, cell, inv_cell, pbc, nat, r, r_is_device,
+                        cutoff, per_atom_cutoff, per_type_cutoff_sq, ncutoffs,
+                        types, CellOrder::Linear, device_id, /*want_pairs=*/false,
+                        out);
 }
 
 error_t neighbour_list_gpu(int quantities, const real_t cell_origin[3],
@@ -425,7 +677,8 @@ error_t neighbour_list_gpu(int quantities, const real_t cell_origin[3],
                            const bool pbc[3], index_t nat, const real_t *r,
                            real_t cutoff, const real_t *per_atom_cutoff,
                            const real_t *per_type_cutoff_sq, index_t ncutoffs,
-                           const index_t *types, NeighbourList &out) {
+                           const index_t *types, NeighbourList &out,
+                           CellOrder order) {
     out.first.clear();
     out.secnd.clear();
     out.distvec.clear();
@@ -436,19 +689,20 @@ error_t neighbour_list_gpu(int quantities, const real_t cell_origin[3],
     NeighbourListDevice dev;
     error_t e = build_device(quantities, cell_origin, cell, inv_cell, pbc, nat, r,
                              /*r_is_device=*/false, cutoff, per_atom_cutoff,
-                             per_type_cutoff_sq, ncutoffs, types, dev);
+                             per_type_cutoff_sq, ncutoffs, types, order,
+                             /*device_id=*/-1, /*want_pairs=*/true, dev);
     if (e != NL_SUCCESS) return e;
     out.npairs = dev.npairs;
     if (dev.npairs == 0) return NL_SUCCESS;
 
     /* D2H the requested quantities (presence inferred from buffer size). */
-    auto d2h_i = [](std::vector<index_t> &h, const Array<index_t, CudaSpace> &d) {
+    auto d2h_i = [](std::vector<index_t> &h, const Array<index_t, DeviceSpace> &d) {
         if (d.size() == 0) return;
         h.resize(d.size());
         GPU_CHECK(gpuMemcpy(h.data(), d.data(), d.size() * sizeof(index_t),
                             gpuMemcpyDeviceToHost));
     };
-    auto d2h_r = [](std::vector<real_t> &h, const Array<real_t, CudaSpace> &d) {
+    auto d2h_r = [](std::vector<real_t> &h, const Array<real_t, DeviceSpace> &d) {
         if (d.size() == 0) return;
         h.resize(d.size());
         GPU_CHECK(gpuMemcpy(h.data(), d.data(), d.size() * sizeof(real_t),

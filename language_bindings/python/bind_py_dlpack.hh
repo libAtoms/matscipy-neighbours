@@ -23,6 +23,10 @@ extern "C" {
    capsules for cupy.from_dlpack, with results left on the device. */
 PyObject *py_neighbour_list_dlpack(PyObject *self, PyObject *args);
 
+/* Phase 3.4: per-atom neighbour counts (coordination) as a single DLPack
+   capsule, computed on the GPU without materialising the pair arrays. */
+PyObject *py_coordination_dlpack(PyObject *self, PyObject *args);
+
 #ifdef __cplusplus
 }
 #endif

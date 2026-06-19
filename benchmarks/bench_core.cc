@@ -70,13 +70,14 @@ static void run(const char *label, int flags, int N, const real_t cell[9],
 /* GPU end-to-end (H2D positions -> kernels -> D2H pairs), same config as run().
    Reports the full call cost — the honest equivalent of the CPU number. */
 static index_t run_gpu(const char *label, int flags, int N, const real_t cell[9],
-                       const real_t inv[9], std::vector<real_t> &r) {
+                       const real_t inv[9], std::vector<real_t> &r,
+                       CellOrder order) {
     const real_t origin[3] = {0, 0, 0};
     const bool pbc[3] = {true, true, true};
 
     NeighbourList nl;
     neighbour_list_gpu(flags, origin, cell, inv, pbc, N, r.data(), 1.0, nullptr,
-                       nullptr, 0, nullptr, nl);  // warm up (GPU ctx + alloc)
+                       nullptr, 0, nullptr, nl, order);  // warm up (ctx + alloc)
     const index_t pairs = nl.npairs;
 
     const int reps = g_reps(N);
@@ -84,7 +85,7 @@ static index_t run_gpu(const char *label, int flags, int N, const real_t cell[9]
     for (int rep = 0; rep < reps; rep++) {
         auto t0 = clock_type::now();
         neighbour_list_gpu(flags, origin, cell, inv, pbc, N, r.data(), 1.0,
-                           nullptr, nullptr, 0, nullptr, nl);
+                           nullptr, nullptr, 0, nullptr, nl, order);
         auto t1 = clock_type::now();
         ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
     }
@@ -144,7 +145,9 @@ int main(int argc, char **argv) {
         for (int k = 0; k < 3 * N; k++) r[k] = U(rng);
         run("cpu-dense", flags, N, cell, inv, r, order);
 #ifdef MATSCIPY_ENABLE_CUDA
-        index_t pairs = run_gpu("gpu-dense", flags, N, cell, inv, r);
+        index_t pairs = run_gpu("gpu-linear", flags, N, cell, inv, r,
+                                CellOrder::Linear);
+        run_gpu("gpu-morton", flags, N, cell, inv, r, CellOrder::Morton);
         run_transfer(N, pairs);
 #endif
     }
