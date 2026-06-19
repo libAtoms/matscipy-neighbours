@@ -18,11 +18,13 @@
 
 #include <cmath>
 
+#include "cell_list.hh"          /* shared cell_hash, morton3, Dense/SparseQuery */
 #include "device.hh"
 #include "device_primitives.hh"
 #include "error.hh"
 #include "memory_space.hh"
-#include "tools.hh"
+#include "neighbour_visit.hh"     /* shared NeighbourContext + visit_neighbours */
+#include "tools.hh"               /* shared bin_wrap/bin_trunc/position_to_cell_index */
 
 namespace matscipy {
 namespace {
@@ -30,41 +32,12 @@ namespace {
 constexpr int BLOCK = 256;
 inline int grid_for(index_t n) { return static_cast<int>((n + BLOCK - 1) / BLOCK); }
 
-/* --- device-callable mirrors of the host helpers (must match exactly) ----- */
-
-__device__ inline int d_bin_wrap(int i, int n) {
-    while (i < 0) i += n;
-    while (i >= n) i -= n;
-    return i;
-}
-__device__ inline int d_bin_trunc(int i, int n) {
-    return i < 0 ? 0 : (i >= n ? n - 1 : i);
-}
-__device__ inline void d_pos_to_cell(const real_t *origin, const real_t *inv,
-                                     const real_t *ri, int n1, int n2, int n3,
-                                     int *c1, int *c2, int *c3) {
-    real_t d0 = ri[0] - origin[0], d1 = ri[1] - origin[1], d2 = ri[2] - origin[2];
-    real_t s0 = inv[0] * d0 + inv[1] * d1 + inv[2] * d2;
-    real_t s1 = inv[3] * d0 + inv[4] * d1 + inv[5] * d2;
-    real_t s2 = inv[6] * d0 + inv[7] * d1 + inv[8] * d2;
-    *c1 = static_cast<int>(floor(s0 * n1));
-    *c2 = static_cast<int>(floor(s1 * n2));
-    *c3 = static_cast<int>(floor(s2 * n3));
-}
-
-/* Morton (Z-curve) key of a cell, mirroring cell_list.cc's host version. */
-__device__ inline std::uint64_t d_part1by2(std::uint64_t x) {
-    x &= 0x1fffffull;
-    x = (x | (x << 32)) & 0x1f00000000ffffull;
-    x = (x | (x << 16)) & 0x1f0000ff0000ffull;
-    x = (x | (x << 8)) & 0x100f00f00f00f00full;
-    x = (x | (x << 4)) & 0x10c30c30c30c30c3ull;
-    x = (x | (x << 2)) & 0x1249249249249249ull;
-    return x;
-}
-__device__ inline std::uint64_t d_morton3(int a, int b, int c) {
-    return d_part1by2(a) | (d_part1by2(b) << 1) | (d_part1by2(c) << 2);
-}
+/* The cell-index helpers (bin_wrap/bin_trunc/position_to_cell_index), the hash
+   and Morton keys (cell_hash/morton3), the Dense/SparseQuery lookups, and the
+   NeighbourContext + visit_neighbours traversal are all host+device functions
+   shared with the CPU path (tools.hh / cell_list.hh / neighbour_visit.hh). The
+   kernels below only add the GPU-specific build (atomic histogram / hash) and
+   the two-pass driver. */
 
 /* RAII: switch to `dev` for the duration of the build, restore on exit. A
    negative id means "use the current device, don't switch" (host-input path). */
@@ -85,136 +58,12 @@ struct DeviceGuard {
     }
 };
 
-/* 64-bit cell hash (Fibonacci), mirroring cell_list.cc's host version. */
-__device__ inline std::int64_t d_cell_hash(std::int64_t key) {
-    std::uint64_t h = static_cast<std::uint64_t>(key) * 0x9E3779B97F4A7C15ull;
-    return static_cast<std::int64_t>(h >> 1);
-}
 
-/* Cell-lookup policies: map neighbour-cell coords -> [b, e) slice of
-   sorted_atom. Dense indexes arrays by linear cell; sparse probes a hash table
-   keyed by the 64-bit linear cell index (for huge/sparse grids). The kernels
-   are templated on the policy, exactly like the CPU visit_neighbours. */
-struct DenseQueryDev {
-    int n1, n2;
-    const int *cell_first;
-    const int *cell_count;
-    __device__ void slice(int c1, int c2, int c3, int &b, int &e) const {
-        int c = c1 + n1 * (c2 + n2 * c3);
-        b = cell_first[c];
-        e = b + cell_count[c];
-    }
-};
-struct SparseQueryDev {
-    int n1, n2;
-    std::int64_t mask;
-    const std::int64_t *hkey;
-    const int *hfirst;
-    const int *hcount;
-    __device__ void slice(int c1, int c2, int c3, int &b, int &e) const {
-        std::int64_t key = static_cast<std::int64_t>(c1) +
-                           static_cast<std::int64_t>(n1) *
-                               (static_cast<std::int64_t>(c2) +
-                                static_cast<std::int64_t>(n2) * c3);
-        std::int64_t h = d_cell_hash(key) & mask;
-        while (hkey[h] != -1) {
-            if (hkey[h] == key) {
-                b = hfirst[h];
-                e = b + hcount[h];
-                return;
-            }
-            h = (h + 1) & mask;
-        }
-        b = 0;
-        e = 0;
-    }
-};
-
-/* Per-kernel context, passed by value (small, all device pointers). The cell
-   lookup lives in a separate Query (dense or sparse) passed alongside. */
-struct DevCtx {
-    int n1, n2, n3, nx, ny, nz;
-    int pbc0, pbc1, pbc2;
-    real_t bin1[3], bin2[3], bin3[3];
-    real_t cutoff_sq;
-    const real_t *per_type_cutoff_sq;
-    int ncutoffs;
-    const real_t *rel_pos;     /* 3*nat sorted */
-    const int *raw_cell;       /* 3*nat sorted (unwrapped) */
-    const int *rel_cell;       /* 3*nat sorted */
-    const int *sorted_atom;    /* nat */
-    const real_t *per_atom;    /* nat sorted or null */
-    const int *types;          /* nat sorted or null */
-};
-
-/* Visit every neighbour of sorted atom `si`, calling f(sj, dr[3], r2, shift[3]).
-   Byte-for-byte the same traversal/pair test as the host visit_neighbours. */
-template <typename Query, typename F>
-__device__ inline void d_visit(const DevCtx &c, const Query &q, int si, F &f) {
-    const int n1 = c.n1, n2 = c.n2, n3 = c.n3;
-    const int *raw_i = &c.raw_cell[3 * si];
-    const real_t *dri = &c.rel_pos[3 * si];
-    const int ci1 = c.pbc0 ? d_bin_wrap(raw_i[0], n1) : d_bin_trunc(raw_i[0], n1);
-    const int ci2 = c.pbc1 ? d_bin_wrap(raw_i[1], n2) : d_bin_trunc(raw_i[1], n2);
-    const int ci3 = c.pbc2 ? d_bin_wrap(raw_i[2], n3) : d_bin_trunc(raw_i[2], n3);
-
-    for (int z = -c.nz; z <= c.nz; z++) {
-        int cj3 = ci3 + z;
-        if (c.pbc2) cj3 = d_bin_wrap(cj3, n3);
-        if (cj3 < 0 || cj3 >= n3) continue;
-        real_t off3[3] = {z * c.bin3[0], z * c.bin3[1], z * c.bin3[2]};
-
-        for (int y = -c.ny; y <= c.ny; y++) {
-            int cj2 = ci2 + y;
-            if (c.pbc1) cj2 = d_bin_wrap(cj2, n2);
-            if (cj2 < 0 || cj2 >= n2) continue;
-            real_t off2[3] = {off3[0] + y * c.bin2[0], off3[1] + y * c.bin2[1],
-                              off3[2] + y * c.bin2[2]};
-
-            for (int x = -c.nx; x <= c.nx; x++) {
-                int cj1 = ci1 + x;
-                if (c.pbc0) cj1 = d_bin_wrap(cj1, n1);
-                if (cj1 < 0 || cj1 >= n1) continue;
-                real_t off[3] = {off2[0] + x * c.bin1[0], off2[1] + x * c.bin1[1],
-                                 off2[2] + x * c.bin1[2]};
-
-                int begin, end;
-                q.slice(cj1, cj2, cj3, begin, end);
-                for (int sj = begin; sj < end; sj++) {
-                    if (sj == si && x == 0 && y == 0 && z == 0) continue;
-                    const real_t *drj = &c.rel_pos[3 * sj];
-                    real_t dr[3] = {drj[0] - dri[0] + off[0],
-                                    drj[1] - dri[1] + off[1],
-                                    drj[2] - dri[2] + off[2]};
-                    real_t r2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
-                    if (r2 >= c.cutoff_sq) continue;
-
-                    bool inside = true;
-                    if (c.per_atom) {
-                        real_t s = c.per_atom[si] + c.per_atom[sj];
-                        inside = r2 < s * s;
-                    } else if (c.per_type_cutoff_sq && c.types) {
-                        int ti = c.types[si], tj = c.types[sj];
-                        if (ti >= 0 && ti < c.ncutoffs && tj >= 0 &&
-                            tj < c.ncutoffs)
-                            inside = r2 < c.per_type_cutoff_sq[ti * c.ncutoffs + tj];
-                    }
-                    if (!inside) continue;
-
-                    const int *crj = &c.rel_cell[3 * sj];
-                    int shift[3] = {(raw_i[0] - crj[0] + x) / n1,
-                                    (raw_i[1] - crj[1] + y) / n2,
-                                    (raw_i[2] - crj[2] + z) / n3};
-                    f(sj, dr, r2, shift);
-                }
-            }
-        }
-    }
-}
-
+/* Per-pair sinks for the shared visit_neighbours traversal. HD so the
+   host+device template that calls them is valid for both instantiations. */
 struct Counter {
     int n = 0;
-    __device__ void operator()(int, const real_t *, real_t, const int *) { n++; }
+    MATSCIPY_HD void operator()(int, const real_t *, real_t, const int *) { n++; }
 };
 
 struct Filler {
@@ -222,8 +71,8 @@ struct Filler {
     const int *sorted_atom;
     int *first, *secnd, *shift;
     real_t *distvec, *absdist;
-    __device__ void operator()(int sj, const real_t *dr, real_t r2,
-                               const int *sh) {
+    MATSCIPY_HD void operator()(int sj, const real_t *dr, real_t r2,
+                                const int *sh) {
         if (first) first[w] = i;
         if (secnd) secnd[w] = sorted_atom[sj];
         if (distvec) {
@@ -248,7 +97,7 @@ __global__ void k_cell_index(const real_t *origin, const real_t *inv,
                              index_t nat, int *raw) {
     index_t a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= nat) return;
-    d_pos_to_cell(origin, inv, &r[3 * a], n1, n2, n3, &raw[3 * a],
+    position_to_cell_index(origin, inv, &r[3 * a], n1, n2, n3, &raw[3 * a],
                   &raw[3 * a + 1], &raw[3 * a + 2]);
 }
 
@@ -257,9 +106,9 @@ __global__ void k_fold_lin_hist(const int *raw, int pbc0, int pbc1, int pbc2,
                                 int *cell_count) {
     index_t a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= nat) return;
-    int c1 = pbc0 ? d_bin_wrap(raw[3 * a], n1) : d_bin_trunc(raw[3 * a], n1);
-    int c2 = pbc1 ? d_bin_wrap(raw[3 * a + 1], n2) : d_bin_trunc(raw[3 * a + 1], n2);
-    int c3 = pbc2 ? d_bin_wrap(raw[3 * a + 2], n3) : d_bin_trunc(raw[3 * a + 2], n3);
+    int c1 = pbc0 ? bin_wrap(raw[3 * a], n1) : bin_trunc(raw[3 * a], n1);
+    int c2 = pbc1 ? bin_wrap(raw[3 * a + 1], n2) : bin_trunc(raw[3 * a + 1], n2);
+    int c3 = pbc2 ? bin_wrap(raw[3 * a + 2], n3) : bin_trunc(raw[3 * a + 2], n3);
     int l = c1 + n1 * (c2 + n2 * c3);
     lin[a] = l;
     atomicAdd(&cell_count[l], 1);
@@ -285,10 +134,10 @@ __global__ void k_morton_key(const int *raw, int pbc0, int pbc1, int pbc2,
                             std::uint64_t *key) {
     index_t a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= nat) return;
-    int c1 = pbc0 ? d_bin_wrap(raw[3 * a], n1) : d_bin_trunc(raw[3 * a], n1);
-    int c2 = pbc1 ? d_bin_wrap(raw[3 * a + 1], n2) : d_bin_trunc(raw[3 * a + 1], n2);
-    int c3 = pbc2 ? d_bin_wrap(raw[3 * a + 2], n3) : d_bin_trunc(raw[3 * a + 2], n3);
-    key[a] = d_morton3(c1, c2, c3);
+    int c1 = pbc0 ? bin_wrap(raw[3 * a], n1) : bin_trunc(raw[3 * a], n1);
+    int c2 = pbc1 ? bin_wrap(raw[3 * a + 1], n2) : bin_trunc(raw[3 * a + 1], n2);
+    int c3 = pbc2 ? bin_wrap(raw[3 * a + 2], n3) : bin_trunc(raw[3 * a + 2], n3);
+    key[a] = morton3(c1, c2, c3);
 }
 
 /* After a Morton sort, atoms of one cell are a contiguous run in `sorted_atom`
@@ -311,9 +160,9 @@ __global__ void k_fold_key64(const int *raw, int pbc0, int pbc1, int pbc2,
                             std::int64_t *key) {
     index_t a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= nat) return;
-    int c1 = pbc0 ? d_bin_wrap(raw[3 * a], n1) : d_bin_trunc(raw[3 * a], n1);
-    int c2 = pbc1 ? d_bin_wrap(raw[3 * a + 1], n2) : d_bin_trunc(raw[3 * a + 1], n2);
-    int c3 = pbc2 ? d_bin_wrap(raw[3 * a + 2], n3) : d_bin_trunc(raw[3 * a + 2], n3);
+    int c1 = pbc0 ? bin_wrap(raw[3 * a], n1) : bin_trunc(raw[3 * a], n1);
+    int c2 = pbc1 ? bin_wrap(raw[3 * a + 1], n2) : bin_trunc(raw[3 * a + 1], n2);
+    int c3 = pbc2 ? bin_wrap(raw[3 * a + 2], n3) : bin_trunc(raw[3 * a + 2], n3);
     key[a] = static_cast<std::int64_t>(c1) +
              static_cast<std::int64_t>(n1) *
                  (static_cast<std::int64_t>(c2) + static_cast<std::int64_t>(n2) * c3);
@@ -324,7 +173,7 @@ __global__ void k_hash_insert(const std::int64_t *key, index_t nat,
     index_t a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= nat) return;
     std::int64_t k = key[a];
-    std::int64_t h = d_cell_hash(k) & mask;
+    std::int64_t h = cell_hash(k) & mask;
     auto *slot = reinterpret_cast<unsigned long long *>(hkey);
     const unsigned long long empty = static_cast<unsigned long long>(-1);
     while (true) {
@@ -344,7 +193,7 @@ __global__ void k_hash_scatter(const std::int64_t *key, index_t nat,
     index_t a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= nat) return;
     std::int64_t k = key[a];
-    std::int64_t h = d_cell_hash(k) & mask;
+    std::int64_t h = cell_hash(k) & mask;
     while (hkey[h] != k) h = (h + 1) & mask;  /* key is guaranteed present */
     int pos = atomicAdd(&cursor[h], 1);
     sorted_atom[pos] = static_cast<int>(a);
@@ -364,9 +213,9 @@ __global__ void k_gather(const int *sorted_atom, const int *raw, const real_t *r
     raw_s[3 * s] = c1;
     raw_s[3 * s + 1] = c2;
     raw_s[3 * s + 2] = c3;
-    int r1 = pbc0 ? c1 : d_bin_trunc(c1, n1);
-    int r2 = pbc1 ? c2 : d_bin_trunc(c2, n2);
-    int r3 = pbc2 ? c3 : d_bin_trunc(c3, n3);
+    int r1 = pbc0 ? c1 : bin_trunc(c1, n1);
+    int r2 = pbc1 ? c2 : bin_trunc(c2, n2);
+    int r3 = pbc2 ? c3 : bin_trunc(c3, n3);
     rel_s[3 * s] = r1;
     rel_s[3 * s + 1] = r2;
     rel_s[3 * s + 2] = r3;
@@ -378,16 +227,16 @@ __global__ void k_gather(const int *sorted_atom, const int *raw, const real_t *r
 }
 
 template <typename Query>
-__global__ void k_count(DevCtx c, Query q, index_t nat, int *cnt) {
+__global__ void k_count(NeighbourContext c, Query q, index_t nat, int *cnt) {
     index_t si = blockIdx.x * blockDim.x + threadIdx.x;
     if (si >= nat) return;
     Counter f;
-    d_visit(c, q, static_cast<int>(si), f);
+    visit_neighbours(c, q, static_cast<int>(si), f);
     cnt[c.sorted_atom[si]] = f.n;
 }
 
 template <typename Query>
-__global__ void k_fill(DevCtx c, Query q, index_t nat, const int *offset,
+__global__ void k_fill(NeighbourContext c, Query q, index_t nat, const int *offset,
                       int *first, int *secnd, real_t *distvec, real_t *absdist,
                       int *shift) {
     index_t si = blockIdx.x * blockDim.x + threadIdx.x;
@@ -402,7 +251,7 @@ __global__ void k_fill(DevCtx c, Query q, index_t nat, const int *offset,
     f.distvec = distvec;
     f.absdist = absdist;
     f.shift = shift;
-    d_visit(c, q, static_cast<int>(si), f);
+    visit_neighbours(c, q, static_cast<int>(si), f);
 }
 
 /* Device buffer alias (RAII via the Phase-3.1 Array). */
@@ -413,7 +262,7 @@ using DBuf = Array<T, DeviceSpace>;
    Always fills `dev.counts` (per-atom neighbour count — Phase 3.4 coordination,
    no pair materialisation); fills the pair arrays only when `want_pairs`. */
 template <typename Query>
-static error_t count_and_fill(const DevCtx &ctx, const Query &q, index_t nat,
+static error_t count_and_fill(const NeighbourContext &ctx, const Query &q, index_t nat,
                               int quantities, bool want_pairs,
                               NeighbourListDevice &dev) {
     const int g_at = grid_for(nat);
@@ -481,25 +330,16 @@ static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
     if (nat <= 0) return NL_SUCCESS;
     DeviceGuard guard(device_id);  /* run on the input's device; restore on exit */
 
-    /* Geometry: identical to the CPU path. */
-    const real_t *c1 = &cell[0], *c2 = &cell[3], *c3 = &cell[6];
-    real_t nrm1[3], nrm2[3], nrm3[3];
-    cross_product(c2, c3, nrm1);
-    cross_product(c3, c1, nrm2);
-    cross_product(c1, c2, nrm3);
-    real_t volume = std::fabs(c3[0] * nrm3[0] + c3[1] * nrm3[1] + c3[2] * nrm3[2]);
-    if (volume < 1e-12) return set_error("Zero cell volume.");
-    real_t len1 = volume / norm(nrm1), len2 = volume / norm(nrm2),
-           len3 = volume / norm(nrm3);
-    int n1 = std::max(static_cast<int>(std::floor(len1 / cutoff)), 1);
-    int n2 = std::max(static_cast<int>(std::floor(len2 / cutoff)), 1);
-    int n3 = std::max(static_cast<int>(std::floor(len3 / cutoff)), 1);
-    real_t bin1[3], bin2[3], bin3[3];
-    for (int k = 0; k < 3; k++) {
-        bin1[k] = c1[k] / n1;
-        bin2[k] = c2[k] / n2;
-        bin3[k] = c3[k] / n3;
-    }
+    /* Grid definition (resolution, bins, box widths) via the shared helper —
+       same computation as the CPU path. The binning vectors of `grid` stay
+       empty; the GPU builds its cell list in device memory below. */
+    CellGrid grid;
+    if (!cell_grid_geometry(cell_origin, cell, inv_cell, pbc, cutoff, grid))
+        return set_error("Zero cell volume.");
+    const int n1 = grid.n1, n2 = grid.n2, n3 = grid.n3;
+    const real_t *bin1 = grid.bin1, *bin2 = grid.bin2, *bin3 = grid.bin3;
+    const real_t len1 = grid.len[0], len2 = grid.len[1], len3 = grid.len[2];
+
     /* Cell count in 64-bit: a huge/sparse grid can exceed a 32-bit index, which
        is exactly when the hashed compact backend is used instead of dense
        arrays (mirrors cell_list.cc's threshold). */
@@ -622,7 +462,7 @@ static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
                types ? d_types_s.data() : nullptr);
 
     /* Assemble the device context. */
-    DevCtx ctx;
+    NeighbourContext ctx;
     ctx.n1 = n1; ctx.n2 = n2; ctx.n3 = n3;
     ctx.nx = static_cast<int>(std::ceil(cutoff * n1 / len1));
     ctx.ny = static_cast<int>(std::ceil(cutoff * n2 / len2));
@@ -643,10 +483,10 @@ static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
 
     /* 4. two-pass count/fill, dispatched on the chosen cell-lookup policy. */
     if (!sparse) {
-        DenseQueryDev q{n1, n2, d_cell_first.data(), d_cell_count.data()};
+        DenseQuery q{n1, n2, d_cell_first.data(), d_cell_count.data()};
         return count_and_fill(ctx, q, nat, quantities, want_pairs, dev);
     }
-    SparseQueryDev q{n1,  n2,           hmask, d_hkey.data(),
+    SparseQuery q{n1,  n2,           hmask, d_hkey.data(),
                      d_hfirst.data(), d_hcount.data()};
     return count_and_fill(ctx, q, nat, quantities, want_pairs, dev);
 }

@@ -11,6 +11,15 @@
 #ifndef MATSCIPY_TYPES_HH
 #define MATSCIPY_TYPES_HH
 
+/* Mark a small leaf function callable from both host and device so the CPU and
+   GPU paths share one definition. Expands to nothing for the host compiler and
+   to `__host__ __device__` when nvcc/hipcc compiles the translation unit. */
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define MATSCIPY_HD __host__ __device__
+#else
+#define MATSCIPY_HD
+#endif
+
 namespace matscipy {
 
 /* Integer and floating-point types used throughout the core. Kept as plain

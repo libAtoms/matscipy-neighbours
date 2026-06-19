@@ -25,21 +25,6 @@ inline index_t fold(index_t c, index_t n, bool periodic) {
     return periodic ? bin_wrap(c, n) : bin_trunc(c, n);
 }
 
-/* Spread the low 21 bits of x so they occupy every third bit (for Morton). */
-inline std::uint64_t part1by2(std::uint64_t x) {
-    x &= 0x1fffffull;
-    x = (x | (x << 32)) & 0x1f00000000ffffull;
-    x = (x | (x << 16)) & 0x1f0000ff0000ffull;
-    x = (x | (x << 8)) & 0x100f00f00f00f00full;
-    x = (x | (x << 4)) & 0x10c30c30c30c30c3ull;
-    x = (x | (x << 2)) & 0x1249249249249249ull;
-    return x;
-}
-
-inline std::uint64_t morton3(index_t a, index_t b, index_t c) {
-    return part1by2(a) | (part1by2(b) << 1) | (part1by2(c) << 2);
-}
-
 /* Wrapped cell coordinates of every atom (used by both backends). */
 void folded_coords(const index_t *raw_cell, const bool *pbc, index_t nat,
                    index_t n1, index_t n2, index_t n3,
@@ -56,7 +41,7 @@ void folded_coords(const index_t *raw_cell, const bool *pbc, index_t nat,
 }
 
 void build_dense(const std::vector<index_t> &cc, index_t nat, index_t n1,
-                 index_t n2, index_t n3, CellOrder order, CellList &cl) {
+                 index_t n2, index_t n3, CellOrder order, CellGrid &cl) {
     const index_t ncells = n1 * n2 * n3;
     cl.cell_first.assign(ncells, 0);
     cl.cell_count.assign(ncells, 0);
@@ -118,7 +103,7 @@ void build_dense(const std::vector<index_t> &cc, index_t nat, index_t n1,
 }
 
 void build_sparse(const std::vector<index_t> &cc, index_t nat, index_t n1,
-                  index_t n2, CellList &cl) {
+                  index_t n2, CellGrid &cl) {
     /* Power-of-two capacity, load factor <= 0.5. */
     std::int64_t cap = 1;
     while (cap < 2 * static_cast<std::int64_t>(nat) + 1) cap <<= 1;
@@ -165,27 +150,55 @@ void build_sparse(const std::vector<index_t> &cc, index_t nat, index_t n1,
 
 }  // namespace
 
-void build_cell_list(const index_t *raw_cell, const bool *pbc, index_t nat,
-                     index_t n1, index_t n2, index_t n3, CellOrder order,
-                     CellList &cl) {
-    cl.n1 = n1;
-    cl.n2 = n2;
-    cl.n3 = n3;
+bool cell_grid_geometry(const real_t origin[3], const real_t cell[9],
+                        const real_t inv_cell[9], const bool pbc[3],
+                        real_t cutoff, CellGrid &cg) {
+    const real_t *c1 = &cell[0], *c2 = &cell[3], *c3 = &cell[6];
+    real_t nrm1[3], nrm2[3], nrm3[3];
+    cross_product(c2, c3, nrm1);
+    cross_product(c3, c1, nrm2);
+    cross_product(c1, c2, nrm3);
+    real_t volume = std::fabs(c3[0] * nrm3[0] + c3[1] * nrm3[1] + c3[2] * nrm3[2]);
+    if (volume < 1e-12) return false;
+
+    cg.len[0] = volume / norm(nrm1);
+    cg.len[1] = volume / norm(nrm2);
+    cg.len[2] = volume / norm(nrm3);
+    cg.n1 = std::max(static_cast<index_t>(std::floor(cg.len[0] / cutoff)), 1);
+    cg.n2 = std::max(static_cast<index_t>(std::floor(cg.len[1] / cutoff)), 1);
+    cg.n3 = std::max(static_cast<index_t>(std::floor(cg.len[2] / cutoff)), 1);
+    for (int k = 0; k < 3; k++) {
+        cg.origin[k] = origin[k];
+        cg.pbc[k] = pbc[k];
+        cg.bin1[k] = c1[k] / cg.n1;
+        cg.bin2[k] = c2[k] / cg.n2;
+        cg.bin3[k] = c3[k] / cg.n3;
+    }
+    for (int k = 0; k < 9; k++) {
+        cg.cell[k] = cell[k];
+        cg.inv_cell[k] = inv_cell[k];
+    }
+    return true;
+}
+
+void build_cell_grid(const index_t *raw_cell, index_t nat, CellOrder order,
+                     CellGrid &cg) {
+    const index_t n1 = cg.n1, n2 = cg.n2, n3 = cg.n3;
 
     std::vector<index_t> cc;
-    folded_coords(raw_cell, pbc, nat, n1, n2, n3, cc);
+    folded_coords(raw_cell, cg.pbc, nat, n1, n2, n3, cc);
 
     /* Choose the backend: dense unless the grid is far larger than the atom
        count (or would overflow a 32-bit cell index). */
     const std::int64_t ncells = static_cast<std::int64_t>(n1) * n2 * n3;
     const std::int64_t budget =
         std::max<std::int64_t>(1 << 20, 8 * static_cast<std::int64_t>(nat));
-    cl.sparse = ncells > budget;
+    cg.sparse = ncells > budget;
 
-    if (!cl.sparse) {
-        build_dense(cc, nat, n1, n2, n3, order, cl);
+    if (!cg.sparse) {
+        build_dense(cc, nat, n1, n2, n3, order, cg);
     } else {
-        build_sparse(cc, nat, n1, n2, cl);
+        build_sparse(cc, nat, n1, n2, cg);
     }
 }
 
