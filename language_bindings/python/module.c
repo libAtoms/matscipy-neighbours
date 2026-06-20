@@ -52,6 +52,10 @@ static PyMethodDef module_methods[] = {
     { "coordination_dlpack", (PyCFunction) py_coordination_dlpack, METH_VARARGS,
       "Per-atom neighbour counts (coordination) on the GPU as a DLPack capsule, "
       "without materialising the pair arrays." },
+    { "neighbour_matrix_dlpack", (PyCFunction) py_neighbour_matrix_dlpack,
+      METH_VARARGS,
+      "Dense fixed-capacity (n x K) neighbour list as DLPack capsules "
+      "(idx, dist, count) plus an overflow flag." },
     { "first_neighbours", (PyCFunction) py_first_neighbours, METH_VARARGS,
       "Compute indices of first neighbours in neighbour list array." },
     { "triplet_list", (PyCFunction) py_triplet_list, METH_VARARGS,

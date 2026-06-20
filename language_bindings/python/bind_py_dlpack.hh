@@ -27,6 +27,10 @@ PyObject *py_neighbour_list_dlpack(PyObject *self, PyObject *args);
    on the GPU without materialising the pair arrays. */
 PyObject *py_coordination_dlpack(PyObject *self, PyObject *args);
 
+/* Dense fixed-capacity (n x K) neighbour list as DLPack capsules
+   (idx, dist, count) plus an overflow flag, for static-shape consumers. */
+PyObject *py_neighbour_matrix_dlpack(PyObject *self, PyObject *args);
+
 #ifdef __cplusplus
 }
 #endif

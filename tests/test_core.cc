@@ -13,6 +13,7 @@
 
 #include <array>
 #include <cmath>
+#include <random>
 #include <vector>
 
 #include "first_neighbours.hh"
@@ -213,4 +214,77 @@ TEST(TripletList, WithAndWithoutCutoff) {
                  absdist.data(), 2.6, ij, ik);
     EXPECT_EQ(ij.size(), 16u);
     EXPECT_EQ(ik.size(), 16u);
+}
+
+namespace {
+// Random cubic periodic config for the dense-matrix tests.
+void random_cubic(int N, double L, unsigned seed, std::vector<real_t> &r) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<real_t> U(0.0, L);
+    r.resize(3 * N);
+    for (int k = 0; k < 3 * N; k++) r[k] = U(rng);
+}
+}  // namespace
+
+TEST(NeighbourMatrix, MatchesPairList) {
+    const int N = 1500;
+    const double L = 12.0, cutoff = 1.5;
+    const real_t cell[9] = {(real_t)L, 0, 0, 0, (real_t)L, 0, 0, 0, (real_t)L};
+    const real_t inv[9] = {(real_t)(1 / L), 0, 0, 0, (real_t)(1 / L), 0,
+                           0, 0, (real_t)(1 / L)};
+    const bool pbc[3] = {true, true, true};
+    std::vector<real_t> r;
+    random_cubic(N, L, 3, r);
+
+    NeighbourList nl;
+    ASSERT_EQ(neighbour_list(QUANTITY_FIRST | QUANTITY_SECOND | QUANTITY_DISTVEC,
+                             kOrigin, cell, inv, pbc, N, r.data(), cutoff, nullptr,
+                             nullptr, 0, nullptr, nl),
+              NL_SUCCESS);
+
+    const index_t K = 64;
+    NeighbourMatrix nm;
+    ASSERT_EQ(neighbour_matrix(kOrigin, cell, inv, pbc, N, r.data(), cutoff,
+                               nullptr, nullptr, 0, nullptr, K, nm),
+              NL_SUCCESS);
+    ASSERT_FALSE(nm.overflow);
+
+    // Per-atom degree must match the pair list.
+    std::vector<index_t> deg(N, 0);
+    for (index_t p = 0; p < nl.npairs; p++) deg[nl.first[p]]++;
+    for (int i = 0; i < N; i++) EXPECT_EQ(nm.count[i], deg[i]);
+
+    // Each pair must appear in its atom's row with the matching distance vector.
+    for (index_t p = 0; p < nl.npairs; p++) {
+        index_t i = nl.first[p], j = nl.secnd[p];
+        // find j in row i of the matrix
+        bool found = false;
+        for (index_t s = 0; s < nm.count[i]; s++) {
+            if (nm.idx[(size_t)i * K + s] == j) {
+                for (int k = 0; k < 3; k++)
+                    EXPECT_NEAR(nm.dist[((size_t)i * K + s) * 3 + k],
+                                nl.distvec[3 * p + k], 1e-12);
+                found = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(found);
+    }
+}
+
+TEST(NeighbourMatrix, OverflowFlag) {
+    const int N = 800;
+    const double L = 9.0, cutoff = 1.5;
+    const real_t cell[9] = {(real_t)L, 0, 0, 0, (real_t)L, 0, 0, 0, (real_t)L};
+    const real_t inv[9] = {(real_t)(1 / L), 0, 0, 0, (real_t)(1 / L), 0,
+                           0, 0, (real_t)(1 / L)};
+    const bool pbc[3] = {true, true, true};
+    std::vector<real_t> r;
+    random_cubic(N, L, 5, r);
+
+    NeighbourMatrix nm;
+    ASSERT_EQ(neighbour_matrix(kOrigin, cell, inv, pbc, N, r.data(), cutoff,
+                               nullptr, nullptr, 0, nullptr, /*K=*/2, nm),
+              NL_SUCCESS);
+    EXPECT_TRUE(nm.overflow);  // 2 slots is far too few for this density
 }

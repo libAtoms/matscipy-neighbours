@@ -103,6 +103,27 @@ error_t neighbour_list_gpu_device(const NeighbourListRequest &req,
    (req.quantities is ignored.) */
 error_t neighbour_count_gpu_device(const NeighbourListRequest &req,
                                    NeighbourListDevice &out);
+
+/*
+ * Fixed-capacity ("dense") neighbour list on the device. Each atom's neighbours
+ * occupy a row of an n x max_neighbours matrix, so the shapes are static —
+ * suitable for frameworks that compile for fixed shapes (e.g. JAX). The buffers
+ * stay on the device for zero-copy export. `overflow` is true if any atom has
+ * more than max_neighbours neighbours (rows clipped; retry with a larger
+ * capacity). Unused slots are 0; mask them with `count`.
+ */
+struct NeighbourMatrixDevice {
+    index_t n = 0;
+    index_t max_neighbours = 0;
+    Array<index_t, DeviceSpace> idx;     /* [n*K] */
+    Array<real_t, DeviceSpace> dist;     /* [n*K*3] */
+    Array<index_t, DeviceSpace> count;   /* [n] */
+    bool overflow = false;
+};
+
+error_t neighbour_matrix_gpu_device(const NeighbourListRequest &req,
+                                    index_t max_neighbours,
+                                    NeighbourMatrixDevice &out);
 #endif
 
 }  // namespace matscipy

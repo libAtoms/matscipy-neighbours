@@ -203,4 +203,54 @@ error_t neighbour_list(int quantities, const real_t cell_origin[3],
     return NL_SUCCESS;
 }
 
+error_t neighbour_matrix(const real_t cell_origin[3], const real_t cell[9],
+                         const real_t inv_cell[9], const bool pbc[3], index_t nat,
+                         const real_t *positions, real_t cutoff,
+                         const real_t *per_atom_cutoff,
+                         const real_t *per_type_cutoff_sq, index_t ncutoffs,
+                         const index_t *types, index_t max_neighbours,
+                         NeighbourMatrix &out, CellOrder order) {
+    const index_t K = max_neighbours;
+    out.n = nat;
+    out.max_neighbours = K;
+    out.idx.assign((size_t)nat * K, 0);
+    out.dist.assign((size_t)nat * K * 3, 0.0);
+    out.count.assign(nat, 0);
+    out.overflow = false;
+    if (nat <= 0) return NL_SUCCESS;
+
+    /* The dense matrix is a reshape of the pair list: build the pairs, then
+       scatter each into its atom's row. */
+    NeighbourList nl;
+    error_t e = neighbour_list(
+        QUANTITY_FIRST | QUANTITY_SECOND | QUANTITY_DISTVEC, cell_origin, cell,
+        inv_cell, pbc, nat, positions, cutoff, per_atom_cutoff,
+        per_type_cutoff_sq, ncutoffs, types, nl, order);
+    if (e != NL_SUCCESS) return e;
+
+    /* CSR offsets from the i-sorted pair list, so rows fill in parallel. */
+    std::vector<index_t> off(nat + 1, 0);
+    for (index_t p = 0; p < nl.npairs; p++) off[nl.first[p] + 1]++;
+    for (index_t a = 0; a < nat; a++) off[a + 1] += off[a];
+
+    bool overflow = false;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) reduction(|| : overflow)
+#endif
+    for (index_t i = 0; i < nat; i++) {
+        const index_t deg = off[i + 1] - off[i];
+        out.count[i] = deg;
+        if (deg > K) overflow = true;
+        const index_t m = deg < K ? deg : K;
+        for (index_t s = 0; s < m; s++) {
+            const index_t p = off[i] + s;
+            out.idx[(size_t)i * K + s] = nl.secnd[p];
+            for (int k = 0; k < 3; k++)
+                out.dist[((size_t)i * K + s) * 3 + k] = nl.distvec[3 * p + k];
+        }
+    }
+    out.overflow = overflow;
+    return NL_SUCCESS;
+}
+
 }  // namespace matscipy

@@ -95,6 +95,40 @@ Number of neighbours of each atom within `cutoff`. On the GPU this runs a
 count-only kernel that never materialises the pair list. `device` and
 `array_namespace` behave as for `neighbour_list`.
 
+## `neighbour_matrix`
+
+```python
+neighbour_matrix(atoms=None, cutoff=None, max_neighbours=None, *,
+                 positions=None, cell=None, pbc=None, numbers=None,
+                 cell_origin=None, device=None, array_namespace=None)
+```
+
+Dense, **fixed-capacity** neighbour list — each atom's neighbours fill a row of
+an `n × max_neighbours` matrix, so the output shape is *static* (it depends only
+on `n` and `max_neighbours`, not on the number of pairs). This is the form to use
+with frameworks that compile for fixed shapes (e.g. JAX `jit`), where forces are
+a masked sum over the neighbour axis with no scatter.
+
+Returns `(idx, dist, count)`:
+
+- `idx` — shape `(n, max_neighbours)`, neighbour indices (unused slots 0);
+- `dist` — shape `(n, max_neighbours, 3)`, distance vectors `D` (unused slots 0);
+- `count` — shape `(n,)`, true neighbour count; mask with
+  `arange(max_neighbours) < count[:, None]`.
+
+`device` and `array_namespace` behave as for `neighbour_list`. Raises
+`ValueError` if any atom has more than `max_neighbours` neighbours (capacity too
+small) — retry with a larger value.
+
+```python
+import jax.numpy as jnp
+idx, dist, count = neighbour_matrix(positions=r_jax, cell=cell, pbc=True,
+                                    cutoff=2.5, max_neighbours=96,
+                                    array_namespace=jnp)
+mask = jnp.arange(idx.shape[1])[None, :] < count[:, None]
+r2 = jnp.where(mask, (dist * dist).sum(-1), 1.0)          # masked, jit-friendly
+```
+
 ## Other functions
 
 - `first_neighbours(n, i)` — row-start (CSR) offsets for an `i`-sorted list.

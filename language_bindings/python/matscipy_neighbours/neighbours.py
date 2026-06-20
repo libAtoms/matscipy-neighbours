@@ -288,6 +288,75 @@ def neighbour_list(quantities, atoms=None, cutoff=None, *, positions=None,
     return arrays[0] if len(quantities) == 1 else tuple(arrays)
 
 
+def neighbour_matrix(atoms=None, cutoff=None, max_neighbours=None, *,
+                     positions=None, cell=None, pbc=None, numbers=None,
+                     cell_origin=None, device=None, array_namespace=None):
+    """Dense fixed-capacity neighbour list: ``(idx, dist, count)``.
+
+    Each atom's neighbours occupy a row of an ``n x max_neighbours`` matrix, so
+    the output shape is static (it depends only on ``n`` and ``max_neighbours``,
+    not on the number of pairs). This suits frameworks that compile for fixed
+    shapes (e.g. JAX), where forces are a masked sum over the neighbour axis with
+    no scatter.
+
+    Returns ``(idx, dist, count)``: ``idx`` has shape ``(n, max_neighbours)``
+    (neighbour indices; unused slots are 0), ``dist`` has shape
+    ``(n, max_neighbours, 3)`` (distance vectors ``D == r[j] - r[i] + S @ cell``;
+    unused slots 0), and ``count`` has shape ``(n,)`` (true neighbour count;
+    mask with ``arange(max_neighbours) < count[:, None]``). ``device`` and
+    ``array_namespace`` behave as in :func:`neighbour_list`.
+
+    Raises ``ValueError`` if any atom has more than ``max_neighbours`` neighbours
+    (the capacity is too small); retry with a larger ``max_neighbours``.
+    """
+    if cutoff is None:
+        raise ValueError("Please provide a value for the cutoff radius.")
+    if max_neighbours is None:
+        raise ValueError("Please provide max_neighbours (the row capacity).")
+    positions, cell, pbc, numbers, cell_origin = _gather(
+        atoms, positions, cell, pbc, numbers, cell_origin)
+
+    on_device = _is_on_device(positions)
+    use_gpu, device_id = _resolve_device(device, on_device)
+    if on_device and not use_gpu:
+        raise ValueError("device='cpu' with device-resident positions is not "
+                         "supported; move the array to the host first.")
+    if use_gpu and not getattr(_ext, "_has_gpu", 0):
+        raise RuntimeError("GPU requested but the extension was built without a "
+                           "GPU backend (-DENABLE_CUDA=ON).")
+    if use_gpu and on_device and cell is None:
+        raise ValueError("cell must be given for device-resident positions.")
+
+    nat = int(positions.shape[0])
+    if on_device:
+        py_in, host_pos = positions, np.empty((0, 3), dtype=float)
+    else:
+        py_in, host_pos = None, np.ascontiguousarray(positions, dtype=float)
+        if use_gpu and device_id < 0:
+            device_id = 0
+    co, ce, inv, pb, nums = _host_metadata(
+        cell, pbc, numbers, cell_origin, nat,
+        positions=None if on_device else host_pos)
+    rc, nums = _resolve_cutoff(cutoff, nums)
+
+    idx_cap, dist_cap, count_cap, overflow = _ext.neighbour_matrix_dlpack(
+        co, ce, inv, pb, host_pos, rc, int(max_neighbours), nums,
+        1 if use_gpu else 0, py_in, device_id)
+    if overflow:
+        raise ValueError(
+            f"max_neighbours={max_neighbours} is too small: some atom has more "
+            "neighbours than that. Retry with a larger max_neighbours.")
+
+    if use_gpu:
+        dtype = getattr(_ext, "_device_type", _DLPACK_CUDA)
+        out_id = _dlpack_device(positions)[1] if on_device else device_id
+        out_dev = (dtype, out_id)
+    else:
+        out_dev = (_DLPACK_CPU, 0)
+    wrappers = [DLPackTensor(c, out_dev) for c in (idx_cap, dist_cap, count_cap)]
+    return tuple(_consume(wrappers, array_namespace, use_gpu))
+
+
 def triplet_list(first_neighbours, abs_dr_p=None, cutoff=None):
     """Compute a triplet list from a first-neighbour (row-start) array.
 

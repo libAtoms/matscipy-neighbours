@@ -45,7 +45,7 @@ namespace {
    shared_ptr to the std::vector / Array, released when the manager is deleted. */
 struct DLPackManager {
     DLManagedTensor mt;
-    int64_t shape[2];
+    int64_t shape[3];
     std::shared_ptr<void> keep;
 };
 
@@ -64,11 +64,12 @@ void capsule_destructor(PyObject *cap) {
 }
 
 PyObject *make_capsule(std::shared_ptr<void> keep, void *data, int ndim,
-                       int64_t d0, int64_t d1, uint8_t code, uint8_t bits,
-                       DLDeviceType dev, int dev_id) {
+                       int64_t d0, int64_t d1, int64_t d2, uint8_t code,
+                       uint8_t bits, DLDeviceType dev, int dev_id) {
     auto *m = new DLPackManager();
     m->shape[0] = d0;
     m->shape[1] = d1;
+    m->shape[2] = d2;
     m->keep = std::move(keep);
     m->mt.dl_tensor.data = data;
     m->mt.dl_tensor.device.device_type = dev;
@@ -92,20 +93,22 @@ constexpr uint8_t kRealBits = sizeof(real_t) * 8;
 
 template <typename T>
 PyObject *host_capsule(std::vector<T> &&v, int ndim, int64_t d0, int64_t d1,
-                       uint8_t code, uint8_t bits) {
+                       uint8_t code, uint8_t bits, int64_t d2 = 1) {
     auto keep = std::make_shared<std::vector<T>>(std::move(v));
-    return make_capsule(keep, keep->data(), ndim, d0, d1, code, bits, kDLCPU, 0);
+    return make_capsule(keep, keep->data(), ndim, d0, d1, d2, code, bits, kDLCPU,
+                        0);
 }
 
 #if defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP)
 template <typename T>
 PyObject *device_capsule(Array<T, DeviceSpace> &&a, int ndim, int64_t d0,
-                         int64_t d1, uint8_t code, uint8_t bits, int dev_id) {
+                         int64_t d1, uint8_t code, uint8_t bits, int dev_id,
+                         int64_t d2 = 1) {
     auto keep = std::make_shared<Array<T, DeviceSpace>>(std::move(a));
     void *data = keep->data();
     /* DeviceType codes equal the DLPack device codes by construction. */
     const auto dev = static_cast<DLDeviceType>(static_cast<int>(DeviceSpace::device));
-    return make_capsule(keep, data, ndim, d0, d1, code, bits, dev, dev_id);
+    return make_capsule(keep, data, ndim, d0, d1, d2, code, bits, dev, dev_id);
 }
 #endif
 
@@ -153,7 +156,9 @@ int import_positions_dlpack(PyObject *arr, ImportedDLPack *imp) {
         PyErr_SetString(PyExc_TypeError,
                         "device positions must be a C-contiguous float64 array "
                         "of shape (n, 3)");
-        if (mt->deleter) mt->deleter(mt);  /* release the just-produced tensor */
+        /* Not consumed: leave the capsule named "dltensor" and let its own
+           destructor free the managed tensor. Calling the deleter here as well
+           would double-free. */
         Py_DECREF(cap);
         return -1;
     }
@@ -503,4 +508,151 @@ cfail:
     Py_XDECREF(a_types);
     return NULL;
 #endif
+}
+
+/* Dense fixed-capacity (n x K) neighbour list: returns (idx, dist, count) as
+   DLPack capsules plus an overflow flag. CPU backend yields host capsules;
+   GPU backend yields device capsules. */
+PyObject *py_neighbour_matrix_dlpack(PyObject *self, PyObject *args) {
+    PyObject *py_origin, *py_cell, *py_inv, *py_pbc, *py_pos, *py_cut;
+    int max_neighbours = 0;
+    PyObject *py_types = NULL, *py_in = NULL;
+    int backend = 0, device_id = -1;
+
+    if (!PyArg_ParseTuple(args, "OOOOOOi|OiOi", &py_origin, &py_cell, &py_inv,
+                          &py_pbc, &py_pos, &py_cut, &max_neighbours, &py_types,
+                          &backend, &py_in, &device_id))
+        return NULL;
+
+    const bool device_in = py_in && py_in != Py_None;
+#if !(defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP))
+    if (backend != 0) {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "GPU backend requested but the extension was built "
+                        "without a GPU backend (-DENABLE_CUDA=ON).");
+        return NULL;
+    }
+#endif
+
+    PyObject *a_origin = NULL, *a_cell = NULL, *a_inv = NULL, *a_pbc = NULL;
+    PyObject *a_pos = NULL, *a_cut = NULL, *a_types = NULL, *ret = NULL;
+    ImportedDLPack imp;
+
+    a_origin = PyArray_FROMANY(py_origin, NPY_DOUBLE, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
+    a_cell = PyArray_FROMANY(py_cell, NPY_DOUBLE, 2, 2, NPY_ARRAY_C_CONTIGUOUS);
+    a_inv = PyArray_FROMANY(py_inv, NPY_DOUBLE, 2, 2, NPY_ARRAY_C_CONTIGUOUS);
+    a_pbc = PyArray_FROMANY(py_pbc, NPY_BOOL, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
+    a_pos = PyArray_FROMANY(py_pos, NPY_DOUBLE, 2, 2, NPY_ARRAY_C_CONTIGUOUS);
+    if (!a_origin || !a_cell || !a_inv || !a_pbc || !a_pos) goto mfail;
+    if (py_types && py_types != Py_None) {
+        a_types = PyArray_FROMANY(py_types, NPY_INT, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
+        if (!a_types) goto mfail;
+    }
+    if (device_in && import_positions_dlpack(py_in, &imp) != 0) goto mfail;
+    {
+        index_t nat = device_in ? (index_t)imp.nat
+                                : (index_t)PyArray_DIM((PyArrayObject *)a_pos, 0);
+        const index_t K = max_neighbours;
+        real_t cutoff = 0.0;
+        const real_t *per_atom = NULL, *per_type_sq = NULL;
+        index_t ncutoffs = 0;
+        std::vector<real_t> pt_storage;
+        if (resolve_cutoff(py_cut, &a_cut, &cutoff, &per_atom, &per_type_sq,
+                           &ncutoffs, pt_storage) != 0)
+            goto mfail;
+
+        const real_t *origin = (const real_t *)PyArray_DATA((PyArrayObject *)a_origin);
+        const real_t *cell = (const real_t *)PyArray_DATA((PyArrayObject *)a_cell);
+        const real_t *inv = (const real_t *)PyArray_DATA((PyArrayObject *)a_inv);
+        const npy_bool *pb = (const npy_bool *)PyArray_DATA((PyArrayObject *)a_pbc);
+        bool pbc[3] = {(bool)pb[0], (bool)pb[1], (bool)pb[2]};
+        const real_t *r_host = (const real_t *)PyArray_DATA((PyArrayObject *)a_pos);
+        const index_t *types =
+            a_types ? (const index_t *)PyArray_DATA((PyArrayObject *)a_types) : NULL;
+
+        PyObject *cap_idx = NULL, *cap_dist = NULL, *cap_count = NULL;
+        bool overflow = false;
+        const int64_t n64 = nat, K64 = K;
+
+        if (backend == 0) {
+            NeighbourMatrix nm;
+            if (neighbour_matrix(origin, cell, inv, pbc, nat, r_host, cutoff,
+                                 per_atom, per_type_sq, ncutoffs, types, K,
+                                 nm) != NL_SUCCESS) {
+                if (has_error) PyErr_SetString(PyExc_RuntimeError, error_string);
+                goto mfail;
+            }
+            overflow = nm.overflow;
+            cap_idx = host_capsule(std::move(nm.idx), 2, n64, K64, kDLInt, kIntBits);
+            cap_dist = host_capsule(std::move(nm.dist), 3, n64, K64, kDLFloat,
+                                    kRealBits, 3);
+            cap_count = host_capsule(std::move(nm.count), 1, n64, 1, kDLInt,
+                                     kIntBits);
+        } else {
+#if defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP)
+            NeighbourListRequest req;
+            req.cell_origin = origin;
+            req.cell = cell;
+            req.inv_cell = inv;
+            req.pbc = pbc;
+            req.nat = nat;
+            req.positions = device_in ? imp.data : r_host;
+            req.positions_on_device = device_in;
+            req.cutoff = cutoff;
+            req.per_atom_cutoff = per_atom;
+            req.per_type_cutoff_sq = per_type_sq;
+            req.ncutoffs = ncutoffs;
+            req.types = types;
+            req.device_id = device_in ? imp.device_id : device_id;
+            NeighbourMatrixDevice dev;
+            error_t st = neighbour_matrix_gpu_device(req, K, dev);
+            imp.release();
+            if (st != NL_SUCCESS) {
+                if (has_error) PyErr_SetString(PyExc_RuntimeError, error_string);
+                goto mfail;
+            }
+            overflow = dev.overflow;
+            const int dev_id = req.device_id >= 0 ? req.device_id
+                                                  : current_device_id();
+            cap_idx = device_capsule(std::move(dev.idx), 2, n64, K64, kDLInt,
+                                     kIntBits, dev_id);
+            cap_dist = device_capsule(std::move(dev.dist), 3, n64, K64, kDLFloat,
+                                      kRealBits, dev_id, 3);
+            cap_count = device_capsule(std::move(dev.count), 1, n64, 1, kDLInt,
+                                       kIntBits, dev_id);
+#endif
+        }
+        if (!cap_idx || !cap_dist || !cap_count) {
+            Py_XDECREF(cap_idx);
+            Py_XDECREF(cap_dist);
+            Py_XDECREF(cap_count);
+            goto mfail;
+        }
+        ret = PyTuple_Pack(4, cap_idx, cap_dist, cap_count,
+                           overflow ? Py_True : Py_False);
+        Py_DECREF(cap_idx);
+        Py_DECREF(cap_dist);
+        Py_DECREF(cap_count);
+        if (!ret) goto mfail;
+    }
+    Py_XDECREF(a_cut);
+    Py_XDECREF(a_origin);
+    Py_XDECREF(a_cell);
+    Py_XDECREF(a_inv);
+    Py_XDECREF(a_pbc);
+    Py_XDECREF(a_pos);
+    Py_XDECREF(a_types);
+    return ret;
+
+mfail:
+    imp.release();
+    Py_XDECREF(ret);
+    Py_XDECREF(a_cut);
+    Py_XDECREF(a_origin);
+    Py_XDECREF(a_cell);
+    Py_XDECREF(a_inv);
+    Py_XDECREF(a_pbc);
+    Py_XDECREF(a_pos);
+    Py_XDECREF(a_types);
+    return NULL;
 }

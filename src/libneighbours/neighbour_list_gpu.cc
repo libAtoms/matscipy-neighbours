@@ -491,6 +491,28 @@ static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
     return count_and_fill(ctx, q, nat, quantities, want_pairs, dev);
 }
 
+/* Scatter the pair list into a dense (n x K) matrix: each pair goes into the
+   next free slot of its atom's row; count holds the true degree (the atomic
+   counter), and overflow is flagged when a row exceeds K. */
+__global__ void k_scatter_matrix(const index_t *first, const index_t *secnd,
+                                 const real_t *distvec, index_t npairs, int K,
+                                 index_t *idx, real_t *dist, index_t *count,
+                                 int *overflow) {
+    index_t p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= npairs) return;
+    index_t i = first[p];
+    int s = atomicAdd(&count[i], 1);
+    if (s < K) {
+        std::size_t base = (static_cast<std::size_t>(i) * K + s);
+        idx[base] = secnd[p];
+        dist[base * 3 + 0] = distvec[3 * p + 0];
+        dist[base * 3 + 1] = distvec[3 * p + 1];
+        dist[base * 3 + 2] = distvec[3 * p + 2];
+    } else {
+        *overflow = 1;
+    }
+}
+
 }  // namespace
 
 error_t neighbour_list_gpu_device(const NeighbourListRequest &req,
@@ -502,6 +524,49 @@ error_t neighbour_count_gpu_device(const NeighbourListRequest &req,
                                    NeighbourListDevice &out) {
     /* Per-atom neighbour counts without materialising the pairs. */
     return build_device(req, /*want_pairs=*/false, out);
+}
+
+error_t neighbour_matrix_gpu_device(const NeighbourListRequest &req, index_t K,
+                                    NeighbourMatrixDevice &out) {
+    DeviceGuard guard(req.device_id);  /* allocate + scatter on the input device */
+    const index_t n = req.nat;
+    out.n = n;
+    out.max_neighbours = K;
+    out.overflow = false;
+    out.idx.resize(0);
+    out.dist.resize(0);
+    out.count.resize(0);
+    if (n <= 0) return NL_SUCCESS;
+
+    /* Build the pair list on the device, then scatter it into the dense rows. */
+    NeighbourListRequest r = req;
+    r.quantities = QUANTITY_FIRST | QUANTITY_SECOND | QUANTITY_DISTVEC;
+    NeighbourListDevice dev;
+    error_t e = build_device(r, /*want_pairs=*/true, dev);
+    if (e != NL_SUCCESS) return e;
+
+    out.idx.resize(static_cast<std::size_t>(n) * K);
+    out.dist.resize(static_cast<std::size_t>(n) * K * 3);
+    out.count.resize(n);
+    GPU_CHECK(gpuMemset(out.idx.data(), 0,
+                        static_cast<std::size_t>(n) * K * sizeof(index_t)));
+    GPU_CHECK(gpuMemset(out.dist.data(), 0,
+                        static_cast<std::size_t>(n) * K * 3 * sizeof(real_t)));
+    GPU_CHECK(gpuMemset(out.count.data(), 0, n * sizeof(index_t)));
+    DBuf<int> d_overflow(1);
+    GPU_CHECK(gpuMemset(d_overflow.data(), 0, sizeof(int)));
+
+    if (dev.npairs > 0) {
+        GPU_LAUNCH(k_scatter_matrix, grid_for(dev.npairs), BLOCK, dev.first.data(),
+                   dev.secnd.data(), dev.distvec.data(), dev.npairs,
+                   static_cast<int>(K), out.idx.data(), out.dist.data(),
+                   out.count.data(), d_overflow.data());
+    }
+    int host_overflow = 0;
+    GPU_CHECK(gpuMemcpy(&host_overflow, d_overflow.data(), sizeof(int),
+                        gpuMemcpyDeviceToHost));
+    out.overflow = host_overflow != 0;
+    return NL_SUCCESS;
 }
 
 error_t neighbour_list_gpu(int quantities, const real_t cell_origin[3],

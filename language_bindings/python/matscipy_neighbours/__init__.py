@@ -7,19 +7,23 @@ matscipy code keeps working.
 """
 
 from .neighbours import (
+    DLPackTensor,
     coordination,
     first_neighbours,
     get_jump_indicies,
     mic,
     neighbour_list,
+    neighbour_matrix,
     triplet_list,
 )
 
 __all__ = [
     "neighbour_list",
+    "neighbour_matrix",
     "first_neighbours",
     "get_jump_indicies",
     "triplet_list",
     "mic",
     "coordination",
+    "DLPackTensor",
 ]

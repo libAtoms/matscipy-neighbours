@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <map>
 #include <random>
 #include <tuple>
 #include <vector>
@@ -123,6 +124,72 @@ TEST(NeighbourListGpu, MatchesCpuSparseVacuum) {
     const double Lc = std::cbrt(4000 / 12.0);
     compare(/*N=*/4000, /*L=*/Lc * 40.0, /*cutoff=*/1.0, /*seed=*/11,
             CellOrder::Linear, /*fill=*/Lc);
+}
+
+/* --- dense fixed-capacity matrix -------------------------------------------- */
+
+TEST(NeighbourListGpu, MatrixMatchesCpu) {
+    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    const int N = 3000;
+    const double L = 14.0, cutoff = 1.4;
+    const real_t cell[9] = {(real_t)L, 0, 0, 0, (real_t)L, 0, 0, 0, (real_t)L};
+    const real_t inv[9] = {(real_t)(1 / L), 0, 0, 0, (real_t)(1 / L), 0,
+                           0, 0, (real_t)(1 / L)};
+    const real_t origin[3] = {0, 0, 0};
+    const bool pbc[3] = {true, true, true};
+    std::mt19937 rng(4);
+    std::uniform_real_distribution<real_t> U(0.0, L);
+    std::vector<real_t> r(3 * N);
+    for (int k = 0; k < 3 * N; k++) r[k] = U(rng);
+
+    const index_t K = 80;
+    NeighbourMatrix cpu;
+    ASSERT_EQ(neighbour_matrix(origin, cell, inv, pbc, N, r.data(), cutoff,
+                               nullptr, nullptr, 0, nullptr, K, cpu),
+              NL_SUCCESS);
+    ASSERT_FALSE(cpu.overflow);
+
+    NeighbourListRequest req;
+    req.cell_origin = origin;
+    req.cell = cell;
+    req.inv_cell = inv;
+    req.pbc = pbc;
+    req.nat = N;
+    req.positions = r.data();
+    req.cutoff = cutoff;
+    NeighbourMatrixDevice dev;
+    ASSERT_EQ(neighbour_matrix_gpu_device(req, K, dev), NL_SUCCESS);
+    ASSERT_FALSE(dev.overflow);
+    ASSERT_EQ(dev.max_neighbours, K);
+
+    std::vector<index_t> gidx((size_t)N * K), gcount(N);
+    std::vector<real_t> gdist((size_t)N * K * 3);
+    cudaMemcpy(gidx.data(), dev.idx.data(), gidx.size() * sizeof(index_t),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(gcount.data(), dev.count.data(), N * sizeof(index_t),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(gdist.data(), dev.dist.data(), gdist.size() * sizeof(real_t),
+               cudaMemcpyDeviceToHost);
+
+    /* Per-atom: same count, and the same set of (j -> distance vector). */
+    for (int i = 0; i < N; i++) {
+        ASSERT_EQ(gcount[i], cpu.count[i]) << "atom " << i;
+        std::map<index_t, std::array<real_t, 3>> ref;
+        for (index_t s = 0; s < cpu.count[i]; s++) {
+            index_t j = cpu.idx[(size_t)i * K + s];
+            ref[j] = {cpu.dist[((size_t)i * K + s) * 3],
+                      cpu.dist[((size_t)i * K + s) * 3 + 1],
+                      cpu.dist[((size_t)i * K + s) * 3 + 2]};
+        }
+        for (index_t s = 0; s < gcount[i]; s++) {
+            index_t j = gidx[(size_t)i * K + s];
+            auto it = ref.find(j);
+            ASSERT_NE(it, ref.end()) << "atom " << i << " missing j " << j;
+            for (int k = 0; k < 3; k++)
+                EXPECT_NEAR(gdist[((size_t)i * K + s) * 3 + k], it->second[k],
+                            1e-12);
+        }
+    }
 }
 
 /* --- coordination (count without materialising pairs) --------------------- */

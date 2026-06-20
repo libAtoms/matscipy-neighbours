@@ -82,6 +82,14 @@ if(BUILD_BENCHMARKS)
 endif()
 
 # ----------------------------------------------------------------------
+# Examples
+# ----------------------------------------------------------------------
+option(BUILD_EXAMPLES "Build the example programs" ON)
+if(BUILD_EXAMPLES)
+    add_subdirectory(examples/lj_langevin)
+endif()
+
+# ----------------------------------------------------------------------
 # Tests
 # ----------------------------------------------------------------------
 if(BUILD_TESTING)

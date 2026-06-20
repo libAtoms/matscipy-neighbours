@@ -92,6 +92,37 @@ def test_host_jax_namespace():
     assert np.array_equal(np.sort(np.asarray(i1)), np.sort(i0))
 
 
+# --------------------------------------------------- dense fixed-capacity matrix
+
+def _per_atom_sets(i, j, n):
+    from collections import defaultdict
+    s = defaultdict(set)
+    for a, b in zip(np.asarray(i), np.asarray(j)):
+        s[int(a)].add(int(b))
+    return s
+
+
+def test_matrix_host_matches_pairs():
+    pos, cell, pbc = _random_config(seed=11)
+    n = len(pos)
+    i, j = nl.neighbour_list("ij", positions=pos, cell=cell, pbc=pbc, cutoff=1.0)
+    idx, dist, count = nl.neighbour_matrix(positions=pos, cell=cell, pbc=pbc,
+                                           cutoff=1.0, max_neighbours=64)
+    idx, dist, count = np.asarray(idx), np.asarray(dist), np.asarray(count)
+    assert idx.shape == (n, 64) and dist.shape == (n, 64, 3)
+    assert np.array_equal(count, np.bincount(i, minlength=n))
+    ref = _per_atom_sets(i, j, n)
+    for a in range(n):
+        assert {int(x) for x in idx[a, :count[a]]} == ref[a]
+
+
+def test_matrix_overflow_raises():
+    pos, cell, pbc = _random_config(seed=12)
+    with pytest.raises(ValueError):
+        nl.neighbour_matrix(positions=pos, cell=cell, pbc=pbc, cutoff=1.5,
+                            max_neighbours=2)
+
+
 # --------------------------------------------------------------- device paths
 
 def _gpu_available():
@@ -161,6 +192,33 @@ def test_multi_gpu_follows_input_device():
                                      cutoff=1.0)
         assert int(i.device.id) == d
         assert len(i) == len(i_cpu)
+
+
+@requires_gpu
+def test_device_wrong_dtype_raises_not_crash():
+    """A device array of the wrong dtype must raise cleanly (the DLPack importer
+    must not double-free the producer's capsule)."""
+    pos = cupy.asarray(np.random.rand(400, 3).astype(np.float32))
+    with pytest.raises(TypeError):
+        nl.neighbour_list("ij", positions=pos, cell=np.diag([12.0, 12, 12]),
+                          cell_origin=np.zeros(3), pbc=False, cutoff=2.5)
+
+
+@requires_gpu
+def test_matrix_cupy_matches_cpu():
+    pos, cell, pbc = _random_config(seed=13)
+    n = len(pos)
+    idx_c, _, cnt_c = nl.neighbour_matrix(positions=pos, cell=cell, pbc=pbc,
+                                          cutoff=1.0, max_neighbours=64)
+    idx_g, dist_g, cnt_g = nl.neighbour_matrix(positions=cupy.asarray(pos),
+                                               cell=cell, pbc=pbc, cutoff=1.0,
+                                               max_neighbours=64)
+    assert isinstance(idx_g, cupy.ndarray) and isinstance(dist_g, cupy.ndarray)
+    cnt_c = np.asarray(cnt_c)
+    assert np.array_equal(cupy.asnumpy(cnt_g), cnt_c)
+    ig, ic = cupy.asnumpy(idx_g), np.asarray(idx_c)
+    for a in range(n):
+        assert set(ig[a, :cnt_c[a]]) == set(ic[a, :cnt_c[a]])
 
 
 @requires_gpu
