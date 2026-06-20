@@ -47,6 +47,7 @@ nav:
   - Python API: python.md
   - C++ API: cpp.md
   - Examples: examples.md
+  - Benchmark: benchmark.md
   - Algorithm & references: algorithm.md
 
 # REFRESH.md is a development roadmap, not part of the user-facing docs; keep it
