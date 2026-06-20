@@ -48,6 +48,7 @@ nav:
   - C++ API: cpp.md
   - Examples: examples.md
   - Benchmark: benchmark.md
+  - Warp benchmark: benchmark_warp.md
   - Algorithm & references: algorithm.md
 
 # REFRESH.md is a development roadmap, not part of the user-facing docs; keep it

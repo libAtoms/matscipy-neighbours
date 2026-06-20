@@ -80,6 +80,13 @@ Run configuration: reduced LJ units, cutoff 2.5, dt 0.005, friction 1.0,
 temperature 0.7; {steps} steps per measurement (JAX is `jit`-compiled once, then
 timed).
 
+!!! warning "CPU threading"
+    The CPU rows are **multi-threaded**: the matscipy neighbour list is
+    OpenMP-parallel (all logical cores), `C++ (CPU)` is fully threaded, and
+    NumPy/JAX use their threaded backends. Set `OMP_NUM_THREADS=1` (and the
+    relevant BLAS/XLA thread vars) for a single-threaded comparison. The GPU
+    rows are unaffected.
+
 {table}
 
 (values are **ms/step**)

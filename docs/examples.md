@@ -20,6 +20,17 @@ neighbour-list-only**: all Lennard-Jones code lives in the examples.
   neighbour list supplies only the `ij` connectivity; a single fused pass
   recomputes distances and accumulates the LJ force, never materialising per-pair
   arrays.
+- **Python Warp (`lj_langevin_warp.py`)** — *interop*. The LJ force/energy and
+  the Langevin integrator are [NVIDIA Warp](https://github.com/NVIDIA/warp)
+  kernels (compiled once, launched every step), but the neighbour list is built
+  by this library — or, for comparison, by
+  [`vesin`](https://github.com/luthaf/vesin) (`--neighbours {matscipy,vesin}`).
+  Positions live in one device buffer that Warp wraps zero-copy through DLPack
+  and the list builder reads directly; the fused kernel recomputes each pair's
+  distance and atomically accumulates the force on `i`. Timing is broken down
+  per phase with [`muTimer`](https://pypi.org/project/muTimer/) (build list / LJ
+  force / integrate), with the neighbour-list build reported separately. See the
+  [Warp benchmark](benchmark_warp.md).
 
 ### Running
 
@@ -29,10 +40,18 @@ python examples/lj_langevin/lj_langevin.py     --device cpu --steps 2000 --out t
 python examples/lj_langevin/lj_langevin.py     --device gpu --steps 2000 --out traj.xyz
 python examples/lj_langevin/lj_langevin_jax.py --device cpu --steps 2000 --out traj.xyz
 
+# Warp kernels + this library's neighbour list (or vesin, --neighbours vesin)
+python examples/lj_langevin/lj_langevin_warp.py --device gpu --neighbours matscipy --atoms 2000
+
 # C++ (BUILD_EXAMPLES=ON; the GPU binary needs ENABLE_CUDA=ON)
 ./build/examples/lj_langevin/lj_langevin_cpu --steps 2000 --out traj.xyz
 ./build/examples/lj_langevin/lj_langevin_gpu --steps 2000 --out traj.xyz
 ```
+
+The Warp example additionally needs `warp-lang`, `muTimer`, and (for the vesin
+comparison) `vesin`: `pip install warp-lang muTimer vesin`. On WSL, put
+`libcuda.so` on `LD_LIBRARY_PATH` (e.g. `/usr/lib/wsl/lib`) for the vesin GPU
+path.
 
 ### Scaling benchmark
 
@@ -51,6 +70,15 @@ numbers for your own hardware). The broad picture:
   mid-range.
 - **C++ + CUDA** is fastest everywhere — the fused kernel avoids materialising
   per-pair arrays and the per-step kernel launches.
+
+The CPU rows there are **multi-threaded** (the matscipy neighbour list is
+OpenMP-parallel and the C++/NumPy/JAX backends use all cores); set
+`OMP_NUM_THREADS=1` for a single-threaded comparison.
+
+The separate [Warp benchmark](benchmark_warp.md) sweeps logarithmically spaced
+sizes (100, 1000, … up to GPU memory) and compares this library's neighbour
+list against vesin — feeding the same Warp kernels — on CPU and GPU, with the
+neighbour-list build time listed and plotted on its own.
 
 ### JAX and the dense neighbour list
 

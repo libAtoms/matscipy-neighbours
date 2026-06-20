@@ -20,6 +20,14 @@ examples.
 - **`lj_langevin_cpu.cc` / `lj_langevin_gpu.cu`** — *performance*. The neighbour
   list supplies only the `ij` connectivity; a single fused pass recomputes the
   distances and accumulates the LJ force, never materialising per-pair arrays.
+- **`lj_langevin_warp.py`** — *interop*. The LJ force/energy and the Langevin
+  integrator are [NVIDIA Warp](https://github.com/NVIDIA/warp) kernels, but the
+  neighbour list is built by this library — or, with `--neighbours vesin`, by
+  [vesin](https://github.com/luthaf/vesin), feeding the *same* kernels.
+  Positions live in one device buffer shared zero-copy with Warp through DLPack.
+  Per-phase timing (build list / force / integrate) is reported with
+  [muTimer](https://pypi.org/project/muTimer/), with the neighbour-list build
+  listed separately. Needs `pip install warp-lang muTimer vesin`.
 
 ## Running
 
@@ -30,6 +38,10 @@ export PYTHONPATH=$PWD/build:$PWD/language_bindings/python
 python examples/lj_langevin/lj_langevin.py     --device cpu --steps 2000 --out traj.xyz
 python examples/lj_langevin/lj_langevin.py     --device gpu --steps 2000 --out traj.xyz
 python examples/lj_langevin/lj_langevin_jax.py --device cpu --steps 2000 --out traj.xyz
+
+# Warp kernels + this library's neighbour list (or vesin)
+python examples/lj_langevin/lj_langevin_warp.py --device gpu --neighbours matscipy --atoms 2000
+python examples/lj_langevin/lj_langevin_warp.py --device gpu --neighbours vesin    --atoms 2000
 ```
 
 C++ (built when `BUILD_EXAMPLES=ON`; the GPU binary needs `ENABLE_CUDA=ON`):
@@ -50,6 +62,19 @@ per-step wall time:
 ```bash
 python examples/lj_langevin/benchmark.py --build build --sizes 3 4 5 6 8 \
        --jax-python /path/to/python-with-jax
+```
+
+The CPU rows are **multi-threaded** (the matscipy neighbour list is
+OpenMP-parallel, and the C++/NumPy/JAX backends use all cores); set
+`OMP_NUM_THREADS=1` for a single-threaded comparison.
+
+`benchmark_warp.py` is a separate scaling benchmark for the Warp example: it
+sweeps logarithmically spaced sizes (100, 1000, 10000, … up to GPU memory),
+compares this library's neighbour list against vesin on CPU and GPU, lists the
+neighbour-list build time separately, and writes a time-vs-atoms plot:
+
+```bash
+python examples/lj_langevin/benchmark_warp.py --doc-out docs/benchmark_warp.md
 ```
 
 Per-step wall time (**ms/step**) on a 48-core CPU and a GTX TITAN X (Maxwell):

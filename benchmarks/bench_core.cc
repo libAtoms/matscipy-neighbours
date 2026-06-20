@@ -15,6 +15,10 @@
 #include <random>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "cell_list.hh"
 #include "neighbour_list.hh"
 #ifdef MATSCIPY_ENABLE_CUDA
@@ -40,9 +44,16 @@ static int quantity_flags(const char *q) {
     return f;
 }
 
-/* Run a single configuration and print one row. */
+/* Run a single configuration and print one row. When nthreads > 0 the CPU
+   core is pinned to that many OpenMP threads (no-op in a serial build). */
 static void run(const char *label, int flags, int N, const real_t cell[9],
-                const real_t inv[9], std::vector<real_t> &r, CellOrder order) {
+                const real_t inv[9], std::vector<real_t> &r, CellOrder order,
+                int nthreads = 0) {
+#ifdef _OPENMP
+    if (nthreads > 0) omp_set_num_threads(nthreads);
+#else
+    (void)nthreads;
+#endif
     const real_t origin[3] = {0, 0, 0};
     const bool pbc[3] = {true, true, true};
 
