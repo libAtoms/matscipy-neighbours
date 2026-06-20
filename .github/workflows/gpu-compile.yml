@@ -32,6 +32,10 @@ jobs:
           method: 'network'
           # nvcc + cudart-dev pull in the CUB/Thrust headers we use.
           sub-packages: '["nvcc", "cudart-dev"]'
+          # cuRAND (the lj_langevin GPU example links CUDA::curand for its
+          # per-atom Langevin noise). It ships as libcurand[-dev], which has no
+          # "cuda-" prefix, so it goes here rather than in sub-packages.
+          non-cuda-sub-packages: '["libcurand", "libcurand-dev"]'
 
       - name: Set up Python
         uses: actions/setup-python@v5
