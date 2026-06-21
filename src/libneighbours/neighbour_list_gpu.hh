@@ -89,9 +89,6 @@ struct NeighbourListDevice {
         return {absdist.data(), absdist.size()};
     }
     Span<const index_t> shift_view() const { return {shift.data(), shift.size()}; }
-    Span<const index_t> counts_view() const {
-        return {counts.data(), counts.size()};
-    }
 };
 
 /* Device-out: results left on the GPU (no D2H copy). */

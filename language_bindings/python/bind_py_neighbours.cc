@@ -218,10 +218,6 @@ PyObject *py_neighbour_list(PyObject *self, PyObject *args) {
             raise_if_core_error();
             goto fail;
         }
-        if (has_warning) {
-            if (PyErr_WarnEx(PyExc_RuntimeWarning, warning_string, 1) < 0)
-                goto fail;
-        }
 
         /* Build the output tuple in the requested order. */
         py_ret = PyTuple_New(strlen(quantities));

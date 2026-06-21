@@ -93,7 +93,7 @@ struct NeighbourList {
  * out                 result (cleared and filled)
  *
  * Returns NL_SUCCESS, or NL_ERROR with a message recorded via set_error()
- * (e.g. for a degenerate cell). May record a warning via set_warning().
+ * (e.g. for a degenerate cell).
  */
 error_t neighbour_list(int quantities, const real_t cell_origin[3],
                        const real_t cell[9], const real_t inv_cell[9],
