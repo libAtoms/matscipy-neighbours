@@ -33,6 +33,7 @@ static const char *args(int argc, char **argv, const char *key, const char *def)
 
 int main(int argc, char **argv) {
     const int ncells = (int)argd(argc, argv, "--ncells", 6);
+    const index_t atoms = (index_t)argd(argc, argv, "--atoms", 0);
     const real_t lattice = argd(argc, argv, "--lattice", 1.6);
     const int steps = (int)argd(argc, argv, "--steps", 300);
     const real_t dt = argd(argc, argv, "--dt", 0.005);
@@ -43,11 +44,15 @@ int main(int argc, char **argv) {
     const char *outfile = args(argc, argv, "--out", "traj_cpu.xyz");
 
     std::vector<real_t> pos;
-    const index_t n = lj::fcc_droplet(ncells, lattice, pos);
+    const index_t n = atoms > 0 ? lj::fcc_droplet_n(atoms, lattice, pos)
+                                : lj::fcc_droplet(ncells, lattice, pos);
     std::vector<real_t> vel(3 * n, 0.0), f(3 * n, 0.0);
 
     real_t origin[3], cell[9], inv_cell[9];
-    lj::fixed_box(ncells, lattice, cutoff, origin, cell, inv_cell);
+    if (atoms > 0)
+        lj::fixed_box_pos(pos, cutoff, origin, cell, inv_cell);
+    else
+        lj::fixed_box(ncells, lattice, cutoff, origin, cell, inv_cell);
     const bool pbc[3] = {false, false, false};
     const lj::Langevin lc = lj::langevin_constants(dt, gamma, kT);
     const real_t rc2 = cutoff * cutoff;

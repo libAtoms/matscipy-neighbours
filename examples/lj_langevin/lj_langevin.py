@@ -40,6 +40,22 @@ def fcc_droplet(xp, ncells, lattice):
     return xp.ascontiguousarray(r[(r * r).sum(axis=1) <= radius * radius])
 
 
+def fcc_droplet_n(xp, target_n, lattice):
+    """An FCC cluster of *exactly* ``target_n`` atoms (the sites closest to the
+    centre), so the benchmark can hit round atom counts for every backend."""
+    import math
+    import numpy as np
+    basis = np.array([[0, 0, 0], [0.5, 0.5, 0], [0.5, 0, 0.5], [0, 0.5, 0.5]])
+    ncells = int(math.ceil((3.0 * target_n / (16.0 * math.pi)) ** (1.0 / 3.0))) + 2
+    span = range(-ncells, ncells + 1)
+    r = np.array([(np.array([ix, iy, iz]) + b) * lattice
+                  for ix in span for iy in span for iz in span for b in basis])
+    r -= r.mean(axis=0)
+    order = np.argsort((r * r).sum(axis=1))
+    r = np.ascontiguousarray(r[order[:target_n]], dtype=float)
+    return xp.asarray(r)
+
+
 def mabincount(xp, idx, weights, n):
     """Sum ``weights`` (shape (npairs, d)) over pairs grouped by ``idx``,
     giving (n, d). ``bincount`` weights are 1-D, so accumulate per component —
@@ -56,21 +72,63 @@ def fixed_box(ncells, lattice, cutoff):
     the whole run, so the neighbour grid need not be recomputed each step."""
     import numpy as np
     half = ncells * lattice + cutoff + 5.0
+    return _box(np, half)
+
+
+def fixed_box_pos(positions, cutoff):
+    """As fixed_box, but sized from the actual droplet extent (used with the
+    exact-count droplet, where there is no single ncells)."""
+    import numpy as np
+    half = float(abs(positions).max()) + cutoff + 5.0
+    return _box(np, half)
+
+
+def _box(np, half):
     L = 2.0 * half
     origin = np.ascontiguousarray(np.full(3, -half))
     cell = np.ascontiguousarray(np.diag([L, L, L]).astype(float))
     return origin, cell
 
 
-def lj_forces_energy(xp, neighbour_list, positions, cutoff, origin, cell):
+def make_pairs_builder(kind, neighbour_list, xp, cutoff, origin, cell):
+    """Return ``build(positions) -> (i, j, D)`` for the chosen neighbour-list
+    backend. ``D == r[j] - r[i]`` (both backends share this convention)."""
+    if kind == "matscipy":
+        def build(positions):
+            return neighbour_list("ijD", positions=positions, cell=cell,
+                                  cell_origin=origin, pbc=False, cutoff=cutoff)
+        return build
+    if kind == "vesin":
+        import vesin
+        box = xp.asarray(cell)
+        nl = vesin.NeighborList(cutoff=cutoff, full_list=True, sorted=True)
+
+        def build(positions):
+            return nl.compute(points=positions, box=box, periodic=False,
+                              quantities="ijD")
+        return build
+    if kind == "matscipy-classic":
+        # The classic matscipy package (pinned to 1.2.0). CPU/host only: its C
+        # extension wants positions inside the cell, so shift by -origin (the
+        # list is translation invariant).
+        from matscipy.neighbours import neighbour_list as ms_nl
+        pbc = [False, False, False]
+
+        def build(positions):
+            return ms_nl("ijD", positions=positions - origin, cell=cell,
+                         pbc=pbc, cutoff=cutoff)
+        return build
+    raise SystemExit(f"unknown neighbour backend: {kind}")
+
+
+def lj_forces_energy(xp, build_ijD, positions):
     """Lennard-Jones forces and potential energy from the neighbour list.
 
-    The list returns directed pairs sorted by ``i`` with the distance vector
+    The builder returns directed pairs sorted by ``i`` with the distance vector
     ``D == r[j] - r[i]``; the force on ``i`` from each pair is accumulated per
     atom. This is the whole potential."""
     n = positions.shape[0]
-    i, j, D = neighbour_list("ijD", positions=positions, cell=cell,
-                             cell_origin=origin, pbc=False, cutoff=cutoff)
+    i, j, D = build_ijD(positions)
 
     r2 = (D * D).sum(axis=1)
     inv_r2 = 1.0 / r2
@@ -117,7 +175,14 @@ def write_xyz(handle, positions_host, comment):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--device", choices=["cpu", "gpu"], default="cpu")
+    ap.add_argument("--neighbours",
+                    choices=["matscipy", "matscipy-classic", "vesin"],
+                    default="matscipy",
+                    help="neighbour-list builder (matscipy = this library; "
+                         "matscipy-classic = the matscipy 1.2.0 package, CPU only)")
     ap.add_argument("--ncells", type=int, default=6, help="FCC cells each way")
+    ap.add_argument("--atoms", type=int, default=0,
+                    help="exact atom count (overrides --ncells if > 0)")
     ap.add_argument("--lattice", type=float, default=1.6)
     ap.add_argument("--steps", type=int, default=2000)
     ap.add_argument("--dt", type=float, default=0.005)
@@ -128,28 +193,36 @@ def main():
     ap.add_argument("--write-every", type=int, default=50)
     args = ap.parse_args()
 
+    if args.neighbours == "matscipy-classic" and args.device == "gpu":
+        raise SystemExit("matscipy-classic (the matscipy 1.2.0 package) is "
+                         "CPU only; use --device cpu")
     xp, on_gpu = get_backend(args.device)
     import numpy as np
     from matscipy_neighbours import neighbour_list
 
-    positions = fcc_droplet(xp, args.ncells, args.lattice)
+    if args.atoms > 0:
+        positions = fcc_droplet_n(xp, args.atoms, args.lattice)
+        origin, cell = fixed_box_pos(positions, args.cutoff)
+    else:
+        positions = fcc_droplet(xp, args.ncells, args.lattice)
+        origin, cell = fixed_box(args.ncells, args.lattice, args.cutoff)
     n = positions.shape[0]
     velocities = xp.zeros_like(positions)
     lc = langevin_constants(args.dt, args.gamma, args.kT)
 
     to_host = (lambda a: xp.asnumpy(a)) if on_gpu else (lambda a: np.asarray(a))
-    origin, cell = fixed_box(args.ncells, args.lattice, args.cutoff)
+    build_ijD = make_pairs_builder(args.neighbours, neighbour_list, xp,
+                                   args.cutoff, origin, cell)
 
-    forces, energy, npairs = lj_forces_energy(xp, neighbour_list, positions,
-                                              args.cutoff, origin, cell)
-    print(f"device={args.device}  atoms={n}  pairs~{npairs}")
+    forces, energy, npairs = lj_forces_energy(xp, build_ijD, positions)
+    print(f"device={args.device}  neighbours={args.neighbours}  "
+          f"atoms={n}  pairs~{npairs}")
 
     out = open(args.out, "w")
     t0 = time.perf_counter()
     for step in range(args.steps):
         langevin_step(xp, positions, velocities, forces, lc)
-        forces, energy, npairs = lj_forces_energy(xp, neighbour_list, positions,
-                                                  args.cutoff, origin, cell)
+        forces, energy, npairs = lj_forces_energy(xp, build_ijD, positions)
         if step % args.write_every == 0:
             write_xyz(out, to_host(positions), f"step={step} E_pot={energy:.4f}")
     if on_gpu:

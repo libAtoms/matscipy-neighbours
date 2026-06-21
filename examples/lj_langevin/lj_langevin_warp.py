@@ -145,6 +145,18 @@ def make_neighbour_builder(kind, xp, on_gpu, cutoff, origin, cell):
             return i.astype(xp.int32), j.astype(xp.int32), int(i.shape[0])
         return build
 
+    if kind == "matscipy-classic":
+        # The classic matscipy package (pinned to 1.2.0). CPU/host only; shift
+        # positions by -origin so they sit inside the cell for its C extension.
+        from matscipy.neighbours import neighbour_list as ms_nl
+        pbc = [False, False, False]
+
+        def build(positions):
+            i, j = ms_nl("ij", positions=positions - origin, cell=cell,
+                         pbc=pbc, cutoff=cutoff)
+            return i.astype(xp.int32), j.astype(xp.int32), int(i.shape[0])
+        return build
+
     raise SystemExit(f"unknown neighbour backend: {kind}")
 
 
@@ -162,8 +174,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--device", choices=["cpu", "gpu"], default="gpu")
-    ap.add_argument("--neighbours", choices=["matscipy", "vesin"],
-                    default="matscipy", help="neighbour-list builder")
+    ap.add_argument("--neighbours",
+                    choices=["matscipy", "matscipy-classic", "vesin"],
+                    default="matscipy",
+                    help="neighbour-list builder (matscipy = this library; "
+                         "matscipy-classic = the matscipy 1.2.0 package, CPU only)")
     ap.add_argument("--atoms", type=int, default=2048,
                     help="target number of atoms in the droplet")
     ap.add_argument("--lattice", type=float, default=1.6)
@@ -176,6 +191,9 @@ def main():
     ap.add_argument("--write-every", type=int, default=50)
     args = ap.parse_args()
 
+    if args.neighbours == "matscipy-classic" and args.device == "gpu":
+        raise SystemExit("matscipy-classic (the matscipy 1.2.0 package) is "
+                         "CPU only; use --device cpu")
     on_gpu = args.device == "gpu"
     wp_device = "cuda:0" if on_gpu else "cpu"
     wp.init()

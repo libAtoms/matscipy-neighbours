@@ -28,6 +28,20 @@ def fcc_droplet(ncells, lattice):
     return np.ascontiguousarray(r[(r * r).sum(axis=1) <= radius * radius])
 
 
+def fcc_droplet_n(target_n, lattice):
+    """An FCC cluster of *exactly* ``target_n`` atoms (the sites closest to the
+    centre), so the benchmark can hit round atom counts for every backend."""
+    import math
+    basis = np.array([[0, 0, 0], [0.5, 0.5, 0], [0.5, 0, 0.5], [0, 0.5, 0.5]])
+    ncells = int(math.ceil((3.0 * target_n / (16.0 * math.pi)) ** (1.0 / 3.0))) + 2
+    span = range(-ncells, ncells + 1)
+    r = np.array([(np.array([ix, iy, iz]) + b) * lattice
+                  for ix in span for iy in span for iz in span for b in basis])
+    r -= r.mean(axis=0)
+    order = np.argsort((r * r).sum(axis=1))
+    return np.ascontiguousarray(r[order[:target_n]], dtype=float)
+
+
 def langevin_constants(dt, gamma, kT, mass=1.0):
     D = kT / (mass * gamma)
     c0 = np.exp(-gamma * dt)
@@ -86,6 +100,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--device", choices=["cpu", "gpu"], default="cpu")
     ap.add_argument("--ncells", type=int, default=6)
+    ap.add_argument("--atoms", type=int, default=0,
+                    help="exact atom count (overrides --ncells if > 0)")
     ap.add_argument("--lattice", type=float, default=1.6)
     ap.add_argument("--steps", type=int, default=2000)
     ap.add_argument("--dt", type=float, default=0.005)
@@ -110,16 +126,20 @@ def main():
         raise SystemExit(f"no JAX {args.device} device available")
     dev = devices[0]
 
-    pos_np = fcc_droplet(args.ncells, args.lattice)
+    cutoff, K = args.cutoff, args.max_neighbours
+    if args.atoms > 0:
+        pos_np = fcc_droplet_n(args.atoms, args.lattice)
+        half = float(abs(pos_np).max()) + cutoff + 5.0
+    else:
+        pos_np = fcc_droplet(args.ncells, args.lattice)
+        half = args.ncells * args.lattice + cutoff + 5.0
     n = pos_np.shape[0]
     positions = jax.device_put(jnp.asarray(pos_np), dev)
     velocities = jnp.zeros_like(positions)
     lc = langevin_constants(args.dt, args.gamma, args.kT)
-    cutoff, K = args.cutoff, args.max_neighbours
     key = jrandom.PRNGKey(12345)
     step = make_step(jnp, jrandom, lc)
 
-    half = args.ncells * args.lattice + cutoff + 5.0
     L = 2.0 * half
     origin = np.ascontiguousarray(np.full(3, -half))
     cell = np.ascontiguousarray(np.diag([L, L, L]).astype(float))
