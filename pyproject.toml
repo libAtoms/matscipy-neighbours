@@ -1,0 +1,38 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "numpy"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "matscipy-neighbours"
+version = "0.1.0"
+description = "Neighbour list for particle simulations"
+readme = "README.md"
+license = { file = "LICENSE.md" }
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+# ASE is optional: only needed for Atoms input and element-pair cutoffs.
+ase = ["ase"]
+
+[project.urls]
+repository = "https://github.com/libAtoms/matscipy-neighbours"
+
+# Expose the compiled neighbour list as an ASE v4 neighbour-list backend.
+[project.entry-points."ase.plugins"]
+matscipy_neighbours = "matscipy_neighbours._ase_plugin"
+
+[tool.scikit-build]
+# Pure-Python package lives under language_bindings/python; the compiled
+# extension is installed into it by the CMake install() rule (see
+# language_bindings/python/CMakeLists.txt) so the package's relative import
+# `from . import _matscipy_neighbours` resolves.
+wheel.packages = ["language_bindings/python/matscipy_neighbours"]
+# CPU-only wheel: skip the C++ test/benchmark/example targets (the tests fetch
+# GoogleTest from the network). GPU is a separate, documented build
+# (-Dcmake.define.ENABLE_CUDA=ON).
+cmake.args = [
+    "-DBUILD_TESTING=OFF",
+    "-DBUILD_BENCHMARKS=OFF",
+    "-DBUILD_EXAMPLES=OFF",
+]

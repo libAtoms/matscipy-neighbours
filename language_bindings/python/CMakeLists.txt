@@ -19,3 +19,11 @@ target_link_libraries(_matscipy_neighbours PRIVATE neighbours Python::NumPy)
 set_target_properties(_matscipy_neighbours PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
 )
+
+# Install the extension *inside* the Python package so the relative import
+# `from . import _matscipy_neighbours` (matscipy_neighbours/neighbours.py)
+# resolves in an installed wheel.  Used by the scikit-build-core packaging
+# (see the repository-root pyproject.toml).
+install(TARGETS _matscipy_neighbours
+        LIBRARY DESTINATION matscipy_neighbours
+        RUNTIME DESTINATION matscipy_neighbours)
