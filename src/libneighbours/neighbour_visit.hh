@@ -54,6 +54,11 @@ MATSCIPY_HD inline void visit_neighbours(const NeighbourContext &c,
                                          Emit &&emit) {
     const index_t n1 = c.n1, n2 = c.n2, n3 = c.n3;
     const index_t *raw_i = &c.raw_cell[3 * si];
+    /* Cell index used to build dri (raw for periodic, truncated for
+       non-periodic); the reference for the shift so it matches the distance
+       vector. Using raw_i here would leak a spurious shift for a non-periodic
+       atom outside the cell, where no boundary can be crossed. */
+    const index_t *rel_i = &c.rel_cell[3 * si];
     const real_t *dri = &c.rel_pos[3 * si];
 
     const index_t ci1 = c.pbc0 ? bin_wrap(raw_i[0], n1) : bin_trunc(raw_i[0], n1);
@@ -109,9 +114,9 @@ MATSCIPY_HD inline void visit_neighbours(const NeighbourContext &c,
                     if (!inside_cutoff) continue;
 
                     const index_t *crj = &c.rel_cell[3 * sj];
-                    index_t shift[3] = {(raw_i[0] - crj[0] + x) / n1,
-                                        (raw_i[1] - crj[1] + y) / n2,
-                                        (raw_i[2] - crj[2] + z) / n3};
+                    index_t shift[3] = {(rel_i[0] - crj[0] + x) / n1,
+                                        (rel_i[1] - crj[1] + y) / n2,
+                                        (rel_i[2] - crj[2] + z) / n3};
                     emit(sj, dr, abs_dr_sq, shift);
                 }
             }
