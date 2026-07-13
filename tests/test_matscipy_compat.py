@@ -121,6 +121,22 @@ def test_shrink_wrapped_positions_only():
     assert (np.bincount(i) == np.bincount(j)).all()
 
 
+def test_shift_is_zero_for_non_periodic_atom_outside_cell():
+    # Regression test for matscipy PR #315 / issue #313: shifts must be zero
+    # for a non-periodic system, even when an atom lies outside the (shrink-
+    # wrapped or supplied) cell -- no cell boundary can be crossed. Otherwise
+    # the contract D == r[j] - r[i] + S @ cell is silently violated.
+    positions = np.array([[0.0, 0.0, 0.0], [1.1, 1.2, 1.3]])
+    for cell in (None, np.eye(3), np.diag([1.1, 1.2, 1.3])):
+        i, j, S, D = neighbour_list(
+            "ijSD", cutoff=5.0, positions=positions, cell=cell,
+            pbc=[False, False, False])
+        assert len(i) > 0  # the pair is within the cutoff
+        np.testing.assert_array_equal(S, np.zeros_like(S))
+        # D must be the direct difference for a non-periodic system.
+        np.testing.assert_allclose(D, positions[j] - positions[i], atol=1e-12)
+
+
 def test_first_neighbours_reference_values():
     np.testing.assert_array_equal(
         first_neighbours(5, [1, 1, 1, 1, 3, 3, 3]), [-1, 0, 4, 4, 7, 7])
