@@ -33,6 +33,26 @@ def neighbor_list(quantities, atoms, cutoff, *, self_interaction=False):
     return _neighbour_list(quantities, atoms, cutoff)
 
 
+def device_neighbor_list(device_id=0):
+    """Return the *experimental* device-resident neighbour-list backend.
+
+    The result satisfies ASE's experimental ``DeviceNeighborList`` protocol
+    (:mod:`ase._4.plugins.neighborlist_device`) and builds/maintains edge data
+    on-device, exchanged via DLPack.  GPU-only (CUDA/HIP) and requires CuPy.
+
+    This device capability is intentionally *separate* from the host
+    ``neighbor_list`` registration above: the host ``ase.plugins``
+    ``NeighborListPlugin`` carries no device slot yet, so a consumer obtains the
+    device backend through this factory and checks
+    ``isinstance(backend, DeviceNeighborList)``.  (Folding an optional
+    ``device_implementation=`` into ``NeighborListPlugin`` upstream would let it
+    be advertised through the same plugin record -- a noted upstream ask.)
+    """
+    from matscipy_neighbours._device import MatscipyDeviceNeighborList
+
+    return MatscipyDeviceNeighborList(device_id=device_id)
+
+
 try:
     from ase._4.plugins.neighborlist import NeighborListPlugin
 except ImportError:

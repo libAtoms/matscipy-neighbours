@@ -31,6 +31,17 @@ PyObject *py_coordination_dlpack(PyObject *self, PyObject *args);
    (idx, dist, count) plus an overflow flag, for static-shape consumers. */
 PyObject *py_neighbour_matrix_dlpack(PyObject *self, PyObject *args);
 
+/* Verlet-skin "update check" (formerly done in CuPy):
+   clone_device   -- snapshot (n,3) device positions into a reusable, opaque
+                     device-reference capsule (the skin reference).
+   needs_rebuild  -- on-device rebuild test against a reference capsule; returns
+                     a 1-element uint8 device DLPack capsule (no host sync).
+   dlpack_item    -- read a 1-element DLPack scalar (host or device) to a Python
+                     number, for the eager device-flag -> bool sync point. */
+PyObject *py_clone_device(PyObject *self, PyObject *args);
+PyObject *py_needs_rebuild(PyObject *self, PyObject *args);
+PyObject *py_dlpack_item(PyObject *self, PyObject *args);
+
 #ifdef __cplusplus
 }
 #endif

@@ -56,6 +56,14 @@ static PyMethodDef module_methods[] = {
       METH_VARARGS,
       "Dense fixed-capacity (n x K) neighbour list as DLPack capsules "
       "(idx, dist, count) plus an overflow flag." },
+    { "clone_device", (PyCFunction) py_clone_device, METH_VARARGS,
+      "Snapshot (n, 3) device positions into a reusable device-reference "
+      "capsule (Verlet-skin reference)." },
+    { "needs_rebuild", (PyCFunction) py_needs_rebuild, METH_VARARGS,
+      "On-device Verlet rebuild test: a 1-element uint8 DLPack capsule, 1 iff "
+      "the max squared displacement exceeds skin^2." },
+    { "dlpack_item", (PyCFunction) py_dlpack_item, METH_VARARGS,
+      "Read a 1-element DLPack scalar (host or device) to a Python number." },
     { "first_neighbours", (PyCFunction) py_first_neighbours, METH_VARARGS,
       "Compute indices of first neighbours in neighbour list array." },
     { "triplet_list", (PyCFunction) py_triplet_list, METH_VARARGS,

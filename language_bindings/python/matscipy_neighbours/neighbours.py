@@ -80,6 +80,22 @@ class DLPackTensor:
     def __dlpack_device__(self):
         return self._device
 
+    def __bool__(self):
+        """Truth value of a single-element tensor (host or device).
+
+        Reads the one element to the host via the C extension (no framework
+        dependency), so an on-device 0-d/1-element flag -- e.g. the Verlet skin
+        ``needs_rebuild`` result -- can be used in ``if``/``bool()`` without
+        CuPy/torch. This is the eager device->host sync point; a fully compiled
+        consumer instead adopts the tensor with ``from_dlpack`` and branches
+        in-graph.
+        """
+        return bool(_ext.dlpack_item(self))
+
+    def item(self):
+        """Return the single element as a Python number (host or device)."""
+        return _ext.dlpack_item(self)
+
 
 # Backwards-compatible internal alias.
 _DLPackArray = DLPackTensor

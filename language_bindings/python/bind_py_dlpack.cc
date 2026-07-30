@@ -23,12 +23,14 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <vector>
 
 #include "bind_py_dlpack.hh"
 #include "dlpack.h"
 
+#include "device_primitives.hh"
 #include "error.hh"
 #include "memory_space.hh"
 #include "neighbour_list.hh"
@@ -225,6 +227,23 @@ int quantity_flags(const char *q, int *flags) {
     }
     return 0;
 }
+
+#if defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP)
+/* Opaque, reusable device-resident skin reference (the build-time positions
+   snapshot). Held by Python across many needs_rebuild() calls; the capsule owns
+   the device Array and frees it on collection. Unlike a DLPack capsule this is
+   not one-shot, so it can be read on every step without being consumed. */
+struct DeviceRef {
+    Array<real_t, DeviceSpace> arr;
+    index_t nat;
+    int device_id;
+};
+
+void deviceref_destructor(PyObject *cap) {
+    delete static_cast<DeviceRef *>(
+        PyCapsule_GetPointer(cap, "matscipy_device_ref"));
+}
+#endif
 
 }  // namespace
 
@@ -655,4 +674,142 @@ mfail:
     Py_XDECREF(a_pos);
     Py_XDECREF(a_types);
     return NULL;
+}
+
+/* Snapshot (n, 3) float64 device positions into an opaque, reusable device
+   reference capsule (the Verlet-skin reference). */
+PyObject *py_clone_device(PyObject *self, PyObject *args) {
+#if !(defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP))
+    (void)self;
+    (void)args;
+    PyErr_SetString(PyExc_RuntimeError,
+                    "clone_device requires a GPU backend (-DENABLE_CUDA=ON).");
+    return NULL;
+#else
+    (void)self;
+    PyObject *py_in;
+    if (!PyArg_ParseTuple(args, "O", &py_in)) return NULL;
+    ImportedDLPack imp;
+    if (import_positions_dlpack(py_in, &imp) != 0) return NULL;
+    const index_t nat = static_cast<index_t>(imp.nat);
+    auto *ref = new DeviceRef{device_clone_positions(imp.data, 3 * nat), nat,
+                             imp.device_id};
+    imp.release();
+    PyObject *cap =
+        PyCapsule_New(ref, "matscipy_device_ref", deviceref_destructor);
+    if (!cap) delete ref;
+    return cap;
+#endif
+}
+
+/* On-device Verlet rebuild test against a reference capsule from clone_device().
+   Returns a 1-element uint8 device DLPack capsule (1 iff a rebuild is needed);
+   nothing is read back to the host. */
+PyObject *py_needs_rebuild(PyObject *self, PyObject *args) {
+#if !(defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP))
+    (void)self;
+    (void)args;
+    PyErr_SetString(PyExc_RuntimeError,
+                    "needs_rebuild requires a GPU backend (-DENABLE_CUDA=ON).");
+    return NULL;
+#else
+    (void)self;
+    PyObject *py_cur, *py_ref;
+    double skin;
+    if (!PyArg_ParseTuple(args, "OOd", &py_cur, &py_ref, &skin)) return NULL;
+    auto *ref =
+        static_cast<DeviceRef *>(PyCapsule_GetPointer(py_ref, "matscipy_device_ref"));
+    if (!ref) {
+        PyErr_SetString(PyExc_TypeError,
+                        "ref must be a device-reference capsule from "
+                        "clone_device()");
+        return NULL;
+    }
+    ImportedDLPack cur;
+    if (import_positions_dlpack(py_cur, &cur) != 0) return NULL;
+    if (static_cast<index_t>(cur.nat) != ref->nat) {
+        cur.release();
+        PyErr_SetString(PyExc_ValueError,
+                        "positions and reference have different atom counts");
+        return NULL;
+    }
+    const index_t nat = static_cast<index_t>(cur.nat);
+    const int dev_id = cur.device_id;
+    Array<std::uint8_t, DeviceSpace> out = device_needs_rebuild(
+        cur.data, ref->arr.data(), nat, static_cast<real_t>(skin));
+    cur.release();
+    return device_capsule(std::move(out), 1, 1, 1, kDLUInt, 8, dev_id);
+#endif
+}
+
+/* Read a 1-element DLPack scalar (host or device) to a Python number, for the
+   eager device-flag -> bool sync. Does NOT consume the producer's capsule. */
+PyObject *py_dlpack_item(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *obj;
+    if (!PyArg_ParseTuple(args, "O", &obj)) return NULL;
+    PyObject *cap = PyObject_CallMethod(obj, "__dlpack__", NULL);
+    if (!cap) return NULL;
+    if (!PyCapsule_IsValid(cap, "dltensor")) {
+        PyErr_SetString(PyExc_TypeError,
+                        "object did not yield an unversioned DLPack capsule");
+        Py_DECREF(cap);
+        return NULL;
+    }
+    auto *mt =
+        static_cast<DLManagedTensor *>(PyCapsule_GetPointer(cap, "dltensor"));
+    if (!mt) {
+        Py_DECREF(cap);
+        return NULL;
+    }
+    const DLTensor &t = mt->dl_tensor;
+    const void *src =
+        static_cast<const char *>(t.data) + t.byte_offset;
+    const int dev = static_cast<int>(t.device.device_type);
+    const uint8_t code = t.dtype.code;
+    const uint8_t bits = t.dtype.bits;
+    const std::size_t nbytes = bits / 8u;
+    unsigned char buf[8] = {0};
+    if (nbytes == 0 || nbytes > sizeof(buf)) {
+        PyErr_SetString(PyExc_TypeError, "unsupported scalar width");
+        Py_DECREF(cap);
+        return NULL;
+    }
+    if (dev == kDLCPU) {
+        std::memcpy(buf, src, nbytes);
+    } else {
+#if defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP)
+        device_copy_to_host(buf, src, nbytes);
+#else
+        PyErr_SetString(PyExc_RuntimeError,
+                        "device scalar but this build has no GPU backend");
+        Py_DECREF(cap);
+        return NULL;
+#endif
+    }
+    /* Read the pointer only; leave the capsule named "dltensor" so the producer
+       keeps ownership and can still be consumed (or freed) later. */
+    Py_DECREF(cap);
+
+    if (code == kDLFloat) {
+        double v = (bits == 32) ? static_cast<double>(
+                                      *reinterpret_cast<float *>(buf))
+                                : *reinterpret_cast<double *>(buf);
+        return PyFloat_FromDouble(v);
+    }
+    if (code == kDLInt) {
+        long long v = 0;
+        if (bits == 8) v = *reinterpret_cast<std::int8_t *>(buf);
+        else if (bits == 16) v = *reinterpret_cast<std::int16_t *>(buf);
+        else if (bits == 32) v = *reinterpret_cast<std::int32_t *>(buf);
+        else v = *reinterpret_cast<std::int64_t *>(buf);
+        return PyLong_FromLongLong(v);
+    }
+    /* kDLUInt or kDLBool */
+    unsigned long long v = 0;
+    if (bits == 8) v = *reinterpret_cast<std::uint8_t *>(buf);
+    else if (bits == 16) v = *reinterpret_cast<std::uint16_t *>(buf);
+    else if (bits == 32) v = *reinterpret_cast<std::uint32_t *>(buf);
+    else v = *reinterpret_cast<std::uint64_t *>(buf);
+    return PyLong_FromUnsignedLongLong(v);
 }
