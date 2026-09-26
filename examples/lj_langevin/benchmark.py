@@ -16,11 +16,12 @@ threading controls the matscipy list (and the C++ OpenMP force loop). vesin's
 CPU list is single-threaded.
 
 Each configuration is launched as a subprocess and its printed `ms/step` is
-parsed. Output: a combined table and a log-log plot of time vs. number of atoms,
+parsed. Output: a console table, a JSON file of raw timings, and a log-log plot of time vs. number of atoms,
 faceted by kernel.
 """
 
 import argparse
+import json
 import os
 import platform
 import re
@@ -28,6 +29,15 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def usable_cores():
+    """Cores this process may run on (respects cgroup/affinity limits, e.g. a
+    batch-job allocation), falling back to the machine's logical core count."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count()
 
 KERNEL_NAME = {"warp": "Warp", "array": "array (NumPy/CuPy)", "jax": "JAX",
                "cpp": "C++"}
@@ -68,7 +78,7 @@ def detect_cpu():
                     break
     except OSError:
         pass
-    return f"{model} ({os.cpu_count()} logical cores)"
+    return f"{model} ({usable_cores()} usable cores)"
 
 
 def detect_gpu():
@@ -129,7 +139,7 @@ def build_command(cfg, atoms, steps, build, base_env):
     env = dict(base_env)
     if cfg["device"] == "cpu" and cfg["nl"] == "matscipy":
         env["OMP_NUM_THREADS"] = "1" if cfg["threads"] == "1t" else \
-            str(os.cpu_count())
+            str(usable_cores())
     common = ["--atoms", str(atoms), "--steps", str(steps),
               "--write-every", str(steps + 1), "--out", os.devnull]
     kernel = cfg["kernel"]
@@ -180,6 +190,20 @@ def run(cfg, atoms, base_steps, build, base_env, timeout):
 THRASH_GROWTH = 6.0
 
 
+def predicted_run_seconds(points, atoms, base_steps):
+    """Timed-loop wall time of the next size, extrapolated linearly in the atom
+    count from the last measured point (None if nothing is measured yet)."""
+    if not points:
+        return None
+    pa, pm = points[-1]
+    return pm * (atoms / pa) * adaptive_steps(base_steps, atoms) / 1000
+
+
+def within_budget(points, atoms, base_steps, budget):
+    predicted = predicted_run_seconds(points, atoms, base_steps)
+    return budget is None or predicted is None or predicted <= budget
+
+
 def make_plot(cfgs, sizes, path):
     """2x2 log-log facets (one per kernel): time per step vs. number of atoms."""
     import matplotlib
@@ -226,7 +250,11 @@ def table_markdown(cfgs, sizes):
     return "\n".join(lines)
 
 
-def write_doc_page(path, table, plot_name, sizes, steps, ncores):
+def write_doc_page(path, plot_name, meta):
+    sizes = meta["sizes"]
+    cpu_cap = meta.get("max_atoms_cpu")
+    cpu_range = (f"\nCPU runs stop at {cpu_cap:,} atoms; the GPU runs cover the "
+                 f"full range." if cpu_cap else "")
     body = f"""# Benchmark
 
 Per-step wall time of the [Lennard-Jones Langevin droplet](examples.md) example
@@ -240,49 +268,49 @@ Lower is better. The neighbour-list backends are:
 - **vesin** — [`vesin`](https://github.com/luthaf/vesin), CPU + GPU.
 
 !!! info "Test machine"
-    - **CPU:** {detect_cpu()}
-    - **GPU:** {detect_gpu()}
+    - **CPU:** {meta["cpu"]}
+    - **GPU:** {meta["gpu"]}
 
 !!! warning "CPU threading"
     On the CPU the **matscipy-neighbours** list is benchmarked **both
-    single-threaded** (`OMP_NUM_THREADS=1`, the `(1t)` rows) **and
-    multi-threaded** (all {ncores} logical cores, the `(mt)` rows). The C++
-    force loop is OpenMP-parallel and follows the same setting; the Warp and
+    single-threaded** (`OMP_NUM_THREADS=1`, the `(1t)` curves) **and
+    multi-threaded** (all {meta["ncores"]} usable cores, the `(mt)` curves). The
+    C++ force loop is OpenMP-parallel and follows the same setting; the Warp and
     array kernels and the JAX backend use their own threading. The classic
-    **matscipy 1.2.0** and **vesin** CPU lists are single-threaded. The GPU rows
-    are unaffected.
+    **matscipy 1.2.0** and **vesin** CPU lists are single-threaded. The GPU
+    curves are unaffected.
 
-!!! note "Empty cells"
+!!! note "Missing curves"
     vesin and matscipy 1.2.0 only feed the Warp and array kernels: JAX uses the
     dense `neighbour_matrix` and the C++ example uses the in-tree C++ core, so
-    those rows are left empty. matscipy 1.2.0 is CPU-only, so it has no GPU rows.
-    A blank in an otherwise-populated row marks a size that **exceeded the GPU
-    memory** (e.g. the JAX dense matrix and the CuPy/vesin GPU paths at the
-    largest sizes on this card).
+    those panels show matscipy-neighbours only. matscipy 1.2.0 is CPU-only, so it
+    has no GPU curve. A curve that ends before the largest size either ran
+    **out of GPU memory** at the next size (e.g. the JAX dense neighbour
+    matrix, or the per-pair arrays of the array kernels) or was stopped because
+    its next run was predicted to take longer than
+    {meta.get("max_run_seconds", 60):g} s.
 
 Run configuration: reduced LJ units, cutoff 2.5, dt 0.005, friction 1.0,
-temperature 0.7; logarithmically spaced sizes ({sizes[0]} → {sizes[-1]} atoms).
-Up to {steps} steps per point (fewer for the largest systems; JAX and Warp are
-compiled once during an untimed warm-up).
+temperature 0.7; sizes from {sizes[0]:,} to {sizes[-1]:,} atoms.{cpu_range}
+Up to {meta["steps"]} steps per point (fewer for the largest systems; JAX and
+Warp are compiled once during an untimed warm-up).
 
 ![Time vs. number of atoms]({plot_name})
-
-{table}
-
-(values are **ms/step**)
 
 How to read it:
 
 - The neighbour-list build dominates the step, so the **list** choice drives the
-  scaling: matscipy-neighbours' cell list stays close to linear on both devices,
-  the classic matscipy 1.2.0 list is a single-threaded CPU reference, and vesin's
-  GPU path falls behind for these large, low-density droplets.
+  scaling: matscipy-neighbours' cell list stays close to linear on both devices
+  (on the GPU up to the largest size), the classic matscipy 1.2.0 list is a
+  single-threaded CPU reference, and vesin's GPU path grows super-linearly and
+  falls far behind for these large, low-density droplets.
 - The **kernel** choice mostly shifts the curve: the fused C++/CUDA and Warp
   kernels avoid materialising per-pair arrays, the array (NumPy/CuPy) path is the
   simplest, and JAX `jit`-compiles a dense masked sum.
-- On the CPU, the matscipy-neighbours `(mt)` rows pull away from `(1t)` as the
-  system grows; and even single-threaded, matscipy-neighbours `(1t)` is already
-  faster than the classic matscipy 1.2.0 and vesin CPU lists.
+- On the CPU, the matscipy-neighbours `(mt)` curves pull away from `(1t)` as the
+  system grows (at small sizes the thread start-up cost dominates); and from
+  about 10⁵ atoms on, even single-threaded matscipy-neighbours `(1t)` is faster
+  than the classic matscipy 1.2.0 and vesin CPU lists.
 
 This page is generated by `examples/lj_langevin/benchmark.py`. Regenerate it on
 your own hardware with:
@@ -291,9 +319,11 @@ your own hardware with:
 python examples/lj_langevin/benchmark.py --build build --doc-out docs/benchmark.md
 ```
 
-For the C++ rows, build with `-DBUILD_EXAMPLES=ON` (and `-DENABLE_CUDA=ON` for
-the GPU binary); the other rows need `pip install jax warp-lang vesin muTimer
-matscipy==1.2.0` in the interpreter that runs this driver.
+The raw timings are written to `--results-out` (JSON); pass that file to
+`--replot` to redraw the plot and this page without re-running the benchmark.
+For the C++ curves, build with `-DBUILD_EXAMPLES=ON` (and `-DENABLE_CUDA=ON` for
+the GPU binary); the others need `pip install jax warp-lang vesin muTimer
+matscipy==1.2.0 matplotlib` in the interpreter that runs this driver.
 """
     with open(path, "w") as fh:
         fh.write(body)
@@ -306,16 +336,35 @@ def main():
                     help="CMake build directory (C++ binaries + Python extension)")
     ap.add_argument("--sizes", type=int, nargs="+",
                     default=[100, 1000, 10000, 100000, 1000000])
+    ap.add_argument("--max-atoms-cpu", type=int, default=None,
+                    help="skip CPU configurations above this size (GPU runs "
+                         "still cover all --sizes)")
     ap.add_argument("--steps", type=int, default=40,
                     help="timed steps for the smallest systems (scaled down "
                          "automatically for larger ones)")
-    ap.add_argument("--timeout", type=int, default=900,
-                    help="per-run timeout in seconds")
+    ap.add_argument("--max-run-seconds", type=float, default=60,
+                    help="skip a size (and all larger ones) when its timed loop "
+                         "is predicted, from the previous size, to take longer "
+                         "than this; keeps slow configurations such as large "
+                         "single-threaded CPU runs from dominating the runtime")
+    ap.add_argument("--timeout", type=int, default=300,
+                    help="per-run timeout in seconds (safety net)")
     ap.add_argument("--plot-out", default=os.path.join(HERE, "..", "..",
                                                        "docs", "benchmark.png"))
     ap.add_argument("--doc-out", default=None,
                     help="write a documentation page (with hardware info) here")
+    ap.add_argument("--results-out", default=None,
+                    help="write the raw timings and machine info (JSON) here")
+    ap.add_argument("--replot", default=None, metavar="JSON",
+                    help="skip the runs; redraw plot/page from a --results-out "
+                         "file")
     args = ap.parse_args()
+
+    if args.replot:
+        with open(args.replot) as fh:
+            saved = json.load(fh)
+        finish(saved["configs"], saved["meta"], args)
+        return
 
     build = os.path.abspath(args.build)
     pkg = os.path.join(HERE, "..", "..", "language_bindings", "python")
@@ -329,6 +378,15 @@ def main():
             continue
         cfg["points"] = []
         for atoms in args.sizes:
+            if (cfg["device"] == "cpu" and args.max_atoms_cpu is not None
+                    and atoms > args.max_atoms_cpu):
+                break
+            if not within_budget(cfg["points"], atoms, args.steps,
+                                 args.max_run_seconds):
+                print(f"  {label(cfg):44s} atoms={atoms} -> predicted run "
+                      f"exceeds {args.max_run_seconds:g} s; stopping this "
+                      f"configuration", file=sys.stderr)
+                break
             ms = run(cfg, atoms, args.steps, build, base_env, args.timeout)
             if ms is None:
                 print(f"  {label(cfg):44s} atoms={atoms} -> failed/timed out "
@@ -346,14 +404,25 @@ def main():
             print(f"  {label(cfg):44s} atoms={atoms:>8d} -> {ms:.2f} ms/step",
                   file=sys.stderr)
 
+    meta = dict(cpu=detect_cpu(), gpu=detect_gpu(), ncores=usable_cores(),
+                sizes=args.sizes, steps=args.steps, timeout=args.timeout,
+                max_run_seconds=args.max_run_seconds,
+                max_atoms_cpu=args.max_atoms_cpu)
+    if args.results_out:
+        with open(args.results_out, "w") as fh:
+            json.dump(dict(meta=meta, configs=cfgs), fh, indent=1)
+        print(f"wrote {args.results_out}", file=sys.stderr)
+    finish(cfgs, meta, args)
+
+
+def finish(cfgs, meta, args):
+    """Plot, print the console table, and optionally write the doc page."""
     plot_path = os.path.abspath(args.plot_out)
-    make_plot(cfgs, args.sizes, plot_path)
-    table = table_markdown(cfgs, args.sizes)
-    print("\n" + table + "\n\n(values are ms/step)")
+    make_plot(cfgs, meta["sizes"], plot_path)
+    print("\n" + table_markdown(cfgs, meta["sizes"]) + "\n\n(values are ms/step)")
     if args.doc_out:
-        write_doc_page(os.path.abspath(args.doc_out), table,
-                       os.path.basename(plot_path), args.sizes, args.steps,
-                       os.cpu_count())
+        write_doc_page(os.path.abspath(args.doc_out),
+                       os.path.basename(plot_path), meta)
         print(f"\nwrote {args.doc_out}", file=sys.stderr)
 
 
