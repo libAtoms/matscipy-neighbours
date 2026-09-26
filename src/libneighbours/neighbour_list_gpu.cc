@@ -17,6 +17,7 @@
 #include "neighbour_list_gpu.hh"
 
 #include <cmath>
+#include <cstdio>
 
 #include "cell_list.hh"          /* shared cell_hash, morton3, Dense/SparseQuery */
 #include "device.hh"
@@ -55,7 +56,14 @@ struct DeviceGuard {
         }
     }
     ~DeviceGuard() {
-        if (prev >= 0) gpuSetDevice(prev);
+        if (prev < 0) return;
+        /* Restoring the caller's device cannot fail meaningfully at this
+           point; report rather than abort from a destructor. */
+        const gpuError_t err = gpuSetDevice(prev);
+        if (err != gpuSuccess) {
+            std::fprintf(stderr, "[matscipy] could not restore GPU device %d: %s\n",
+                         prev, gpuGetErrorString(err));
+        }
     }
 };
 

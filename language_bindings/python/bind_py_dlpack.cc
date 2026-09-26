@@ -175,7 +175,7 @@ int import_positions_dlpack(PyObject *arr, ImportedDLPack *imp) {
     const bool ok_device = dev_type == kDLCUDA || dev_type == kDLCUDAManaged;
     const char *backend = "CUDA";
 #elif defined(MATSCIPY_ENABLE_HIP)
-    const bool ok_device = dev_type == kDLROCm;
+    const bool ok_device = dev_type == kDLROCM;
     const char *backend = "HIP";
 #else
     const bool ok_device = false;
