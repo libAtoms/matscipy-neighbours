@@ -104,11 +104,17 @@ __device__ inline index_t atomic_inc(index_t *p) {
 
 /* --- kernels --------------------------------------------------------------- */
 
+/* Also flags any non-finite coordinate (every offending thread stores the same
+   value, so a plain store suffices); the host turns the flag into an error. */
 __global__ void k_cell_index(const real_t *origin, const real_t *inv,
                              const real_t *r, index_t n1, index_t n2, index_t n3,
-                             index_t nat, index_t *raw) {
+                             index_t nat, index_t *raw, int *nonfinite) {
     index_t a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= nat) return;
+    if (!is_finite(r[3 * a]) || !is_finite(r[3 * a + 1]) ||
+        !is_finite(r[3 * a + 2])) {
+        *nonfinite = 1;
+    }
     position_to_cell_index(origin, inv, &r[3 * a], n1, n2, n3, &raw[3 * a],
                   &raw[3 * a + 1], &raw[3 * a + 2]);
 }
@@ -390,10 +396,17 @@ static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
         d_r = d_r_owned.data();
     }
 
-    /* 1. raw (unwrapped) cell index per atom. */
+    /* 1. raw (unwrapped) cell index per atom, rejecting non-finite positions
+          (the CPU path does the same; device input can only be checked here). */
     DBuf<index_t> d_raw(3 * nat);
+    DBuf<int> d_nonfinite(1);
+    GPU_CHECK(gpuMemset(d_nonfinite.data(), 0, sizeof(int)));
     GPU_LAUNCH(k_cell_index, g_at, BLOCK, d_origin.data(), d_inv.data(), d_r,
-               n1, n2, n3, nat, d_raw.data());
+               n1, n2, n3, nat, d_raw.data(), d_nonfinite.data());
+    int nonfinite = 0;
+    GPU_CHECK(gpuMemcpy(&nonfinite, d_nonfinite.data(), sizeof(int),
+                        gpuMemcpyDeviceToHost));
+    if (nonfinite) return set_invalid_argument("Positions must be finite.");
 
     /* 2. build the CSR cell list -> d_sorted plus a dense or sparse lookup.
           The dense backends (Linear scan+scatter / Morton radix-sort+runs) need

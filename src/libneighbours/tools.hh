@@ -51,6 +51,11 @@ MATSCIPY_HD inline index_t bin_trunc(index_t i, index_t n) {
     return i;
 }
 
+/* True for a finite value. Written without <cmath> so it is usable in device
+   code under both nvcc and hipcc: x - x is 0 for finite x, NaN for +-inf and
+   NaN, and IEEE semantics (no fast-math) forbid folding it to 0. */
+MATSCIPY_HD inline bool is_finite(real_t x) { return x - x == 0.0; }
+
 /* Largest magnitude of a raw (unwrapped) cell coordinate. Scaled fractional
    coordinates beyond this (atoms astronomically far outside the cell, or
    non-finite positions the caller did not reject) are clamped before the

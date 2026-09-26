@@ -1,8 +1,8 @@
 # C++ API
 
 The core lives in `src/libneighbours/` (namespace `matscipy`) and is
-Python-free. Numeric types are aliased in `types.hh`: `index_t` (32-bit signed)
-and `real_t` (double).
+Python-free. Numeric types are aliased in `types.hh`: `index_t` (64-bit signed,
+`std::int64_t`; exposed to Python as NumPy `int64`) and `real_t` (double).
 
 ## Building a neighbour list
 

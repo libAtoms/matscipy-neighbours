@@ -167,6 +167,27 @@ int import_positions_dlpack(PyObject *arr, ImportedDLPack *imp) {
            destructor frees the managed tensor. */
         return -1;
     }
+    /* The pointer is handed to this build's runtime: only memory that runtime
+       can address is acceptable (CUDA or CUDA-managed for the CUDA build, ROCm
+       for the HIP build). Anything else would be an illegal access. */
+    const int dev_type = static_cast<int>(t.device.device_type);
+#if defined(MATSCIPY_ENABLE_CUDA)
+    const bool ok_device = dev_type == kDLCUDA || dev_type == kDLCUDAManaged;
+    const char *backend = "CUDA";
+#elif defined(MATSCIPY_ENABLE_HIP)
+    const bool ok_device = dev_type == kDLROCm;
+    const char *backend = "HIP";
+#else
+    const bool ok_device = false;
+    const char *backend = "no GPU";
+#endif
+    if (!ok_device) {
+        PyErr_Format(PyExc_TypeError,
+                     "device positions live on DLPack device type %d, which the "
+                     "%s backend of this build cannot access",
+                     dev_type, backend);
+        return -1;
+    }
     imp->mt = mt;
     imp->data = reinterpret_cast<const real_t *>(
         static_cast<char *>(t.data) + t.byte_offset);

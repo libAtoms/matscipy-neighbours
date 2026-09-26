@@ -269,6 +269,14 @@ TEST(TripletList, RejectsBadRowStarts) {
     std::vector<index_t> decreasing = {5, 0};
     EXPECT_EQ(triplet_list(2, decreasing.data(), 0, nullptr, 0.0, ij, ik),
               NL_INVALID_ARGUMENT);
+    std::vector<index_t> minus_one_then_three = {-1, 3};
+    EXPECT_EQ(triplet_list(2, minus_one_then_three.data(), 0, nullptr, 0.0, ij,
+                           ik),
+              NL_INVALID_ARGUMENT);
+    // A slice of a row-start array (no -1, not starting at 0) is fine.
+    std::vector<index_t> slice = {3, 5};
+    EXPECT_EQ(triplet_list(2, slice.data(), 0, nullptr, 0.0, ij, ik), NL_SUCCESS);
+    EXPECT_EQ(ij.size(), 2u);
 }
 
 TEST(NeighbourList, RejectsInvalidArguments) {

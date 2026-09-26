@@ -228,6 +228,8 @@ def test_triplet_list_rejects_bad_row_starts():
         triplet_list([5, 0])                         # decreasing
     with pytest.raises(ValueError):
         triplet_list([0, 2, 4], cutoff=1.0)          # cutoff without distances
+    with pytest.raises(ValueError):
+        triplet_list([-1, 3])                        # -1 not followed by 0
 
 
 def test_triplet_list_accepts_leading_minus_one():

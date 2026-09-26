@@ -36,8 +36,60 @@ first_neighbours = _ext.first_neighbours
 get_jump_indicies = _ext.get_jump_indicies
 
 
+def _gauss_reduce(b1, b2):
+    """Lagrange/Gauss reduction of a 2D lattice basis (shortest two vectors)."""
+    b1, b2 = (b1, b2) if b1 @ b1 <= b2 @ b2 else (b2, b1)
+    while True:
+        b2 = b2 - np.round((b2 @ b1) / (b1 @ b1)) * b1
+        if b2 @ b2 >= b1 @ b1:
+            return b1, b2
+        b1, b2 = b2, b1
+
+
+def _closest_in_plane(v, b1, b2):
+    """Lattice vector of the Gauss-reduced basis (b1, b2) closest to v.
+
+    Rounding the (Gram) coordinates and checking the neighbouring cells is
+    exact for a reduced 2D basis.
+    """
+    gram = np.array([[b1 @ b1, b1 @ b2], [b1 @ b2, b2 @ b2]])
+    c = np.round(np.linalg.solve(gram, [v @ b1, v @ b2]))
+    best, best_d = None, np.inf
+    for di in (-1, 0, 1):
+        for dj in (-1, 0, 1):
+            w = (c[0] + di) * b1 + (c[1] + dj) * b2
+            d = (v - w) @ (v - w)
+            if d < best_d:
+                best, best_d = w, d
+    return best
+
+
+def _reduce_basis(vectors):
+    """Minkowski-reduce up to three lattice vectors (greedy algorithm, exact
+    in dimension <= 3): the returned basis spans the same lattice and its
+    vectors are the successive shortest ones."""
+    b = [np.asarray(v, dtype=float) for v in vectors]
+    if len(b) == 1:
+        return np.array(b)
+    if len(b) == 2:
+        return np.array(_gauss_reduce(*b))
+    for _ in range(100):
+        b.sort(key=lambda v: v @ v)
+        b1, b2 = _gauss_reduce(b[0], b[1])
+        b3 = b[2] - _closest_in_plane(b[2], b1, b2)
+        if b3 @ b3 >= b2 @ b2:
+            return np.array([b1, b2, b3])
+        b = [b1, b2, b3]
+    raise RuntimeError("Lattice reduction did not converge.")  # pragma: no cover
+
+
 def mic(dr, cell, pbc=None):
     """Apply the minimum image convention to an array of distance vectors.
+
+    Each vector is replaced by the shortest vector that differs from it by an
+    integer combination of the *periodic* lattice vectors. The periodic
+    sublattice is Minkowski-reduced first, so the result is the true minimum
+    image for any (arbitrarily skewed) cell, not just for orthogonal ones.
 
     Parameters
     ----------
@@ -55,18 +107,33 @@ def mic(dr, cell, pbc=None):
     numpy.ndarray
         ``dr`` wrapped into the minimum image.
     """
-    dr = np.asarray(dr, dtype=float)
+    dr = np.array(dr, dtype=float)
     cell = np.asarray(cell, dtype=float)
-    rec = np.linalg.inv(cell)
-    if pbc is not None:
-        # ``dr @ rec`` gives fractional coordinates, one *column* of ``rec``
-        # per lattice direction; zero the columns of the non-periodic
-        # directions so no shift is applied along them. (Masking the rows
-        # instead would zero Cartesian components, which is wrong for
-        # non-orthogonal cells.)
-        rec = rec * np.asarray(pbc, dtype=int).reshape(1, 3)
-    offset = np.round(dr @ rec)
-    return dr - offset @ cell
+    if pbc is None:
+        pbc = np.ones(3, dtype=bool)
+    pbc = np.broadcast_to(np.asarray(pbc, dtype=bool), (3,))
+    if not pbc.any():
+        return dr
+    basis = _reduce_basis(cell[pbc])        # (k, 3), k periodic directions
+    k = len(basis)
+    # Coordinates of dr in the reduced basis (least squares: components
+    # perpendicular to the periodic sublattice cannot be changed).
+    gram = basis @ basis.T
+    s = np.round(np.linalg.solve(gram, basis @ dr.T).T)
+    # For a Minkowski-reduced basis the closest lattice point lies within one
+    # step of the rounded coordinates in every direction.
+    best = dr - s @ basis
+    best_d = np.einsum("ij,ij->i", best, best)
+    for offset in np.ndindex(*(3,) * k):
+        off = np.asarray(offset) - 1
+        if not off.any():
+            continue
+        cand = dr - (s + off) @ basis
+        cand_d = np.einsum("ij,ij->i", cand, cand)
+        better = cand_d < best_d
+        best[better] = cand[better]
+        best_d[better] = cand_d[better]
+    return best
 
 
 class DLPackTensor:

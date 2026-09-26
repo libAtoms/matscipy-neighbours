@@ -157,7 +157,7 @@ def test_missing_cutoff_raises():
 def _brute_force_mic(dr, cell, pbc):
     """Minimum image over explicit shifts along the periodic directions."""
     import itertools
-    ranges = [range(-3, 4) if p else [0] for p in pbc]
+    ranges = [range(-8, 9) if p else [0] for p in pbc]
     out = np.empty_like(dr)
     for p, v in enumerate(dr):
         images = [v + np.array(s) @ cell for s in itertools.product(*ranges)]
@@ -248,3 +248,42 @@ def test_slab_with_zero_lattice_vector():
     slab.pbc = True
     with pytest.raises(ValueError):
         neighbour_list("i", slab, 2.7)
+
+
+def test_mic_strongly_sheared_cell_matches_brute_force():
+    # Regression (review): rounding fractional coordinates is not a minimum
+    # image for a skewed cell; the periodic basis must be reduced first.
+    cell = np.array([[1.0, 0, 0], [0.9, 1.0, 0], [0, 0, 1.0]])
+    dr = np.array([[0.931, 0.49, 0.0]])
+    np.testing.assert_allclose(np.linalg.norm(mic(dr, cell), axis=1),
+                               [0.494834], atol=1e-6)
+
+    # Random strongly sheared cells. Fully periodic: against ASE's exact
+    # find_mic (which reduces the basis too). Mixed periodicity: against a
+    # brute force with wide lattice offsets in the original basis (ASE's
+    # find_mic is not minimal for partially periodic skewed cells; with at
+    # most two periodic directions the wide search stays cheap).
+    import itertools
+    from ase.geometry import find_mic
+    rng = np.random.default_rng(7)
+    for _ in range(20):
+        cell = np.diag(rng.uniform(1, 3, 3)) + rng.uniform(-1.5, 1.5, (3, 3))
+        if abs(np.linalg.det(cell)) < 0.3:
+            continue
+        pbc = (rng.integers(0, 2, 3).astype(bool) if rng.random() < 0.5
+               else np.ones(3, bool))
+        dr = rng.uniform(-6, 6, (100, 3))
+        got = mic(dr, cell, pbc)
+        if pbc.all():
+            _, ref_len = find_mic(dr, cell, pbc)
+        else:
+            ranges = [range(-25, 26) if p else [0] for p in pbc]
+            ref_len = np.array([
+                min(np.linalg.norm(v + np.array(s) @ cell)
+                    for s in itertools.product(*ranges)) for v in dr])
+        np.testing.assert_allclose(np.linalg.norm(got, axis=1), ref_len,
+                                   atol=1e-9)
+        # The result differs from the input by periodic lattice vectors only.
+        shifts = (got - dr) @ np.linalg.inv(cell)
+        np.testing.assert_allclose(shifts, np.round(shifts), atol=1e-9)
+        assert np.allclose(shifts[:, ~pbc], 0)

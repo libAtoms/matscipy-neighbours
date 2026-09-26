@@ -30,7 +30,15 @@ error_t triplet_list(index_t n_first, const index_t *first_i,
         return set_invalid_argument(
             "triplet_list: invalid distance array or cutoff.");
     }
+    /* first_neighbours() emits -1 for atoms before the first pair and then
+       0 for the first atom with one; -1 is only meaningful in that form. */
     for (index_t r = 0; r < n_first; r++) {
+        if (r > 0 && first_i[r - 1] == -1 && first_i[r] > 0) {
+            return set_invalid_argumentf(
+                "triplet_list: leading -1 row starts must be followed by 0, "
+                "got %lld at position %lld.",
+                static_cast<long long>(first_i[r]), static_cast<long long>(r));
+        }
         if (first_i[r] < -1) {
             return set_invalid_argumentf(
                 "triplet_list: row start %lld at position %lld is negative.",
