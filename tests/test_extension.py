@@ -334,3 +334,66 @@ def test_triplet_list_cutoff_requires_distances():
     first_i = np.array([0, 2, 6, 10], dtype=np.int64)
     with pytest.raises(TypeError):
         nl.triplet_list(first_i, np.ones(10))   # cutoff missing
+
+
+# ---------------------------------------------------------------------------
+# Randomised brute-force check of the full contract
+# ---------------------------------------------------------------------------
+
+def _brute_force_full(pos, cell, pbc, cutoff, radii=None):
+    """All (i, j, shift) triples within the cutoff, including multiple images
+    of the same pair and atoms several cells outside the box."""
+    inv = np.linalg.inv(cell)
+    frac = pos @ inv
+    volume = abs(np.linalg.det(cell))
+    ranges = []
+    for k in range(3):
+        if not pbc[k]:
+            ranges.append([0])
+            continue
+        height = volume / np.linalg.norm(np.cross(cell[(k + 1) % 3],
+                                                  cell[(k + 2) % 3]))
+        span = int(np.ceil(frac[:, k].max() - frac[:, k].min())) + 1
+        reach = int(np.ceil(cutoff / height)) + span + 1
+        ranges.append(range(-reach, reach + 1))
+    pairs = set()
+    for s in itertools.product(*ranges):
+        S = np.array(s)
+        D = pos[None, :, :] - pos[:, None, :] + S @ cell
+        d = np.linalg.norm(D, axis=2)
+        if radii is None:
+            inside = d < cutoff
+        else:
+            inside = d < radii[:, None] + radii[None, :]
+        if s == (0, 0, 0):
+            np.fill_diagonal(inside, False)
+        for i, j in zip(*np.nonzero(inside)):
+            pairs.add((int(i), int(j)) + tuple(int(x) for x in S))
+    return pairs
+
+
+def test_random_triclinic_cells_match_brute_force():
+    """Random triclinic (possibly left-handed) cells, mixed periodicity,
+    cutoffs larger than the cell (multiple images), atoms several cells
+    outside the box, and per-atom radii."""
+    rng = np.random.default_rng(42)
+    trials = 0
+    while trials < 40:
+        n = int(rng.integers(1, 30))
+        cell = (rng.uniform(-1, 1, (3, 3)) * rng.uniform(1, 8)
+                + np.diag(rng.uniform(1, 8, 3)))
+        if abs(np.linalg.det(cell)) < 0.5:
+            continue
+        trials += 1
+        pbc = rng.integers(0, 2, 3).astype(bool)
+        cutoff = float(rng.uniform(0.5, 5))
+        pos = rng.uniform(-2, 3, (n, 3)) @ cell
+        radii = rng.uniform(0.2, cutoff / 2, n) if rng.random() < 0.3 else None
+
+        cell_origin, c, inv_cell, pb, r = make_args(cell, pos, pbc)
+        i, j, S, D = nl.neighbour_list("ijSD", cell_origin, c, inv_cell, pb, r,
+                                       radii if radii is not None else cutoff)
+        got = set(zip(i.tolist(), j.tolist(), *S.T.tolist()))
+        assert got == _brute_force_full(pos, cell, pbc, cutoff, radii), (
+            f"trial {trials}: pbc={pbc.tolist()} cutoff={cutoff:.3f}")
+        np.testing.assert_allclose(D, pos[j] - pos[i] + S @ cell, atol=1e-9)

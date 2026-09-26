@@ -148,3 +148,103 @@ def test_missing_cutoff_raises():
     a = bulk("Al", "fcc", a=4.05)
     with pytest.raises(ValueError):
         neighbour_list("i", a)
+
+
+# ---------------------------------------------------------------------------
+# mic: mixed periodicity
+# ---------------------------------------------------------------------------
+
+def _brute_force_mic(dr, cell, pbc):
+    """Minimum image over explicit shifts along the periodic directions."""
+    import itertools
+    ranges = [range(-3, 4) if p else [0] for p in pbc]
+    out = np.empty_like(dr)
+    for p, v in enumerate(dr):
+        images = [v + np.array(s) @ cell for s in itertools.product(*ranges)]
+        out[p] = min(images, key=lambda w: w @ w)
+    return out
+
+
+def test_mic_orthorhombic_mixed_pbc_matches_brute_force():
+    rng = np.random.default_rng(0)
+    cell = np.diag([10.0, 9.0, 11.0])
+    pbc = np.array([True, False, True])
+    dr = rng.uniform(-30, 30, (300, 3))
+    np.testing.assert_allclose(mic(dr, cell, pbc),
+                               _brute_force_mic(dr, cell, pbc), atol=1e-12)
+
+
+def test_mic_triclinic_never_shifts_along_non_periodic_direction():
+    # Regression: masking the rows of inv(cell) (Cartesian components) instead
+    # of its columns (lattice directions) shifted vectors along the
+    # non-periodic direction of a sheared cell.
+    rng = np.random.default_rng(1)
+    cell = np.array([[10.0, 0, 0], [4.0, 9.0, 0], [1.0, 2.0, 11.0]])
+    pbc = np.array([True, False, True])
+    dr = rng.uniform(-30, 30, (500, 3))
+    wrapped = mic(dr, cell, pbc)
+    shifts = np.round((wrapped - dr) @ np.linalg.inv(cell))
+    assert (shifts[:, 1] == 0).all()
+    # ... and the shifts along the periodic directions are integers.
+    np.testing.assert_allclose((wrapped - dr) @ np.linalg.inv(cell), shifts,
+                               atol=1e-9)
+
+
+def test_mic_triclinic_fully_periodic_reconstructs_neighbour_list():
+    a = bulk("Cu", "fcc", a=3.6, cubic=False).repeat((3, 3, 3))
+    a.rattle(0.05, seed=4)
+    i, j, D = neighbour_list("ijD", a, 2.7)
+    np.testing.assert_allclose(mic(a.positions[j] - a.positions[i], a.cell),
+                               D, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Missing / incomplete cells
+# ---------------------------------------------------------------------------
+
+def test_shrink_wrapped_cell_with_pbc_raises():
+    # A shrink-wrapped box made atoms at opposite faces periodic images.
+    pos = np.random.default_rng(2).uniform(0, 10, (30, 3))
+    with pytest.raises(ValueError):
+        neighbour_list("d", positions=pos, pbc=True, cutoff=3.0)
+
+
+def test_molecule_without_cell():
+    # ASE molecules carry an all-zero cell; the planar water molecule used to
+    # give a singular shrink-wrapped cell.
+    water = molecule("H2O")
+    i, j, d = neighbour_list("ijd", water, 1.2)
+    assert sorted(zip(i.tolist(), j.tolist())) == [(0, 1), (0, 2), (1, 0), (2, 0)]
+    np.testing.assert_allclose(d, 0.969, atol=1e-3)
+    assert (coordination(water, 1.2) == [2, 1, 1]).all()
+    # Element-pair cutoffs on a molecule.
+    i, j = neighbour_list("ij", water, {("H", "O"): 1.2})
+    assert len(i) == 4
+    i, j = neighbour_list("ij", water, {("H", "H"): 1.2})
+    assert len(i) == 0
+
+
+@pytest.mark.parametrize("positions", [
+    np.zeros((1, 3)),                                    # single atom
+    np.c_[np.arange(5.0), np.zeros(5), np.zeros(5)],     # a line
+    np.c_[np.arange(4.0), np.arange(4.0) ** 2, np.zeros(4)],  # planar
+])
+def test_degenerate_configurations_without_cell(positions):
+    i, j, d = neighbour_list("ijd", positions=positions, cutoff=1.5)
+    assert (np.bincount(i, minlength=len(positions)) ==
+            np.bincount(j, minlength=len(positions))).all()
+    assert (d < 1.5).all()
+
+
+def test_slab_with_zero_lattice_vector():
+    from ase.build import fcc111
+    slab = fcc111("Cu", (3, 3, 3), vacuum=None)   # zero c vector
+    slab.pbc = [True, True, False]
+    counts = np.bincount(neighbour_list("i", slab, 2.7))
+    # Nearest neighbours only: 9 at the two surfaces, 12 in the middle layer.
+    assert (counts[:9] == 9).all()
+    assert (counts[9:18] == 12).all()
+    assert (counts[18:] == 9).all()
+    slab.pbc = True
+    with pytest.raises(ValueError):
+        neighbour_list("i", slab, 2.7)
