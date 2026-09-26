@@ -108,6 +108,10 @@ error_t neighbour_count_gpu_device(const NeighbourListRequest &req,
  * stay on the device for zero-copy export. `overflow` is true if any atom has
  * more than max_neighbours neighbours (rows clipped; retry with a larger
  * capacity). Unused slots are 0; mask them with `count`.
+ *
+ * Unlike the host neighbour_matrix(), the order of the neighbours within a row
+ * is unspecified (and may differ between runs): the rows are filled by atomic
+ * slot assignment from the pair list. Consumers must treat a row as a set.
  */
 struct NeighbourMatrixDevice {
     index_t n = 0;

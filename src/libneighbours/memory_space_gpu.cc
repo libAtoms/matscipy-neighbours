@@ -14,6 +14,8 @@
  * for the active backend.
  */
 
+#include <cstdio>
+
 #include "device.hh"
 #include "memory_space.hh"
 
@@ -36,7 +38,18 @@ void *GPU_ALLOC(std::size_t bytes) {
     return ptr;
 }
 
-void GPU_FREE(void *ptr) { GPU_CHECK(gpuFree(ptr)); }
+/* Freeing runs from destructors, including those of DLPack capsules that a
+   Python consumer drops during interpreter shutdown, after the runtime has
+   been torn down: that reports "unloading", which is harmless and must not
+   abort the process. Any other failure is reported but not fatal either; a
+   destructor cannot recover, and aborting would only turn a leak into a crash. */
+void GPU_FREE(void *ptr) {
+    const gpuError_t err = gpuFree(ptr);
+    if (err != gpuSuccess && err != gpuErrorUnloading) {
+        std::fprintf(stderr, "[matscipy] GPU free failed: %s\n",
+                     gpuGetErrorString(err));
+    }
+}
 
 void GPU_COPY(void *dst, DeviceType dst_dev, const void *src,
               DeviceType src_dev, std::size_t bytes) {
