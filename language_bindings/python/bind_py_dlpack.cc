@@ -263,7 +263,7 @@ PyObject *py_neighbour_list_dlpack(PyObject *self, PyObject *args) {
     a_pos = PyArray_FROMANY(py_pos, NPY_DOUBLE, 2, 2, NPY_ARRAY_C_CONTIGUOUS);
     if (!a_origin || !a_cell || !a_inv || !a_pbc || !a_pos) goto fail;
     if (py_types && py_types != Py_None) {
-        a_types = PyArray_FROMANY(py_types, NPY_INT, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
+        a_types = PyArray_FROMANY(py_types, NPY_INT64, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
         if (!a_types) goto fail;
     }
     if (device_in && import_positions_dlpack(py_in, &imp) != 0) goto fail;
@@ -436,7 +436,7 @@ PyObject *py_coordination_dlpack(PyObject *self, PyObject *args) {
     a_pos = PyArray_FROMANY(py_pos, NPY_DOUBLE, 2, 2, NPY_ARRAY_C_CONTIGUOUS);
     if (!a_origin || !a_cell || !a_inv || !a_pbc || !a_pos) goto cfail;
     if (py_types && py_types != Py_None) {
-        a_types = PyArray_FROMANY(py_types, NPY_INT, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
+        a_types = PyArray_FROMANY(py_types, NPY_INT64, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
         if (!a_types) goto cfail;
     }
     if (device_in && import_positions_dlpack(py_in, &imp) != 0) goto cfail;
@@ -545,7 +545,7 @@ PyObject *py_neighbour_matrix_dlpack(PyObject *self, PyObject *args) {
     a_pos = PyArray_FROMANY(py_pos, NPY_DOUBLE, 2, 2, NPY_ARRAY_C_CONTIGUOUS);
     if (!a_origin || !a_cell || !a_inv || !a_pbc || !a_pos) goto mfail;
     if (py_types && py_types != Py_None) {
-        a_types = PyArray_FROMANY(py_types, NPY_INT, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
+        a_types = PyArray_FROMANY(py_types, NPY_INT64, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
         if (!a_types) goto mfail;
     }
     if (device_in && import_positions_dlpack(py_in, &imp) != 0) goto mfail;

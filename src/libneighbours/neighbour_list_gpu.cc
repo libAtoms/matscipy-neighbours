@@ -30,6 +30,7 @@ namespace matscipy {
 namespace {
 
 constexpr int BLOCK = 256;
+constexpr index_t kMaxDeviceAtoms = index_t(1) << 29;
 inline int grid_for(index_t n) { return static_cast<int>((n + BLOCK - 1) / BLOCK); }
 
 /* The cell-index helpers (bin_wrap/bin_trunc/position_to_cell_index), the hash
@@ -62,17 +63,19 @@ struct DeviceGuard {
 /* Per-pair sinks for the shared visit_neighbours traversal. HD so the
    host+device template that calls them is valid for both instantiations. */
 struct Counter {
-    int n = 0;
-    MATSCIPY_HD void operator()(int, const real_t *, real_t, const int *) { n++; }
+    index_t n = 0;
+    MATSCIPY_HD void operator()(index_t, const real_t *, real_t, const index_t *) {
+        n++;
+    }
 };
 
 struct Filler {
-    int i, w;
-    const int *sorted_atom;
-    int *first, *secnd, *shift;
+    index_t i, w;
+    const index_t *sorted_atom;
+    index_t *first, *secnd, *shift;
     real_t *distvec, *absdist;
-    MATSCIPY_HD void operator()(int sj, const real_t *dr, real_t r2,
-                                const int *sh) {
+    MATSCIPY_HD void operator()(index_t sj, const real_t *dr, real_t r2,
+                                const index_t *sh) {
         if (first) first[w] = i;
         if (secnd) secnd[w] = sorted_atom[sj];
         if (distvec) {
@@ -90,63 +93,73 @@ struct Filler {
     }
 };
 
+/* Atomic post-increment of a 64-bit index (histogram / cursor / row counters).
+   CUDA and HIP provide 64-bit atomicAdd only for unsigned long long. */
+__device__ inline index_t atomic_inc(index_t *p) {
+    static_assert(sizeof(index_t) == sizeof(unsigned long long),
+                  "atomic_inc assumes a 64-bit index_t");
+    return static_cast<index_t>(
+        atomicAdd(reinterpret_cast<unsigned long long *>(p), 1ull));
+}
+
 /* --- kernels --------------------------------------------------------------- */
 
 __global__ void k_cell_index(const real_t *origin, const real_t *inv,
-                             const real_t *r, int n1, int n2, int n3,
-                             index_t nat, int *raw) {
+                             const real_t *r, index_t n1, index_t n2, index_t n3,
+                             index_t nat, index_t *raw) {
     index_t a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= nat) return;
     position_to_cell_index(origin, inv, &r[3 * a], n1, n2, n3, &raw[3 * a],
                   &raw[3 * a + 1], &raw[3 * a + 2]);
 }
 
-__global__ void k_fold_lin_hist(const int *raw, int pbc0, int pbc1, int pbc2,
-                                int n1, int n2, int n3, index_t nat, int *lin,
-                                int *cell_count) {
+__global__ void k_fold_lin_hist(const index_t *raw, int pbc0, int pbc1, int pbc2,
+                                index_t n1, index_t n2, index_t n3, index_t nat,
+                                index_t *lin, index_t *cell_count) {
     index_t a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= nat) return;
-    int c1 = pbc0 ? bin_wrap(raw[3 * a], n1) : bin_trunc(raw[3 * a], n1);
-    int c2 = pbc1 ? bin_wrap(raw[3 * a + 1], n2) : bin_trunc(raw[3 * a + 1], n2);
-    int c3 = pbc2 ? bin_wrap(raw[3 * a + 2], n3) : bin_trunc(raw[3 * a + 2], n3);
-    int l = c1 + n1 * (c2 + n2 * c3);
+    index_t c1 = pbc0 ? bin_wrap(raw[3 * a], n1) : bin_trunc(raw[3 * a], n1);
+    index_t c2 = pbc1 ? bin_wrap(raw[3 * a + 1], n2) : bin_trunc(raw[3 * a + 1], n2);
+    index_t c3 = pbc2 ? bin_wrap(raw[3 * a + 2], n3) : bin_trunc(raw[3 * a + 2], n3);
+    index_t l = c1 + n1 * (c2 + n2 * c3);
     lin[a] = l;
-    atomicAdd(&cell_count[l], 1);
+    atomic_inc(&cell_count[l]);
 }
 
-__global__ void k_scatter(const int *lin, index_t nat, int *cursor,
-                          int *sorted_atom) {
+__global__ void k_scatter(const index_t *lin, index_t nat, index_t *cursor,
+                          index_t *sorted_atom) {
     index_t a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= nat) return;
-    int pos = atomicAdd(&cursor[lin[a]], 1);
+    index_t pos = atomic_inc(&cursor[lin[a]]);
     sorted_atom[pos] = a;
 }
 
-__global__ void k_iota(int *v, index_t n) {
+__global__ void k_iota(index_t *v, index_t n) {
     index_t a = blockIdx.x * blockDim.x + threadIdx.x;
-    if (a < n) v[a] = static_cast<int>(a);
+    if (a < n) v[a] = a;
 }
 
 /* Morton key (Z-curve) of each atom's wrapped cell — the radix-sort key for the
    Morton (coalesced) layout. */
-__global__ void k_morton_key(const int *raw, int pbc0, int pbc1, int pbc2,
-                            int n1, int n2, int n3, index_t nat,
+__global__ void k_morton_key(const index_t *raw, int pbc0, int pbc1, int pbc2,
+                            index_t n1, index_t n2, index_t n3, index_t nat,
                             std::uint64_t *key) {
     index_t a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= nat) return;
-    int c1 = pbc0 ? bin_wrap(raw[3 * a], n1) : bin_trunc(raw[3 * a], n1);
-    int c2 = pbc1 ? bin_wrap(raw[3 * a + 1], n2) : bin_trunc(raw[3 * a + 1], n2);
-    int c3 = pbc2 ? bin_wrap(raw[3 * a + 2], n3) : bin_trunc(raw[3 * a + 2], n3);
+    index_t c1 = pbc0 ? bin_wrap(raw[3 * a], n1) : bin_trunc(raw[3 * a], n1);
+    index_t c2 = pbc1 ? bin_wrap(raw[3 * a + 1], n2) : bin_trunc(raw[3 * a + 1], n2);
+    index_t c3 = pbc2 ? bin_wrap(raw[3 * a + 2], n3) : bin_trunc(raw[3 * a + 2], n3);
     key[a] = morton3(c1, c2, c3);
 }
 
 /* After a Morton sort, atoms of one cell are a contiguous run in `sorted_atom`
    (the key is unique per cell). Record where each run starts: cell_first[lin]. */
-__global__ void k_cell_first_from_runs(const int *sorted_atom, const int *lin,
-                                       index_t nat, int *cell_first) {
+__global__ void k_cell_first_from_runs(const index_t *sorted_atom,
+                                       const index_t *lin, index_t nat,
+                                       index_t *cell_first) {
     index_t s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= nat) return;
-    int c = lin[sorted_atom[s]];
+    index_t c = lin[sorted_atom[s]];
     if (s == 0 || lin[sorted_atom[s - 1]] != c) cell_first[c] = s;
 }
 
@@ -155,21 +168,22 @@ __global__ void k_cell_first_from_runs(const int *sorted_atom, const int *lin,
    atomicCAS inserts. Used when the dense histogram/array path would need
    O(ncells) memory (or overflow a 32-bit index). */
 
-__global__ void k_fold_key64(const int *raw, int pbc0, int pbc1, int pbc2,
-                            int n1, int n2, int n3, index_t nat,
+__global__ void k_fold_key64(const index_t *raw, int pbc0, int pbc1, int pbc2,
+                            index_t n1, index_t n2, index_t n3, index_t nat,
                             std::int64_t *key) {
     index_t a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= nat) return;
-    int c1 = pbc0 ? bin_wrap(raw[3 * a], n1) : bin_trunc(raw[3 * a], n1);
-    int c2 = pbc1 ? bin_wrap(raw[3 * a + 1], n2) : bin_trunc(raw[3 * a + 1], n2);
-    int c3 = pbc2 ? bin_wrap(raw[3 * a + 2], n3) : bin_trunc(raw[3 * a + 2], n3);
+    index_t c1 = pbc0 ? bin_wrap(raw[3 * a], n1) : bin_trunc(raw[3 * a], n1);
+    index_t c2 = pbc1 ? bin_wrap(raw[3 * a + 1], n2) : bin_trunc(raw[3 * a + 1], n2);
+    index_t c3 = pbc2 ? bin_wrap(raw[3 * a + 2], n3) : bin_trunc(raw[3 * a + 2], n3);
     key[a] = static_cast<std::int64_t>(c1) +
              static_cast<std::int64_t>(n1) *
                  (static_cast<std::int64_t>(c2) + static_cast<std::int64_t>(n2) * c3);
 }
 
 __global__ void k_hash_insert(const std::int64_t *key, index_t nat,
-                             std::int64_t mask, std::int64_t *hkey, int *hcount) {
+                             std::int64_t mask, std::int64_t *hkey,
+                             index_t *hcount) {
     index_t a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= nat) return;
     std::int64_t k = key[a];
@@ -180,7 +194,7 @@ __global__ void k_hash_insert(const std::int64_t *key, index_t nat,
         unsigned long long old =
             atomicCAS(&slot[h], empty, static_cast<unsigned long long>(k));
         if (old == empty || static_cast<std::int64_t>(old) == k) {
-            atomicAdd(&hcount[h], 1);
+            atomic_inc(&hcount[h]);
             return;
         }
         h = (h + 1) & mask;
@@ -189,33 +203,34 @@ __global__ void k_hash_insert(const std::int64_t *key, index_t nat,
 
 __global__ void k_hash_scatter(const std::int64_t *key, index_t nat,
                               std::int64_t mask, const std::int64_t *hkey,
-                              int *cursor, int *sorted_atom) {
+                              index_t *cursor, index_t *sorted_atom) {
     index_t a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= nat) return;
     std::int64_t k = key[a];
     std::int64_t h = cell_hash(k) & mask;
     while (hkey[h] != k) h = (h + 1) & mask;  /* key is guaranteed present */
-    int pos = atomicAdd(&cursor[h], 1);
-    sorted_atom[pos] = static_cast<int>(a);
+    index_t pos = atomic_inc(&cursor[h]);
+    sorted_atom[pos] = a;
 }
 
-__global__ void k_gather(const int *sorted_atom, const int *raw, const real_t *r,
-                        int pbc0, int pbc1, int pbc2, int n1, int n2, int n3,
+__global__ void k_gather(const index_t *sorted_atom, const index_t *raw,
+                        const real_t *r,
+                        int pbc0, int pbc1, int pbc2, index_t n1, index_t n2, index_t n3,
                         real_t b1x, real_t b1y, real_t b1z, real_t b2x,
                         real_t b2y, real_t b2z, real_t b3x, real_t b3y,
-                        real_t b3z, const real_t *per_atom, const int *types,
-                        index_t nat, int *raw_s, int *rel_s, real_t *pos_s,
-                        real_t *per_atom_s, int *types_s) {
+                        real_t b3z, const real_t *per_atom, const index_t *types,
+                        index_t nat, index_t *raw_s, index_t *rel_s, real_t *pos_s,
+                        real_t *per_atom_s, index_t *types_s) {
     index_t s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= nat) return;
-    int a = sorted_atom[s];
-    int c1 = raw[3 * a], c2 = raw[3 * a + 1], c3 = raw[3 * a + 2];
+    index_t a = sorted_atom[s];
+    index_t c1 = raw[3 * a], c2 = raw[3 * a + 1], c3 = raw[3 * a + 2];
     raw_s[3 * s] = c1;
     raw_s[3 * s + 1] = c2;
     raw_s[3 * s + 2] = c3;
-    int r1 = pbc0 ? c1 : bin_trunc(c1, n1);
-    int r2 = pbc1 ? c2 : bin_trunc(c2, n2);
-    int r3 = pbc2 ? c3 : bin_trunc(c3, n3);
+    index_t r1 = pbc0 ? c1 : bin_trunc(c1, n1);
+    index_t r2 = pbc1 ? c2 : bin_trunc(c2, n2);
+    index_t r3 = pbc2 ? c3 : bin_trunc(c3, n3);
     rel_s[3 * s] = r1;
     rel_s[3 * s + 1] = r2;
     rel_s[3 * s + 2] = r3;
@@ -227,21 +242,21 @@ __global__ void k_gather(const int *sorted_atom, const int *raw, const real_t *r
 }
 
 template <typename Query>
-__global__ void k_count(NeighbourContext c, Query q, index_t nat, int *cnt) {
+__global__ void k_count(NeighbourContext c, Query q, index_t nat, index_t *cnt) {
     index_t si = blockIdx.x * blockDim.x + threadIdx.x;
     if (si >= nat) return;
     Counter f;
-    visit_neighbours(c, q, static_cast<int>(si), f);
+    visit_neighbours(c, q, si, f);
     cnt[c.sorted_atom[si]] = f.n;
 }
 
 template <typename Query>
-__global__ void k_fill(NeighbourContext c, Query q, index_t nat, const int *offset,
-                      int *first, int *secnd, real_t *distvec, real_t *absdist,
-                      int *shift) {
+__global__ void k_fill(NeighbourContext c, Query q, index_t nat,
+                      const index_t *offset, index_t *first, index_t *secnd,
+                      real_t *distvec, real_t *absdist, index_t *shift) {
     index_t si = blockIdx.x * blockDim.x + threadIdx.x;
     if (si >= nat) return;
-    int i = c.sorted_atom[si];
+    index_t i = c.sorted_atom[si];
     Filler f;
     f.i = i;
     f.w = offset[i];
@@ -251,7 +266,7 @@ __global__ void k_fill(NeighbourContext c, Query q, index_t nat, const int *offs
     f.distvec = distvec;
     f.absdist = absdist;
     f.shift = shift;
-    visit_neighbours(c, q, static_cast<int>(si), f);
+    visit_neighbours(c, q, si, f);
 }
 
 /* Device buffer alias (RAII via Array). */
@@ -268,8 +283,8 @@ static error_t count_and_fill(const NeighbourContext &ctx, const Query &q, index
     const int g_at = grid_for(nat);
 
     /* pass 1: count neighbours per (original) atom; cnt[nat] = 0 sentinel. */
-    DBuf<int> d_cnt(nat + 1), d_offset(nat + 1);
-    GPU_CHECK(gpuMemset(d_cnt.data() + nat, 0, sizeof(int)));
+    DBuf<index_t> d_cnt(nat + 1), d_offset(nat + 1);
+    GPU_CHECK(gpuMemset(d_cnt.data() + nat, 0, sizeof(index_t)));
     GPU_LAUNCH(k_count, g_at, BLOCK, ctx, q, nat, d_cnt.data());
 
     dev.counts.resize(nat);
@@ -328,6 +343,10 @@ static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
     clear_error();
     dev.npairs = 0;
     if (nat <= 0) return NL_SUCCESS;
+    /* The device primitives (CUB/hipCUB) take 32-bit item counts, and the sparse
+       hash table has capacity ~2*nat; keep both comfortably below 2^31. */
+    if (nat >= kMaxDeviceAtoms)
+        return set_error("GPU backend supports at most 2^29 atoms per call.");
     DeviceGuard guard(device_id);  /* run on the input's device; restore on exit */
 
     /* Grid definition (resolution, bins, box widths) via the shared helper. The
@@ -336,7 +355,7 @@ static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
     CellGrid grid;
     if (!cell_grid_geometry(cell_origin, cell, inv_cell, pbc, cutoff, grid))
         return set_error("Zero cell volume.");
-    const int n1 = grid.n1, n2 = grid.n2, n3 = grid.n3;
+    const index_t n1 = grid.n1, n2 = grid.n2, n3 = grid.n3;
     const real_t *bin1 = grid.bin1, *bin2 = grid.bin2, *bin3 = grid.bin3;
     const real_t len1 = grid.len[0], len2 = grid.len[1], len3 = grid.len[2];
 
@@ -369,7 +388,7 @@ static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
     }
 
     /* 1. raw (unwrapped) cell index per atom. */
-    DBuf<int> d_raw(3 * nat);
+    DBuf<index_t> d_raw(3 * nat);
     GPU_LAUNCH(k_cell_index, g_at, BLOCK, d_origin.data(), d_inv.data(), d_r,
                n1, n2, n3, nat, d_raw.data());
 
@@ -377,20 +396,20 @@ static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
           The dense backends (Linear scan+scatter / Morton radix-sort+runs) need
           O(ncells) arrays; for a huge/sparse grid we build a hashed compact
           table instead. */
-    DBuf<int> d_sorted(nat);
+    DBuf<index_t> d_sorted(nat);
     /* Dense backend buffers (empty for the sparse path). */
-    DBuf<int> d_cell_first, d_cell_count;
+    DBuf<index_t> d_cell_first, d_cell_count;
     /* Sparse backend buffers (empty for the dense path). */
     DBuf<std::int64_t> d_hkey;
-    DBuf<int> d_hfirst, d_hcount;
+    DBuf<index_t> d_hfirst, d_hcount;
     std::int64_t hmask = 0;
 
     if (!sparse) {
         const index_t nc = static_cast<index_t>(ncells);
-        DBuf<int> d_lin(nat);
+        DBuf<index_t> d_lin(nat);
         d_cell_count.resize(nc);
         d_cell_first.resize(nc);
-        GPU_CHECK(gpuMemset(d_cell_count.data(), 0, nc * sizeof(int)));
+        GPU_CHECK(gpuMemset(d_cell_count.data(), 0, nc * sizeof(index_t)));
         GPU_LAUNCH(k_fold_lin_hist, g_at, BLOCK, d_raw.data(), pbc[0], pbc[1],
                    pbc[2], n1, n2, n3, nat, d_lin.data(), d_cell_count.data());
         if (order == CellOrder::Morton) {
@@ -404,9 +423,9 @@ static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
                        d_lin.data(), nat, d_cell_first.data());
         } else {
             device_exclusive_scan(d_cell_count.data(), d_cell_first.data(), nc);
-            DBuf<int> d_cursor(nc);
+            DBuf<index_t> d_cursor(nc);
             GPU_CHECK(gpuMemcpy(d_cursor.data(), d_cell_first.data(),
-                                nc * sizeof(int), gpuMemcpyDeviceToDevice));
+                                nc * sizeof(index_t), gpuMemcpyDeviceToDevice));
             GPU_LAUNCH(k_scatter, g_at, BLOCK, d_lin.data(), nat,
                        d_cursor.data(), d_sorted.data());
         }
@@ -419,7 +438,7 @@ static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
         d_hfirst.resize(cap);
         d_hcount.resize(cap);
         GPU_CHECK(gpuMemset(d_hkey.data(), 0xFF, cap * sizeof(std::int64_t)));
-        GPU_CHECK(gpuMemset(d_hcount.data(), 0, cap * sizeof(int)));
+        GPU_CHECK(gpuMemset(d_hcount.data(), 0, cap * sizeof(index_t)));
         DBuf<std::int64_t> d_key(nat);
         GPU_LAUNCH(k_fold_key64, g_at, BLOCK, d_raw.data(), pbc[0], pbc[1], pbc[2],
                    n1, n2, n3, nat, d_key.data());
@@ -427,26 +446,26 @@ static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
                    d_hkey.data(), d_hcount.data());
         device_exclusive_scan(d_hcount.data(), d_hfirst.data(),
                               static_cast<index_t>(cap));
-        DBuf<int> d_cursor(cap);
+        DBuf<index_t> d_cursor(cap);
         GPU_CHECK(gpuMemcpy(d_cursor.data(), d_hfirst.data(),
-                            cap * sizeof(int), gpuMemcpyDeviceToDevice));
+                            cap * sizeof(index_t), gpuMemcpyDeviceToDevice));
         GPU_LAUNCH(k_hash_scatter, g_at, BLOCK, d_key.data(), nat, hmask,
                    d_hkey.data(), d_cursor.data(), d_sorted.data());
     }
 
     /* 3. gather per-atom data into cell-sorted order. */
-    DBuf<int> d_raw_s(3 * nat), d_rel_s(3 * nat);
+    DBuf<index_t> d_raw_s(3 * nat), d_rel_s(3 * nat);
     DBuf<real_t> d_pos_s(3 * nat);
     DBuf<real_t> d_per_atom_s(per_atom_cutoff ? nat : 0);
-    DBuf<int> d_types_s(types ? nat : 0);
+    DBuf<index_t> d_types_s(types ? nat : 0);
     DBuf<real_t> d_per_atom(per_atom_cutoff ? nat : 0);
-    DBuf<int> d_types(types ? nat : 0);
+    DBuf<index_t> d_types(types ? nat : 0);
     DBuf<real_t> d_pt_sq(per_type_cutoff_sq ? ncutoffs * ncutoffs : 0);
     if (per_atom_cutoff)
         GPU_CHECK(gpuMemcpy(d_per_atom.data(), per_atom_cutoff,
                             nat * sizeof(real_t), gpuMemcpyHostToDevice));
     if (types)
-        GPU_CHECK(gpuMemcpy(d_types.data(), types, nat * sizeof(int),
+        GPU_CHECK(gpuMemcpy(d_types.data(), types, nat * sizeof(index_t),
                             gpuMemcpyHostToDevice));
     if (per_type_cutoff_sq)
         GPU_CHECK(gpuMemcpy(d_pt_sq.data(), per_type_cutoff_sq,
@@ -464,9 +483,9 @@ static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
     /* Assemble the device context. */
     NeighbourContext ctx;
     ctx.n1 = n1; ctx.n2 = n2; ctx.n3 = n3;
-    ctx.nx = static_cast<int>(std::ceil(cutoff * n1 / len1));
-    ctx.ny = static_cast<int>(std::ceil(cutoff * n2 / len2));
-    ctx.nz = static_cast<int>(std::ceil(cutoff * n3 / len3));
+    ctx.nx = static_cast<index_t>(std::ceil(cutoff * n1 / len1));
+    ctx.ny = static_cast<index_t>(std::ceil(cutoff * n2 / len2));
+    ctx.nz = static_cast<index_t>(std::ceil(cutoff * n3 / len3));
     ctx.pbc0 = pbc[0]; ctx.pbc1 = pbc[1]; ctx.pbc2 = pbc[2];
     for (int k = 0; k < 3; k++) {
         ctx.bin1[k] = bin1[k]; ctx.bin2[k] = bin2[k]; ctx.bin3[k] = bin3[k];
@@ -501,7 +520,7 @@ __global__ void k_scatter_matrix(const index_t *first, const index_t *secnd,
     index_t p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= npairs) return;
     index_t i = first[p];
-    int s = atomicAdd(&count[i], 1);
+    index_t s = atomic_inc(&count[i]);
     if (s < K) {
         std::size_t base = (static_cast<std::size_t>(i) * K + s);
         idx[base] = secnd[p];
@@ -528,8 +547,10 @@ error_t neighbour_count_gpu_device(const NeighbourListRequest &req,
 
 error_t neighbour_matrix_gpu_device(const NeighbourListRequest &req, index_t K,
                                     NeighbourMatrixDevice &out) {
-    DeviceGuard guard(req.device_id);  /* allocate + scatter on the input device */
     const index_t n = req.nat;
+    if (n >= kMaxDeviceAtoms)
+        return set_error("GPU backend supports at most 2^29 atoms per call.");
+    DeviceGuard guard(req.device_id);  /* allocate + scatter on the input device */
     out.n = n;
     out.max_neighbours = K;
     out.overflow = false;

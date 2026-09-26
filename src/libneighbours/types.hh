@@ -11,6 +11,8 @@
 #ifndef MATSCIPY_TYPES_HH
 #define MATSCIPY_TYPES_HH
 
+#include <cstdint>
+
 /* Mark a small leaf function callable from both host and device so the CPU and
    GPU paths share one definition. Expands to nothing for the host compiler and
    to `__host__ __device__` when nvcc/hipcc compiles the translation unit. */
@@ -23,9 +25,10 @@
 namespace matscipy {
 
 /* Integer and floating-point types used throughout the core. Plain aliases so
-   the core never needs to include the NumPy headers. `index_t` matches the
-   integer type the Python layer hands across (NumPy NPY_INT). */
-using index_t = int;
+   the core never needs to include the NumPy headers. `index_t` is 64-bit so
+   atom, cell and pair counts cannot overflow; the Python layer exposes it as
+   NumPy int64 / DLPack int64. */
+using index_t = std::int64_t;
 using real_t = double;
 
 /* Error code returned by core routines. */

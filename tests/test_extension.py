@@ -43,7 +43,7 @@ def neighbour_list(quantities, cell, positions, cutoff, pbc=True, types=None):
     cell_origin, cell, inv_cell, pbc, positions = make_args(cell, positions, pbc)
     args = [quantities, cell_origin, cell, inv_cell, pbc, positions, cutoff]
     if types is not None:
-        args.append(np.ascontiguousarray(types, dtype=np.int32))
+        args.append(np.ascontiguousarray(types, dtype=np.int64))
     return nl.neighbour_list(*args)
 
 
@@ -221,7 +221,7 @@ def test_per_atom_cutoffs():
 def test_per_type_cutoffs():
     cell = 10.0 * np.eye(3)
     pos = np.array([[0.0, 0, 0], [1.0, 0, 0], [2.0, 0, 0]])
-    types = np.array([0, 1, 0], dtype=np.int32)
+    types = np.array([0, 1, 0], dtype=np.int64)
     # 2x2 cutoff matrix: only the (0,1)/(1,0) interaction within 1.5 counts
     cutoffs = np.array([[0.5, 1.5],
                         [1.5, 0.5]])
@@ -271,7 +271,7 @@ def test_zero_cell_volume_raises():
 # ---------------------------------------------------------------------------
 
 def _fn(n, i):
-    return nl.first_neighbours(n, np.array(i, dtype=np.int32))
+    return nl.first_neighbours(n, np.array(i, dtype=np.int64))
 
 
 def test_first_neighbours_reference_values():
@@ -298,10 +298,10 @@ def test_first_neighbours_empty():
 def test_get_jump_indicies():
     out = nl.get_jump_indicies(np.array(
         [0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4],
-        dtype=np.int32))
+        dtype=np.int64))
     np.testing.assert_array_equal(out, [0, 3, 8, 11, 15, 19])
 
-    out = nl.get_jump_indicies(np.array([0], dtype=np.int32))
+    out = nl.get_jump_indicies(np.array([0], dtype=np.int64))
     np.testing.assert_array_equal(out, [0, 1])
 
 
@@ -310,7 +310,7 @@ def test_get_jump_indicies():
 # ---------------------------------------------------------------------------
 
 def test_triplet_list_no_cutoff():
-    first_i = np.array([0, 2, 6, 10], dtype=np.int32)
+    first_i = np.array([0, 2, 6, 10], dtype=np.int64)
     ij, ik = nl.triplet_list(first_i)
     ij_comp = [0, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5,
                5, 6, 6, 6, 7, 7, 7, 8, 8, 8, 9, 9, 9]
@@ -321,7 +321,7 @@ def test_triplet_list_no_cutoff():
 
 
 def test_triplet_list_with_cutoff():
-    first_i = np.array([0, 2, 6, 10], dtype=np.int32)
+    first_i = np.array([0, 2, 6, 10], dtype=np.int64)
     absdist = np.array([2.2] * 4 + [3.0] * 2 + [2.0] * 4, dtype=np.float64)
     ij, ik = nl.triplet_list(first_i, absdist, 2.6)
     ij_comp = [0, 1, 2, 3, 6, 6, 6, 7, 7, 7, 8, 8, 8, 9, 9, 9]
@@ -331,6 +331,6 @@ def test_triplet_list_with_cutoff():
 
 
 def test_triplet_list_cutoff_requires_distances():
-    first_i = np.array([0, 2, 6, 10], dtype=np.int32)
+    first_i = np.array([0, 2, 6, 10], dtype=np.int64)
     with pytest.raises(TypeError):
         nl.triplet_list(first_i, np.ones(10))   # cutoff missing

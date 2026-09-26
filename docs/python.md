@@ -28,7 +28,7 @@ Compute a neighbour list and return one array per requested quantity.
 | `S`  | cell shift, shape `(npairs, 3)` |
 
 Arrays come back in the order requested; a single character returns a bare
-array. The shift satisfies `D == r[j] - r[i] + S @ cell`, and pairs are sorted
+array. Index arrays (`i`, `j`, `S`) are `int64`, distances are `float64`. The shift satisfies `D == r[j] - r[i] + S @ cell`, and pairs are sorted
 by `i`.
 
 **Configuration.** Pass either an ASE `Atoms` object as `atoms`, or explicit

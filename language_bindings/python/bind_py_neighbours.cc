@@ -36,7 +36,7 @@ using namespace matscipy;
 /* Wrap a core result buffer in a freshly-allocated NumPy array (copying). */
 static PyObject *array_1d_int(const std::vector<index_t> &v) {
     npy_intp dims[1] = {static_cast<npy_intp>(v.size())};
-    PyObject *a = PyArray_SimpleNew(1, dims, NPY_INT);
+    PyObject *a = PyArray_SimpleNew(1, dims, NPY_INT64);
     if (a && !v.empty()) {
         std::memcpy(PyArray_DATA((PyArrayObject *)a), v.data(),
                     v.size() * sizeof(index_t));
@@ -56,7 +56,7 @@ static PyObject *array_1d_double(const std::vector<real_t> &v) {
 
 static PyObject *array_2d_int(const std::vector<index_t> &v, npy_intp ncols) {
     npy_intp dims[2] = {static_cast<npy_intp>(v.size()) / ncols, ncols};
-    PyObject *a = PyArray_SimpleNew(2, dims, NPY_INT);
+    PyObject *a = PyArray_SimpleNew(2, dims, NPY_INT64);
     if (a && !v.empty()) {
         std::memcpy(PyArray_DATA((PyArrayObject *)a), v.data(),
                     v.size() * sizeof(index_t));
@@ -110,7 +110,7 @@ PyObject *py_neighbour_list(PyObject *self, PyObject *args) {
     if (!a_cell_origin || !a_cell || !a_inv_cell || !a_pbc || !a_r) goto fail;
     if (py_types) {
         a_types =
-            PyArray_FROMANY(py_types, NPY_INT, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
+            PyArray_FROMANY(py_types, NPY_INT64, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
         if (!a_types) goto fail;
     }
 
@@ -270,13 +270,14 @@ fail:
 /* ---------------------------------------------------------- first_neighbours */
 
 PyObject *py_first_neighbours(PyObject *self, PyObject *args) {
-    index_t n;
+    Py_ssize_t n_arg;
     PyObject *py_i;
 
-    if (!PyArg_ParseTuple(args, "iO", &n, &py_i)) return NULL;
+    if (!PyArg_ParseTuple(args, "nO", &n_arg, &py_i)) return NULL;
+    const index_t n = static_cast<index_t>(n_arg);
 
     PyObject *a_i =
-        PyArray_FROMANY(py_i, NPY_INT, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
+        PyArray_FROMANY(py_i, NPY_INT64, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
     if (!a_i) return NULL;
 
     index_t nn = (index_t)PyArray_DIM((PyArrayObject *)a_i, 0);
@@ -297,7 +298,7 @@ PyObject *py_get_jump_indicies(PyObject *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "O", &py_sorted)) return NULL;
 
     PyObject *a_sorted =
-        PyArray_FROMANY(py_sorted, NPY_INT, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
+        PyArray_FROMANY(py_sorted, NPY_INT64, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
     if (!a_sorted) return NULL;
 
     index_t nn = (index_t)PyArray_DIM((PyArrayObject *)a_sorted, 0);
@@ -320,7 +321,7 @@ PyObject *py_triplet_list(PyObject *self, PyObject *args) {
 
     PyObject *a_fi = NULL, *a_absdist = NULL;
 
-    a_fi = PyArray_FROMANY(py_fi, NPY_INT, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
+    a_fi = PyArray_FROMANY(py_fi, NPY_INT64, 1, 1, NPY_ARRAY_C_CONTIGUOUS);
     if (!a_fi) goto fail;
 
     real_t cutoff;

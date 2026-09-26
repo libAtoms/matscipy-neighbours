@@ -164,9 +164,9 @@ bool cell_grid_geometry(const real_t origin[3], const real_t cell[9],
     cg.len[0] = volume / norm(nrm1);
     cg.len[1] = volume / norm(nrm2);
     cg.len[2] = volume / norm(nrm3);
-    cg.n1 = std::max(static_cast<index_t>(std::floor(cg.len[0] / cutoff)), 1);
-    cg.n2 = std::max(static_cast<index_t>(std::floor(cg.len[1] / cutoff)), 1);
-    cg.n3 = std::max(static_cast<index_t>(std::floor(cg.len[2] / cutoff)), 1);
+    cg.n1 = std::max<index_t>(static_cast<index_t>(std::floor(cg.len[0] / cutoff)), 1);
+    cg.n2 = std::max<index_t>(static_cast<index_t>(std::floor(cg.len[1] / cutoff)), 1);
+    cg.n3 = std::max<index_t>(static_cast<index_t>(std::floor(cg.len[2] / cutoff)), 1);
     for (int k = 0; k < 3; k++) {
         cg.origin[k] = origin[k];
         cg.pbc[k] = pbc[k];

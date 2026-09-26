@@ -155,11 +155,11 @@ def _host_metadata(cell, pbc, numbers, cell_origin, nat, *, positions=None):
     if pbc is None:
         pbc = np.zeros(3, dtype=bool)
     if numbers is None:
-        numbers = np.ones(nat, dtype=np.int32)
+        numbers = np.ones(nat, dtype=np.int64)
     cell = np.ascontiguousarray(np.asarray(cell, dtype=float))
     cell_origin = np.ascontiguousarray(np.asarray(cell_origin, dtype=float))
     pbc = np.ascontiguousarray(np.broadcast_to(pbc, (3,)), dtype=bool)
-    numbers = np.ascontiguousarray(np.asarray(numbers), dtype=np.int32)
+    numbers = np.ascontiguousarray(np.asarray(numbers), dtype=np.int64)
     inv_cell = np.ascontiguousarray(np.linalg.inv(cell.T))
     return cell_origin, cell, inv_cell, pbc, numbers
 
@@ -190,7 +190,7 @@ def _gather(atoms, positions, cell, pbc, numbers, cell_origin):
             raise ValueError("Cannot combine an ASE Atoms object with explicit "
                              "positions/cell/pbc/numbers/cell_origin.")
         return (atoms.positions, np.asarray(atoms.cell), atoms.pbc,
-                atoms.numbers.astype(np.int32), np.zeros(3))
+                atoms.numbers.astype(np.int64), np.zeros(3))
     if positions is None:
         raise ValueError("Provide either an ASE Atoms object or a positions "
                          "array.")
@@ -363,7 +363,7 @@ def triplet_list(first_neighbours, abs_dr_p=None, cutoff=None):
     Mirrors :func:`matscipy.neighbours.triplet_list` (without the optional
     ``jk_t`` output).
     """
-    first_neighbours = np.ascontiguousarray(first_neighbours, dtype=np.int32)
+    first_neighbours = np.ascontiguousarray(first_neighbours, dtype=np.int64)
     if abs_dr_p is not None and cutoff is not None:
         abs_dr_p = np.ascontiguousarray(abs_dr_p, dtype=float)
         return _ext.triplet_list(first_neighbours, abs_dr_p, float(cutoff))
