@@ -28,12 +28,16 @@ Compute a neighbour list and return one array per requested quantity.
 | `S`  | cell shift, shape `(npairs, 3)` |
 
 Arrays come back in the order requested; a single character returns a bare
-array. Index arrays (`i`, `j`, `S`) are `int64`, distances are `float64`. The shift satisfies `D == r[j] - r[i] + S @ cell`, and pairs are sorted
-by `i`.
+array. Index arrays (`i`, `j`, `S`) are `int64`, distances are `float64`. The
+shift satisfies `D == r[j] - r[i] + S @ cell`, and pairs are sorted by `i`.
 
 **Configuration.** Pass either an ASE `Atoms` object as `atoms`, or explicit
 `positions` (plus `cell`, `pbc`, `numbers`, `cell_origin`). If `cell` is omitted
-for host input, a shrink-wrapped box around the atoms is used.
+for host input, or has zero lattice vectors (an ASE molecule), a box around the
+atoms is used for the missing directions; those directions must be
+non-periodic, and a full cell is required for device input. Invalid input
+(wrong shapes, a non-positive or non-finite cutoff, non-finite positions, types
+outside a per-type cutoff matrix) raises `TypeError` or `ValueError`.
 
 **Cutoff.** `cutoff` is a scalar, a per-atom radius array (the pair cutoff is the
 sum of the two radii), or a dict `{(el1, el2): cutoff}` of element-pair cutoffs.

@@ -46,7 +46,9 @@ def mic(dr, cell, pbc=None):
     cell : array_like
         ``3x3`` cell matrix (rows are the lattice vectors).
     pbc : array_like, optional
-        Per-direction periodicity. Defaults to periodic in all directions.
+        Periodicity of each *lattice direction* (row of ``cell``). Vectors are
+        only ever shifted by multiples of the periodic lattice vectors.
+        Defaults to periodic in all directions.
 
     Returns
     -------
@@ -57,7 +59,12 @@ def mic(dr, cell, pbc=None):
     cell = np.asarray(cell, dtype=float)
     rec = np.linalg.inv(cell)
     if pbc is not None:
-        rec = rec * np.asarray(pbc, dtype=int).reshape(3, 1)
+        # ``dr @ rec`` gives fractional coordinates, one *column* of ``rec``
+        # per lattice direction; zero the columns of the non-periodic
+        # directions so no shift is applied along them. (Masking the rows
+        # instead would zero Cartesian components, which is wrong for
+        # non-orthogonal cells.)
+        rec = rec * np.asarray(pbc, dtype=int).reshape(1, 3)
     offset = np.round(dr @ rec)
     return dr - offset @ cell
 
@@ -142,42 +149,135 @@ def _consume(wrappers, array_namespace, use_gpu):
     return [array_namespace.from_dlpack(w) for w in wrappers]
 
 
+def _shrink_wrapped_cell(positions):
+    """Orthorhombic cell spanning ``positions`` (non-periodic use only).
+
+    Degenerate extents (planar or linear molecules, a single atom) are padded
+    to the largest extent, or to 1 if every extent is zero: the cell only bins
+    atoms here, so with no periodic direction the padding cannot change the
+    result, but a zero-volume cell could not be binned at all.
+    """
+    r = np.asarray(positions, dtype=float)
+    if r.ndim != 2 or r.shape[1] != 3:
+        raise TypeError(f"positions must have shape (n, 3), got {r.shape}.")
+    if len(r) == 0:
+        return np.zeros(3), np.eye(3)
+    rmin, rmax = r.min(axis=0), r.max(axis=0)
+    extent = rmax - rmin
+    pad = extent.max() if extent.max() > 0 else 1.0
+    extent = np.where(extent > 1e-9 * pad, extent, pad)
+    return rmin, np.diag(extent)
+
+
+def _complete_cell(cell, cell_origin, pbc, positions):
+    """Replace zero lattice vectors (ASE's "no cell in this direction") by
+    vectors orthogonal to the given ones that span the atoms, moving the
+    origin so the atoms sit inside. Only allowed for non-periodic directions:
+    the completed direction merely bins atoms, so its length cannot change
+    the result."""
+    zero = ~cell.any(axis=1)
+    if not zero.any():
+        return cell_origin, cell
+    if (zero & pbc).any():
+        raise ValueError("Lattice vector(s) "
+                         f"{np.flatnonzero(zero & pbc).tolist()} are zero but "
+                         "those directions are periodic.")
+    if positions is None:
+        raise ValueError("The cell has zero lattice vectors; a complete cell "
+                         "is required for device-resident positions.")
+    r = np.asarray(positions, dtype=float)
+    if zero.all():
+        return _shrink_wrapped_cell(r)
+    cell = cell.copy()
+    cell_origin = np.array(cell_origin, dtype=float)
+    given = cell[~zero]
+    if len(given) == 2:
+        normals = [np.cross(given[0], given[1])]
+    else:
+        a = given[0]
+        e = np.eye(3)[np.argmin(np.abs(a))]      # least-aligned axis
+        n1 = np.cross(a, e)
+        normals = [n1, np.cross(a, n1)]
+    scale = max(np.linalg.norm(given, axis=1).max(), 1.0)
+    for k, n in zip(np.flatnonzero(zero), normals):
+        n = n / np.linalg.norm(n)
+        proj = r @ n
+        lo, hi = (proj.min(), proj.max()) if len(proj) else (0.0, 0.0)
+        length = hi - lo if hi - lo > 1e-9 * scale else scale
+        cell[k] = n * length
+        cell_origin += n * (lo - cell_origin @ n)
+    return cell_origin, cell
+
+
 def _host_metadata(cell, pbc, numbers, cell_origin, nat, *, positions=None):
     """Normalise the (small, host-resident) geometry/type arrays. ``positions``
-    is used only to shrink-wrap a cell when none is given (host arrays only)."""
-    if cell is None:
-        r = np.asarray(positions, dtype=float)
-        rmin, rmax = r.min(axis=0), r.max(axis=0)
-        cell_origin = rmin if cell_origin is None else cell_origin
-        cell = np.diag(rmax - rmin)
-    if cell_origin is None:
-        cell_origin = np.zeros(3)
+    is used only to shrink-wrap a cell when none is given, or to complete zero
+    lattice vectors (host arrays only)."""
     if pbc is None:
         pbc = np.zeros(3, dtype=bool)
+    pbc = np.ascontiguousarray(np.broadcast_to(pbc, (3,)), dtype=bool)
+    if cell is None:
+        if pbc.any():
+            raise ValueError("A cell is required when any direction is "
+                             "periodic; pass cell= or set pbc=False.")
+        rmin, cell = _shrink_wrapped_cell(positions)
+        cell_origin = rmin if cell_origin is None else cell_origin
+    if cell_origin is None:
+        cell_origin = np.zeros(3)
     if numbers is None:
         numbers = np.ones(nat, dtype=np.int64)
     cell = np.ascontiguousarray(np.asarray(cell, dtype=float))
     cell_origin = np.ascontiguousarray(np.asarray(cell_origin, dtype=float))
-    pbc = np.ascontiguousarray(np.broadcast_to(pbc, (3,)), dtype=bool)
     numbers = np.ascontiguousarray(np.asarray(numbers), dtype=np.int64)
+    if cell.shape != (3, 3):
+        raise TypeError(f"cell must have shape (3, 3), got {cell.shape}.")
+    cell_origin, cell = _complete_cell(cell, cell_origin, pbc, positions)
     inv_cell = np.ascontiguousarray(np.linalg.inv(cell.T))
     return cell_origin, cell, inv_cell, pbc, numbers
 
 
+def _atomic_number(el):
+    """Atomic number of an element given as a symbol or a number."""
+    if isinstance(el, str):
+        try:
+            return _atomic_numbers[el]
+        except KeyError:
+            raise ValueError(
+                f"Unknown element symbol {el!r} in the cutoff dictionary"
+                + ("" if _atomic_numbers else " (ase is needed to resolve "
+                   "element symbols)")) from None
+    return int(el)
+
+
 def _resolve_cutoff(cutoff, numbers):
-    """Turn a scalar / per-atom array / element-pair dict into a value the
-    C-extension understands, plus the per-atom type array to pass along."""
+    """Turn a scalar / per-atom array / element-pair dict / per-type matrix
+    into a value the C-extension understands, plus the per-atom type array to
+    pass along."""
     if isinstance(cutoff, dict):
-        maxnum = int(np.max(numbers))
+        maxnum = int(np.max(numbers)) if numbers.size else 0
         matrix = np.zeros((maxnum + 1, maxnum + 1), dtype=float)
         for (el1, el2), c in cutoff.items():
-            el1 = _atomic_numbers.get(el1, el1)
-            el2 = _atomic_numbers.get(el2, el2)
+            el1 = _atomic_number(el1)
+            el2 = _atomic_number(el2)
             if el1 <= maxnum and el2 <= maxnum:
                 matrix[el1, el2] = c
                 matrix[el2, el1] = c
-        return matrix, numbers
-    # Scalar or per-atom array: types are unused by the extension.
+        cutoff = matrix
+    elif np.ndim(cutoff) == 0:
+        # Any scalar (int, float32, 0-d array): the extension wants a float.
+        return float(cutoff), numbers
+    else:
+        cutoff = np.ascontiguousarray(cutoff, dtype=float)
+    if cutoff.ndim == 2:
+        if cutoff.shape[0] != cutoff.shape[1]:
+            raise ValueError("Per-type cutoff matrix must be square, got "
+                             f"shape {cutoff.shape}.")
+        if numbers.size and (numbers.min() < 0
+                             or numbers.max() >= cutoff.shape[0]):
+            raise ValueError(
+                f"numbers must index the {cutoff.shape[0]}x{cutoff.shape[0]} "
+                f"per-type cutoff matrix, i.e. lie in [0, {cutoff.shape[0]}); "
+                f"got values in [{numbers.min()}, {numbers.max()}].")
     return cutoff, numbers
 
 
@@ -364,7 +464,9 @@ def triplet_list(first_neighbours, abs_dr_p=None, cutoff=None):
     ``jk_t`` output).
     """
     first_neighbours = np.ascontiguousarray(first_neighbours, dtype=np.int64)
-    if abs_dr_p is not None and cutoff is not None:
+    if (abs_dr_p is None) != (cutoff is None):
+        raise ValueError("abs_dr_p and cutoff must be given together.")
+    if abs_dr_p is not None:
         abs_dr_p = np.ascontiguousarray(abs_dr_p, dtype=float)
         return _ext.triplet_list(first_neighbours, abs_dr_p, float(cutoff))
     return _ext.triplet_list(first_neighbours)
