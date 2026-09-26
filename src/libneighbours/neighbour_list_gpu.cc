@@ -342,7 +342,10 @@ static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
 
     clear_error();
     dev.npairs = 0;
-    if (nat <= 0) return NL_SUCCESS;
+    error_t status = validate_neighbour_args(nat, cutoff, per_atom_cutoff,
+                                             per_type_cutoff_sq, ncutoffs, types);
+    if (status != NL_SUCCESS) return status;
+    if (nat == 0) return NL_SUCCESS;
     /* The device primitives (CUB/hipCUB) take 32-bit item counts, and the sparse
        hash table has capacity ~2*nat; keep both comfortably below 2^31. */
     if (nat >= kMaxDeviceAtoms)
@@ -547,7 +550,9 @@ error_t neighbour_count_gpu_device(const NeighbourListRequest &req,
 
 error_t neighbour_matrix_gpu_device(const NeighbourListRequest &req, index_t K,
                                     NeighbourMatrixDevice &out) {
+    clear_error();
     const index_t n = req.nat;
+    if (K < 0) return set_invalid_argument("max_neighbours must be non-negative.");
     if (n >= kMaxDeviceAtoms)
         return set_error("GPU backend supports at most 2^29 atoms per call.");
     DeviceGuard guard(req.device_id);  /* allocate + scatter on the input device */

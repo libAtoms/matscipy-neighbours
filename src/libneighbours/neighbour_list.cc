@@ -96,6 +96,57 @@ void build_pairs(const NeighbourContext &ctx, const Query &q, index_t nat,
 
 }  // namespace
 
+error_t validate_neighbour_args(index_t nat, real_t cutoff,
+                                const real_t *per_atom_cutoff,
+                                const real_t *per_type_cutoff_sq,
+                                index_t ncutoffs, const index_t *types) {
+    if (nat < 0) {
+        return set_invalid_argument("Number of atoms must be non-negative.");
+    }
+    if (!(cutoff > 0) || !std::isfinite(cutoff)) {
+        return set_invalid_argument(
+            "Cutoff must be finite and positive (are all per-atom radii or "
+            "per-type cutoffs zero?).");
+    }
+    if (per_atom_cutoff) {
+        for (index_t a = 0; a < nat; a++) {
+            if (!(per_atom_cutoff[a] >= 0) || !std::isfinite(per_atom_cutoff[a])) {
+                return set_invalid_argumentf(
+                    "Per-atom cutoff radius of atom %lld is not finite and "
+                    "non-negative.",
+                    static_cast<long long>(a));
+            }
+        }
+    }
+    if (per_type_cutoff_sq) {
+        if (ncutoffs <= 0) {
+            return set_invalid_argument(
+                "Per-type cutoff matrix must have a positive dimension.");
+        }
+        for (index_t k = 0; k < ncutoffs * ncutoffs; k++) {
+            if (!std::isfinite(per_type_cutoff_sq[k])) {
+                return set_invalid_argument(
+                    "Per-type cutoff matrix contains a non-finite entry.");
+            }
+        }
+        if (!types) {
+            return set_invalid_argument(
+                "Per-type cutoffs require a per-atom type array.");
+        }
+        for (index_t a = 0; a < nat; a++) {
+            if (types[a] < 0 || types[a] >= ncutoffs) {
+                return set_invalid_argumentf(
+                    "Type %lld of atom %lld is outside the %lldx%lld per-type "
+                    "cutoff matrix.",
+                    static_cast<long long>(types[a]), static_cast<long long>(a),
+                    static_cast<long long>(ncutoffs),
+                    static_cast<long long>(ncutoffs));
+            }
+        }
+    }
+    return NL_SUCCESS;
+}
+
 error_t neighbour_list(int quantities, const real_t cell_origin[3],
                        const real_t cell[9], const real_t inv_cell[9],
                        const bool pbc[3], index_t nat, const real_t *r,
@@ -112,6 +163,10 @@ error_t neighbour_list(int quantities, const real_t cell_origin[3],
     out.shift.clear();
     out.npairs = 0;
 
+    error_t status = validate_neighbour_args(nat, cutoff, per_atom_cutoff,
+                                             per_type_cutoff_sq, ncutoffs, types);
+    if (status != NL_SUCCESS) return status;
+
     /* The grid (definition + binning). Resolution/bins/len are derived from the
        cutoff; the cutoff itself stays a query parameter (below), not in the
        grid. No bin-count reduction here: a huge/sparse grid is handled by the
@@ -122,14 +177,22 @@ error_t neighbour_list(int quantities, const real_t cell_origin[3],
     }
     const index_t n1 = cg.n1, n2 = cg.n2, n3 = cg.n3;
 
-    /* Raw (un-wrapped) cell coordinate of every atom, computed once. */
+    /* Raw (un-wrapped) cell coordinate of every atom, computed once. A
+       non-finite position would bin to garbage and (as NaN) defeat the
+       distance test, so reject it here. */
     std::vector<index_t> raw(3 * nat);
+    bool all_finite = true;
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static) reduction(&& : all_finite)
 #endif
     for (index_t a = 0; a < nat; a++) {
+        all_finite = all_finite && std::isfinite(r[3 * a]) &&
+                     std::isfinite(r[3 * a + 1]) && std::isfinite(r[3 * a + 2]);
         position_to_cell_index(cell_origin, inv_cell, &r[3 * a], n1, n2, n3,
                                &raw[3 * a], &raw[3 * a + 1], &raw[3 * a + 2]);
+    }
+    if (!all_finite) {
+        return set_invalid_argument("Positions must be finite.");
     }
 
     /* Bin the atoms (dense CSR, or hashed compact for huge/sparse grids). */
@@ -213,10 +276,22 @@ error_t neighbour_matrix(const real_t cell_origin[3], const real_t cell[9],
     const index_t K = max_neighbours;
     out.n = nat;
     out.max_neighbours = K;
+    out.idx.clear();
+    out.dist.clear();
+    out.count.clear();
+    out.overflow = false;
+
+    clear_error();
+    error_t status = validate_neighbour_args(nat, cutoff, per_atom_cutoff,
+                                             per_type_cutoff_sq, ncutoffs, types);
+    if (status != NL_SUCCESS) return status;
+    if (K < 0) {
+        return set_invalid_argument("max_neighbours must be non-negative.");
+    }
+
     out.idx.assign((size_t)nat * K, 0);
     out.dist.assign((size_t)nat * K * 3, 0.0);
     out.count.assign(nat, 0);
-    out.overflow = false;
     if (nat <= 0) return NL_SUCCESS;
 
     /* The dense matrix is a reshape of the pair list: build the pairs, then

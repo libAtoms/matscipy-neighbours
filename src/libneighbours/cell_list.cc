@@ -11,6 +11,7 @@
 #include "cell_list.hh"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <numeric>
 
@@ -159,14 +160,28 @@ bool cell_grid_geometry(const real_t origin[3], const real_t cell[9],
     cross_product(c3, c1, nrm2);
     cross_product(c1, c2, nrm3);
     real_t volume = std::fabs(c3[0] * nrm3[0] + c3[1] * nrm3[1] + c3[2] * nrm3[2]);
-    if (volume < 1e-12) return false;
+    /* Degenerate if the volume is tiny relative to the product of the edge
+       lengths (i.e. the lattice vectors are nearly coplanar), zero, or not
+       finite. The ratio is scale-free, so the test is independent of units and
+       of the cell's aspect ratio. */
+    const real_t edges = norm(c1) * norm(c2) * norm(c3);
+    if (!(volume > 1e-12 * edges) || !std::isfinite(volume)) return false;
 
     cg.len[0] = volume / norm(nrm1);
     cg.len[1] = volume / norm(nrm2);
     cg.len[2] = volume / norm(nrm3);
-    cg.n1 = std::max<index_t>(static_cast<index_t>(std::floor(cg.len[0] / cutoff)), 1);
-    cg.n2 = std::max<index_t>(static_cast<index_t>(std::floor(cg.len[1] / cutoff)), 1);
-    cg.n3 = std::max<index_t>(static_cast<index_t>(std::floor(cg.len[2] / cutoff)), 1);
+    /* Cells per direction: one cutoff wide, at least 1, and at most
+       MAX_CELLS_PER_DIRECTION (clamped in floating point before the cast). */
+    auto resolution = [cutoff](real_t len) -> index_t {
+        const real_t n = std::floor(len / cutoff);
+        if (!(n > 1.0)) return 1;
+        if (n >= static_cast<real_t>(MAX_CELLS_PER_DIRECTION))
+            return MAX_CELLS_PER_DIRECTION;
+        return static_cast<index_t>(n);
+    };
+    cg.n1 = resolution(cg.len[0]);
+    cg.n2 = resolution(cg.len[1]);
+    cg.n3 = resolution(cg.len[2]);
     for (int k = 0; k < 3; k++) {
         cg.origin[k] = origin[k];
         cg.pbc[k] = pbc[k];

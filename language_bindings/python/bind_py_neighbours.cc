@@ -74,13 +74,12 @@ static PyObject *array_2d_double(const std::vector<real_t> &v, npy_intp ncols) {
     return a;
 }
 
-/* Raise the core error (if any) as a Python exception. Returns true if raised. */
-static bool raise_if_core_error() {
-    if (has_error) {
-        PyErr_SetString(PyExc_RuntimeError, error_string);
-        return true;
-    }
-    return false;
+/* Raise the core error as a Python exception: invalid input -> ValueError,
+   anything else -> RuntimeError. */
+static void raise_core_error(error_t status) {
+    PyObject *type = status == NL_INVALID_ARGUMENT ? PyExc_ValueError
+                                                   : PyExc_RuntimeError;
+    PyErr_SetString(type, has_error ? error_string : "Unknown core error.");
 }
 
 /* ----------------------------------------------------------- neighbour_list */
@@ -215,7 +214,7 @@ PyObject *py_neighbour_list(PyObject *self, PyObject *args) {
                            cutoff, per_atom, per_type_sq, ncutoffs, types, nl);
 
         if (status != NL_SUCCESS) {
-            raise_if_core_error();
+            raise_core_error(status);
             goto fail;
         }
 
@@ -283,10 +282,16 @@ PyObject *py_first_neighbours(PyObject *self, PyObject *args) {
     index_t nn = (index_t)PyArray_DIM((PyArrayObject *)a_i, 0);
     const index_t *i_n = (const index_t *)PyArray_DATA((PyArrayObject *)a_i);
 
-    std::vector<index_t> seed(n + 1);
-    first_neighbours(n, nn, i_n, seed.data());
+    /* The core rejects n < 0 and bad indices before touching seed; size the
+       buffer defensively so an invalid n cannot throw first. */
+    std::vector<index_t> seed(n < 0 ? 0 : static_cast<size_t>(n) + 1);
+    error_t status = first_neighbours(n, nn, i_n, seed.data());
 
     Py_DECREF(a_i);
+    if (status != NL_SUCCESS) {
+        raise_core_error(status);
+        return NULL;
+    }
     return array_1d_int(seed);
 }
 
@@ -305,9 +310,14 @@ PyObject *py_get_jump_indicies(PyObject *self, PyObject *args) {
     const index_t *sorted =
         (const index_t *)PyArray_DATA((PyArrayObject *)a_sorted);
 
-    std::vector<index_t> seed = get_jump_indicies(nn, sorted);
+    std::vector<index_t> seed;
+    error_t status = get_jump_indicies(nn, sorted, seed);
 
     Py_DECREF(a_sorted);
+    if (status != NL_SUCCESS) {
+        raise_core_error(status);
+        return NULL;
+    }
     return array_1d_int(seed);
 }
 
@@ -357,8 +367,15 @@ PyObject *py_triplet_list(PyObject *self, PyObject *args) {
         const index_t *first_i =
             (const index_t *)PyArray_DATA((PyArrayObject *)a_fi);
 
+        const index_t n_absdist =
+            a_absdist ? (index_t)PyArray_DIM((PyArrayObject *)a_absdist, 0) : 0;
         std::vector<index_t> ij_t, ik_t;
-        triplet_list(n_first, first_i, absdist, cutoff, ij_t, ik_t);
+        error_t status = triplet_list(n_first, first_i, n_absdist, absdist,
+                                      cutoff, ij_t, ik_t);
+        if (status != NL_SUCCESS) {
+            raise_core_error(status);
+            goto fail;
+        }
 
         PyObject *py_ij = array_1d_int(ij_t);
         PyObject *py_ik = array_1d_int(ik_t);

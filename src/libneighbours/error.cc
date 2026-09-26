@@ -10,6 +10,8 @@
 
 #include "error.hh"
 
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 
 namespace matscipy {
@@ -26,6 +28,30 @@ error_t set_error(const char *msg) {
     has_error = true;
     copy_message(error_string, msg);
     return NL_ERROR;
+}
+
+error_t set_invalid_argument(const char *msg) {
+    has_error = true;
+    copy_message(error_string, msg);
+    return NL_INVALID_ARGUMENT;
+}
+
+error_t set_errorf(const char *fmt, ...) {
+    std::va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(error_string, MAX_ERROR_STRING, fmt, ap);
+    va_end(ap);
+    has_error = true;
+    return NL_ERROR;
+}
+
+error_t set_invalid_argumentf(const char *fmt, ...) {
+    std::va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(error_string, MAX_ERROR_STRING, fmt, ap);
+    va_end(ap);
+    has_error = true;
+    return NL_INVALID_ARGUMENT;
 }
 
 void clear_error() { has_error = false; }

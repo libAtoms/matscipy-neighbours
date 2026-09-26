@@ -39,6 +39,15 @@ using namespace matscipy;
 
 namespace {
 
+/* Raise the core error as a Python exception: invalid input -> ValueError,
+   anything else -> RuntimeError. (Duplicated in bind_py_neighbours.cc until the
+   shared binding helpers land.) */
+void raise_core_error(error_t status) {
+    PyObject *type = status == NL_INVALID_ARGUMENT ? PyExc_ValueError
+                                                   : PyExc_RuntimeError;
+    PyErr_SetString(type, has_error ? error_string : "Unknown core error.");
+}
+
 /* ----------------------------------------------------------- DLPack export */
 
 /* Owns the buffer behind a DLManagedTensor and the shape array. `keep` holds a
@@ -305,10 +314,11 @@ PyObject *py_neighbour_list_dlpack(PyObject *self, PyObject *args) {
         if (backend == 0) {
             /* CPU backend: host buffers wrapped as kDLCPU capsules. */
             NeighbourList nl;
-            if (neighbour_list(flags, origin, cell, inv, pbc, nat, r_host, cutoff,
-                               per_atom, per_type_sq, ncutoffs, types,
-                               nl) != NL_SUCCESS) {
-                if (has_error) PyErr_SetString(PyExc_RuntimeError, error_string);
+            error_t st = neighbour_list(flags, origin, cell, inv, pbc, nat, r_host,
+                                        cutoff, per_atom, per_type_sq, ncutoffs,
+                                        types, nl);
+            if (st != NL_SUCCESS) {
+                raise_core_error(st);
                 goto fail;
             }
             const int64_t np = nl.npairs;
@@ -354,7 +364,7 @@ PyObject *py_neighbour_list_dlpack(PyObject *self, PyObject *args) {
             error_t st = neighbour_list_gpu_device(req, dev);
             imp.release();  /* input consumed; result lives in `dev` */
             if (st != NL_SUCCESS) {
-                if (has_error) PyErr_SetString(PyExc_RuntimeError, error_string);
+                raise_core_error(st);
                 goto fail;
             }
             const int64_t np = dev.npairs;
@@ -479,7 +489,7 @@ PyObject *py_coordination_dlpack(PyObject *self, PyObject *args) {
         error_t st = neighbour_count_gpu_device(req, dev);
         imp.release();
         if (st != NL_SUCCESS) {
-            if (has_error) PyErr_SetString(PyExc_RuntimeError, error_string);
+            raise_core_error(st);
             goto cfail;
         }
         const int dev_id = req.device_id >= 0 ? req.device_id : current_device_id();
@@ -576,10 +586,11 @@ PyObject *py_neighbour_matrix_dlpack(PyObject *self, PyObject *args) {
 
         if (backend == 0) {
             NeighbourMatrix nm;
-            if (neighbour_matrix(origin, cell, inv, pbc, nat, r_host, cutoff,
-                                 per_atom, per_type_sq, ncutoffs, types, K,
-                                 nm) != NL_SUCCESS) {
-                if (has_error) PyErr_SetString(PyExc_RuntimeError, error_string);
+            error_t st = neighbour_matrix(origin, cell, inv, pbc, nat, r_host,
+                                          cutoff, per_atom, per_type_sq, ncutoffs,
+                                          types, K, nm);
+            if (st != NL_SUCCESS) {
+                raise_core_error(st);
                 goto mfail;
             }
             overflow = nm.overflow;
@@ -608,7 +619,7 @@ PyObject *py_neighbour_matrix_dlpack(PyObject *self, PyObject *args) {
             error_t st = neighbour_matrix_gpu_device(req, K, dev);
             imp.release();
             if (st != NL_SUCCESS) {
-                if (has_error) PyErr_SetString(PyExc_RuntimeError, error_string);
+                raise_core_error(st);
                 goto mfail;
             }
             overflow = dev.overflow;

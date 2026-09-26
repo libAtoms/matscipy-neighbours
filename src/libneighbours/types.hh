@@ -34,7 +34,8 @@ using real_t = double;
 /* Error code returned by core routines. */
 using error_t = int;
 constexpr error_t NL_SUCCESS = 0;
-constexpr error_t NL_ERROR = -1;
+constexpr error_t NL_ERROR = -1;            /* internal / runtime failure */
+constexpr error_t NL_INVALID_ARGUMENT = -2; /* unusable caller input */
 
 /* Bit flags selecting which per-pair quantities a neighbour-list call computes.
    The Python layer maps the "ijdDS" quantity string onto these. */
