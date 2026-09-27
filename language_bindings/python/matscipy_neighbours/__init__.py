@@ -6,6 +6,8 @@ exposes the same public ``neighbour_list`` API as upstream
 matscipy code keeps working.
 """
 
+from importlib.metadata import PackageNotFoundError, version
+
 from .neighbours import (
     DLPackTensor,
     coordination,
@@ -27,3 +29,8 @@ __all__ = [
     "coordination",
     "DLPackTensor",
 ]
+
+try:
+    __version__ = version("matscipy-neighbours")
+except PackageNotFoundError:  # pragma: no cover - running from the build tree
+    __version__ = "unknown"
