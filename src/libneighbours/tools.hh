@@ -35,11 +35,11 @@ MATSCIPY_HD inline void mat_mul_vec(const real_t *mat, const real_t *vin,
     }
 }
 
-/* Map cell index i back into [0, n) by shifting by multiples of n (periodic). */
+/* Map cell index i back into [0, n) by shifting by multiples of n (periodic).
+   O(1) for any distance from the cell. */
 MATSCIPY_HD inline index_t bin_wrap(index_t i, index_t n) {
-    while (i < 0) i += n;
-    while (i >= n) i -= n;
-    return i;
+    index_t r = i % n;
+    return r < 0 ? r + n : r;
 }
 
 /* Clamp cell index i into [0, n) (non-periodic). */
@@ -49,6 +49,28 @@ MATSCIPY_HD inline index_t bin_trunc(index_t i, index_t n) {
     else if (i >= n)
         i = n - 1;
     return i;
+}
+
+/* True for a finite value. Written without <cmath> so it is usable in device
+   code under both nvcc and hipcc: x - x is 0 for finite x, NaN for +-inf and
+   NaN, and IEEE semantics (no fast-math) forbid folding it to 0. */
+MATSCIPY_HD inline bool is_finite(real_t x) { return x - x == 0.0; }
+
+/* Largest magnitude of a raw (unwrapped) cell coordinate. Scaled fractional
+   coordinates beyond this (atoms astronomically far outside the cell, or
+   non-finite positions the caller did not reject) are clamped before the
+   float->integer cast, which would otherwise be undefined behaviour. */
+constexpr real_t MAX_RAW_CELL_COORD = 1099511627776.0; /* 2^40 */
+
+MATSCIPY_HD inline index_t scaled_coord_to_cell(real_t x) {
+    /* NaN compares false to everything, so it falls through to the cast; map
+       it to the upper clamp explicitly. */
+    if (!(x > -MAX_RAW_CELL_COORD)) {
+        return x != x ? static_cast<index_t>(MAX_RAW_CELL_COORD)
+                      : -static_cast<index_t>(MAX_RAW_CELL_COORD);
+    }
+    if (!(x < MAX_RAW_CELL_COORD)) return static_cast<index_t>(MAX_RAW_CELL_COORD);
+    return static_cast<index_t>(std::floor(x));
 }
 
 /* Map a Cartesian position to (unwrapped) integer cell indices. */
@@ -61,9 +83,9 @@ MATSCIPY_HD inline void position_to_cell_index(const real_t *cell_origin,
     real_t dri[3], si[3];
     for (int i = 0; i < 3; i++) dri[i] = ri[i] - cell_origin[i];
     mat_mul_vec(inv_cell, dri, si);
-    *c1 = static_cast<index_t>(std::floor(si[0] * n1));
-    *c2 = static_cast<index_t>(std::floor(si[1] * n2));
-    *c3 = static_cast<index_t>(std::floor(si[2] * n3));
+    *c1 = scaled_coord_to_cell(si[0] * n1);
+    *c2 = scaled_coord_to_cell(si[1] * n2);
+    *c3 = scaled_coord_to_cell(si[2] * n3);
 }
 
 }  // namespace matscipy

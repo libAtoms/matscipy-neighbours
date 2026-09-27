@@ -6,7 +6,7 @@ NumPy/CuPy interop through DLPack.
 
 ## Highlights
 
-- **Compatible API.** `neighbour_list("ijdDS", …)` returns one array per
+- **Simple API.** `neighbour_list("ijdDS", …)` returns one array per
   requested quantity — first index `i`, second index `j`, distance `d`,
   distance vector `D`, and cell shift `S`. The contract is
   `D == r[j] - r[i] + S @ cell`, and the output is sorted by `i`.
@@ -17,6 +17,9 @@ NumPy/CuPy interop through DLPack.
   on the device and are handed to CuPy/PyTorch/JAX zero-copy via DLPack.
 - **General geometry.** Triclinic cells, per-direction periodicity, and scalar,
   per-atom, or per-type cutoffs.
+
+The Python interface is compatible with `matscipy.neighbours` from
+[matscipy](https://github.com/libAtoms/matscipy).
 
 ## A first example
 

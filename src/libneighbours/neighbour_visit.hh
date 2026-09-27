@@ -96,20 +96,19 @@ MATSCIPY_HD inline void visit_neighbours(const NeighbourContext &c,
                                     drj[2] - dri[2] + off[2]};
                     real_t abs_dr_sq =
                         dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
-                    if (abs_dr_sq >= c.cutoff_sq) continue;
+                    /* Written as !(d < cutoff) so a NaN distance (from a
+                       non-finite position) is rejected, never accepted. */
+                    if (!(abs_dr_sq < c.cutoff_sq)) continue;
 
                     bool inside_cutoff = true;
                     if (c.per_atom) {
                         real_t cc = c.per_atom[si] + c.per_atom[sj];
                         inside_cutoff = abs_dr_sq < cc * cc;
                     } else if (c.per_type_cutoff_sq && c.types) {
+                        /* Types are validated against ncutoffs up front. */
                         index_t ti = c.types[si], tj = c.types[sj];
-                        if (ti >= 0 && ti < c.ncutoffs && tj >= 0 &&
-                            tj < c.ncutoffs) {
-                            inside_cutoff =
-                                abs_dr_sq <
-                                c.per_type_cutoff_sq[ti * c.ncutoffs + tj];
-                        }
+                        inside_cutoff =
+                            abs_dr_sq < c.per_type_cutoff_sq[ti * c.ncutoffs + tj];
                     }
                     if (!inside_cutoff) continue;
 

@@ -68,11 +68,25 @@ struct CellGrid {
 /* These leaf helpers (hash, Morton key, cell lookup) are host+device: one
    definition serves both the CPU loops and the GPU kernels. */
 
-/* 64-bit hash used by both the sparse build and query (Fibonacci hashing). */
+/* 64-bit hash used by both the sparse build and query. The table index is the
+   low bits of this value, so every input bit must influence the low output
+   bits: a bare multiply (Fibonacci hashing) only spreads the *high* bits, and
+   cell keys that differ solely above the mask width (e.g. a wire along z in a
+   power-of-two grid, key = c3 << 20) would all land in one probe chain. The
+   xor-shift/multiply finaliser (splitmix64) mixes both ways. */
 MATSCIPY_HD inline std::int64_t cell_hash(std::int64_t key) {
     std::uint64_t h = static_cast<std::uint64_t>(key) * 0x9E3779B97F4A7C15ull;
+    h ^= h >> 32;
+    h *= 0xBF58476D1CE4E5B9ull;
+    h ^= h >> 29;
     return static_cast<std::int64_t>(h >> 1);  /* keep non-negative */
 }
+
+/* Upper bound on the cells per lattice direction. Keeps the cell coordinates
+   within the 21 bits the Morton key can interleave (part1by2 below) and the
+   linear cell index within 2^60, so neither can overflow. Bins are widened
+   beyond the cutoff when the bound is hit, which stays correct. */
+constexpr index_t MAX_CELLS_PER_DIRECTION = index_t(1) << 20;
 
 /* Spread the low 21 bits of x so they occupy every third bit (for Morton). */
 MATSCIPY_HD inline std::uint64_t part1by2(std::uint64_t x) {

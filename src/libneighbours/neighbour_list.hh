@@ -75,6 +75,17 @@ struct NeighbourList {
 };
 
 /*
+ * Validate the arguments shared by neighbour_list(), neighbour_matrix() and the
+ * GPU builds: nat >= 0; cutoff finite and > 0; per-atom radii finite and >= 0;
+ * per-type cutoffs finite with ncutoffs > 0 and a types array whose entries lie
+ * in [0, ncutoffs). Returns NL_SUCCESS or NL_INVALID_ARGUMENT with a message.
+ */
+error_t validate_neighbour_args(index_t nat, real_t cutoff,
+                                const real_t *per_atom_cutoff,
+                                const real_t *per_type_cutoff_sq,
+                                index_t ncutoffs, const index_t *types);
+
+/*
  * Build a neighbour list by spatial binning. Output pairs are sorted by the
  * first index i; for each pair the distance vector D == r[j] - r[i] + S @ cell.
  *
@@ -92,8 +103,9 @@ struct NeighbourList {
  * types               [nat] per-atom type indices, or nullptr
  * out                 result (cleared and filled)
  *
- * Returns NL_SUCCESS, or NL_ERROR with a message recorded via set_error()
- * (e.g. for a degenerate cell).
+ * Returns NL_SUCCESS; NL_INVALID_ARGUMENT (see validate_neighbour_args(), plus
+ * non-finite positions); or NL_ERROR for a degenerate (zero-volume) cell. A
+ * message is recorded via set_error() in both failure cases.
  */
 error_t neighbour_list(int quantities, const real_t cell_origin[3],
                        const real_t cell[9], const real_t inv_cell[9],

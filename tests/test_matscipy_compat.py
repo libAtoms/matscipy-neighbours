@@ -148,3 +148,142 @@ def test_missing_cutoff_raises():
     a = bulk("Al", "fcc", a=4.05)
     with pytest.raises(ValueError):
         neighbour_list("i", a)
+
+
+# ---------------------------------------------------------------------------
+# mic: mixed periodicity
+# ---------------------------------------------------------------------------
+
+def _brute_force_mic(dr, cell, pbc):
+    """Minimum image over explicit shifts along the periodic directions."""
+    import itertools
+    ranges = [range(-8, 9) if p else [0] for p in pbc]
+    out = np.empty_like(dr)
+    for p, v in enumerate(dr):
+        images = [v + np.array(s) @ cell for s in itertools.product(*ranges)]
+        out[p] = min(images, key=lambda w: w @ w)
+    return out
+
+
+def test_mic_orthorhombic_mixed_pbc_matches_brute_force():
+    rng = np.random.default_rng(0)
+    cell = np.diag([10.0, 9.0, 11.0])
+    pbc = np.array([True, False, True])
+    dr = rng.uniform(-30, 30, (300, 3))
+    np.testing.assert_allclose(mic(dr, cell, pbc),
+                               _brute_force_mic(dr, cell, pbc), atol=1e-12)
+
+
+def test_mic_triclinic_never_shifts_along_non_periodic_direction():
+    # Regression: masking the rows of inv(cell) (Cartesian components) instead
+    # of its columns (lattice directions) shifted vectors along the
+    # non-periodic direction of a sheared cell.
+    rng = np.random.default_rng(1)
+    cell = np.array([[10.0, 0, 0], [4.0, 9.0, 0], [1.0, 2.0, 11.0]])
+    pbc = np.array([True, False, True])
+    dr = rng.uniform(-30, 30, (500, 3))
+    wrapped = mic(dr, cell, pbc)
+    shifts = np.round((wrapped - dr) @ np.linalg.inv(cell))
+    assert (shifts[:, 1] == 0).all()
+    # ... and the shifts along the periodic directions are integers.
+    np.testing.assert_allclose((wrapped - dr) @ np.linalg.inv(cell), shifts,
+                               atol=1e-9)
+
+
+def test_mic_triclinic_fully_periodic_reconstructs_neighbour_list():
+    a = bulk("Cu", "fcc", a=3.6, cubic=False).repeat((3, 3, 3))
+    a.rattle(0.05, seed=4)
+    i, j, D = neighbour_list("ijD", a, 2.7)
+    np.testing.assert_allclose(mic(a.positions[j] - a.positions[i], a.cell),
+                               D, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Missing / incomplete cells
+# ---------------------------------------------------------------------------
+
+def test_shrink_wrapped_cell_with_pbc_raises():
+    # A shrink-wrapped box made atoms at opposite faces periodic images.
+    pos = np.random.default_rng(2).uniform(0, 10, (30, 3))
+    with pytest.raises(ValueError):
+        neighbour_list("d", positions=pos, pbc=True, cutoff=3.0)
+
+
+def test_molecule_without_cell():
+    # ASE molecules carry an all-zero cell; the planar water molecule used to
+    # give a singular shrink-wrapped cell.
+    water = molecule("H2O")
+    i, j, d = neighbour_list("ijd", water, 1.2)
+    assert sorted(zip(i.tolist(), j.tolist())) == [(0, 1), (0, 2), (1, 0), (2, 0)]
+    np.testing.assert_allclose(d, 0.969, atol=1e-3)
+    assert (coordination(water, 1.2) == [2, 1, 1]).all()
+    # Element-pair cutoffs on a molecule.
+    i, j = neighbour_list("ij", water, {("H", "O"): 1.2})
+    assert len(i) == 4
+    i, j = neighbour_list("ij", water, {("H", "H"): 1.2})
+    assert len(i) == 0
+
+
+@pytest.mark.parametrize("positions", [
+    np.zeros((1, 3)),                                    # single atom
+    np.c_[np.arange(5.0), np.zeros(5), np.zeros(5)],     # a line
+    np.c_[np.arange(4.0), np.arange(4.0) ** 2, np.zeros(4)],  # planar
+])
+def test_degenerate_configurations_without_cell(positions):
+    i, j, d = neighbour_list("ijd", positions=positions, cutoff=1.5)
+    assert (np.bincount(i, minlength=len(positions)) ==
+            np.bincount(j, minlength=len(positions))).all()
+    assert (d < 1.5).all()
+
+
+def test_slab_with_zero_lattice_vector():
+    from ase.build import fcc111
+    slab = fcc111("Cu", (3, 3, 3), vacuum=None)   # zero c vector
+    slab.pbc = [True, True, False]
+    counts = np.bincount(neighbour_list("i", slab, 2.7))
+    # Nearest neighbours only: 9 at the two surfaces, 12 in the middle layer.
+    assert (counts[:9] == 9).all()
+    assert (counts[9:18] == 12).all()
+    assert (counts[18:] == 9).all()
+    slab.pbc = True
+    with pytest.raises(ValueError):
+        neighbour_list("i", slab, 2.7)
+
+
+def test_mic_strongly_sheared_cell_matches_brute_force():
+    # Regression (review): rounding fractional coordinates is not a minimum
+    # image for a skewed cell; the periodic basis must be reduced first.
+    cell = np.array([[1.0, 0, 0], [0.9, 1.0, 0], [0, 0, 1.0]])
+    dr = np.array([[0.931, 0.49, 0.0]])
+    np.testing.assert_allclose(np.linalg.norm(mic(dr, cell), axis=1),
+                               [0.494834], atol=1e-6)
+
+    # Random strongly sheared cells. Fully periodic: against ASE's exact
+    # find_mic (which reduces the basis too). Mixed periodicity: against a
+    # brute force with wide lattice offsets in the original basis (ASE's
+    # find_mic is not minimal for partially periodic skewed cells; with at
+    # most two periodic directions the wide search stays cheap).
+    import itertools
+    from ase.geometry import find_mic
+    rng = np.random.default_rng(7)
+    for _ in range(20):
+        cell = np.diag(rng.uniform(1, 3, 3)) + rng.uniform(-1.5, 1.5, (3, 3))
+        if abs(np.linalg.det(cell)) < 0.3:
+            continue
+        pbc = (rng.integers(0, 2, 3).astype(bool) if rng.random() < 0.5
+               else np.ones(3, bool))
+        dr = rng.uniform(-6, 6, (100, 3))
+        got = mic(dr, cell, pbc)
+        if pbc.all():
+            _, ref_len = find_mic(dr, cell, pbc)
+        else:
+            ranges = [range(-25, 26) if p else [0] for p in pbc]
+            ref_len = np.array([
+                min(np.linalg.norm(v + np.array(s) @ cell)
+                    for s in itertools.product(*ranges)) for v in dr])
+        np.testing.assert_allclose(np.linalg.norm(got, axis=1), ref_len,
+                                   atol=1e-9)
+        # The result differs from the input by periodic lattice vectors only.
+        shifts = (got - dr) @ np.linalg.inv(cell)
+        np.testing.assert_allclose(shifts, np.round(shifts), atol=1e-9)
+        assert np.allclose(shifts[:, ~pbc], 0)

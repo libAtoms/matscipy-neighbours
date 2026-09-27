@@ -3,14 +3,18 @@
 Fast neighbour lists for particle simulations, with a Python-free C++ core, an
 optional CUDA/HIP GPU backend, and zero-copy NumPy/CuPy interop via DLPack.
 
-- **Drop-in API** compatible with `matscipy.neighbours`: request any of the
-  quantities `"ijdDS"` and get one array back per character.
+- **Simple API**: `neighbour_list("ijdDS", …)` returns one array per requested
+  quantity (indices `i`, `j`, distance `d`, distance vector `D`, cell shift
+  `S`), sorted by `i`.
 - **Parallel CPU core** (OpenMP) built from a sorted cell list with a hashed
   compact backend for sparse/vacuum systems.
 - **GPU backend** (single-source CUDA/HIP) that keeps results on the device and
   hands them to CuPy/PyTorch/JAX zero-copy through DLPack.
 - **General geometry**: triclinic cells, per-direction periodicity, and scalar,
   per-atom, or per-type cutoffs.
+
+This interface is compatible with
+[`matscipy.neighbours`](https://github.com/libAtoms/matscipy).
 
 ## Quick start (Python)
 

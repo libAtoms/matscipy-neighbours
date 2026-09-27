@@ -41,6 +41,7 @@ using gpuError_t = cudaError_t;
 #define gpuGetLastError cudaGetLastError
 #define gpuGetDevice cudaGetDevice
 #define gpuSetDevice cudaSetDevice
+#define gpuErrorUnloading cudaErrorCudartUnloading
 #elif defined(MATSCIPY_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 using gpuError_t = hipError_t;
@@ -58,6 +59,7 @@ using gpuError_t = hipError_t;
 #define gpuGetLastError hipGetLastError
 #define gpuGetDevice hipGetDevice
 #define gpuSetDevice hipSetDevice
+#define gpuErrorUnloading hipErrorDeinitialized
 #endif
 
 namespace matscipy {
@@ -75,13 +77,31 @@ inline void gpu_check(gpuError_t err, const char *file, int line) {
 
 #define GPU_CHECK(call) ::matscipy::gpu_check((call), __FILE__, __LINE__)
 
-/* Launch `kernel` over `grid` x `block`. One spelling for both backends. */
+/* Check that a kernel launch was accepted (bad configuration, no device, ...);
+   a launch error is otherwise silent and every later read sees garbage. Debug
+   builds also synchronise, so an asynchronous fault is reported at the
+   offending launch rather than at the next runtime call. */
+inline void gpu_check_launch(const char *file, int line) {
+    gpu_check(gpuGetLastError(), file, line);
+#ifndef NDEBUG
+    gpu_check(gpuDeviceSynchronize(), file, line);
+#endif
+}
+
+/* Launch `kernel` over `grid` x `block` and check the launch. One spelling for
+   both backends. */
 #if defined(MATSCIPY_ENABLE_CUDA)
-#define GPU_LAUNCH(kernel, grid, block, ...) \
-    kernel<<<(grid), (block)>>>(__VA_ARGS__)
+#define GPU_LAUNCH(kernel, grid, block, ...)                  \
+    do {                                                      \
+        kernel<<<(grid), (block)>>>(__VA_ARGS__);             \
+        ::matscipy::gpu_check_launch(__FILE__, __LINE__);     \
+    } while (0)
 #elif defined(MATSCIPY_ENABLE_HIP)
-#define GPU_LAUNCH(kernel, grid, block, ...) \
-    hipLaunchKernelGGL(kernel, (grid), (block), 0, 0, __VA_ARGS__)
+#define GPU_LAUNCH(kernel, grid, block, ...)                             \
+    do {                                                                 \
+        hipLaunchKernelGGL(kernel, (grid), (block), 0, 0, __VA_ARGS__);  \
+        ::matscipy::gpu_check_launch(__FILE__, __LINE__);                \
+    } while (0)
 #endif
 
 }  // namespace matscipy

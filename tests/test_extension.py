@@ -43,7 +43,7 @@ def neighbour_list(quantities, cell, positions, cutoff, pbc=True, types=None):
     cell_origin, cell, inv_cell, pbc, positions = make_args(cell, positions, pbc)
     args = [quantities, cell_origin, cell, inv_cell, pbc, positions, cutoff]
     if types is not None:
-        args.append(np.ascontiguousarray(types, dtype=np.int32))
+        args.append(np.ascontiguousarray(types, dtype=np.int64))
     return nl.neighbour_list(*args)
 
 
@@ -221,7 +221,7 @@ def test_per_atom_cutoffs():
 def test_per_type_cutoffs():
     cell = 10.0 * np.eye(3)
     pos = np.array([[0.0, 0, 0], [1.0, 0, 0], [2.0, 0, 0]])
-    types = np.array([0, 1, 0], dtype=np.int32)
+    types = np.array([0, 1, 0], dtype=np.int64)
     # 2x2 cutoff matrix: only the (0,1)/(1,0) interaction within 1.5 counts
     cutoffs = np.array([[0.5, 1.5],
                         [1.5, 0.5]])
@@ -271,7 +271,7 @@ def test_zero_cell_volume_raises():
 # ---------------------------------------------------------------------------
 
 def _fn(n, i):
-    return nl.first_neighbours(n, np.array(i, dtype=np.int32))
+    return nl.first_neighbours(n, np.array(i, dtype=np.int64))
 
 
 def test_first_neighbours_reference_values():
@@ -298,10 +298,10 @@ def test_first_neighbours_empty():
 def test_get_jump_indicies():
     out = nl.get_jump_indicies(np.array(
         [0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4],
-        dtype=np.int32))
+        dtype=np.int64))
     np.testing.assert_array_equal(out, [0, 3, 8, 11, 15, 19])
 
-    out = nl.get_jump_indicies(np.array([0], dtype=np.int32))
+    out = nl.get_jump_indicies(np.array([0], dtype=np.int64))
     np.testing.assert_array_equal(out, [0, 1])
 
 
@@ -310,7 +310,7 @@ def test_get_jump_indicies():
 # ---------------------------------------------------------------------------
 
 def test_triplet_list_no_cutoff():
-    first_i = np.array([0, 2, 6, 10], dtype=np.int32)
+    first_i = np.array([0, 2, 6, 10], dtype=np.int64)
     ij, ik = nl.triplet_list(first_i)
     ij_comp = [0, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5,
                5, 6, 6, 6, 7, 7, 7, 8, 8, 8, 9, 9, 9]
@@ -321,7 +321,7 @@ def test_triplet_list_no_cutoff():
 
 
 def test_triplet_list_with_cutoff():
-    first_i = np.array([0, 2, 6, 10], dtype=np.int32)
+    first_i = np.array([0, 2, 6, 10], dtype=np.int64)
     absdist = np.array([2.2] * 4 + [3.0] * 2 + [2.0] * 4, dtype=np.float64)
     ij, ik = nl.triplet_list(first_i, absdist, 2.6)
     ij_comp = [0, 1, 2, 3, 6, 6, 6, 7, 7, 7, 8, 8, 8, 9, 9, 9]
@@ -331,6 +331,69 @@ def test_triplet_list_with_cutoff():
 
 
 def test_triplet_list_cutoff_requires_distances():
-    first_i = np.array([0, 2, 6, 10], dtype=np.int32)
+    first_i = np.array([0, 2, 6, 10], dtype=np.int64)
     with pytest.raises(TypeError):
         nl.triplet_list(first_i, np.ones(10))   # cutoff missing
+
+
+# ---------------------------------------------------------------------------
+# Randomised brute-force check of the full contract
+# ---------------------------------------------------------------------------
+
+def _brute_force_full(pos, cell, pbc, cutoff, radii=None):
+    """All (i, j, shift) triples within the cutoff, including multiple images
+    of the same pair and atoms several cells outside the box."""
+    inv = np.linalg.inv(cell)
+    frac = pos @ inv
+    volume = abs(np.linalg.det(cell))
+    ranges = []
+    for k in range(3):
+        if not pbc[k]:
+            ranges.append([0])
+            continue
+        height = volume / np.linalg.norm(np.cross(cell[(k + 1) % 3],
+                                                  cell[(k + 2) % 3]))
+        span = int(np.ceil(frac[:, k].max() - frac[:, k].min())) + 1
+        reach = int(np.ceil(cutoff / height)) + span + 1
+        ranges.append(range(-reach, reach + 1))
+    pairs = set()
+    for s in itertools.product(*ranges):
+        S = np.array(s)
+        D = pos[None, :, :] - pos[:, None, :] + S @ cell
+        d = np.linalg.norm(D, axis=2)
+        if radii is None:
+            inside = d < cutoff
+        else:
+            inside = d < radii[:, None] + radii[None, :]
+        if s == (0, 0, 0):
+            np.fill_diagonal(inside, False)
+        for i, j in zip(*np.nonzero(inside)):
+            pairs.add((int(i), int(j)) + tuple(int(x) for x in S))
+    return pairs
+
+
+def test_random_triclinic_cells_match_brute_force():
+    """Random triclinic (possibly left-handed) cells, mixed periodicity,
+    cutoffs larger than the cell (multiple images), atoms several cells
+    outside the box, and per-atom radii."""
+    rng = np.random.default_rng(42)
+    trials = 0
+    while trials < 40:
+        n = int(rng.integers(1, 30))
+        cell = (rng.uniform(-1, 1, (3, 3)) * rng.uniform(1, 8)
+                + np.diag(rng.uniform(1, 8, 3)))
+        if abs(np.linalg.det(cell)) < 0.5:
+            continue
+        trials += 1
+        pbc = rng.integers(0, 2, 3).astype(bool)
+        cutoff = float(rng.uniform(0.5, 5))
+        pos = rng.uniform(-2, 3, (n, 3)) @ cell
+        radii = rng.uniform(0.2, cutoff / 2, n) if rng.random() < 0.3 else None
+
+        cell_origin, c, inv_cell, pb, r = make_args(cell, pos, pbc)
+        i, j, S, D = nl.neighbour_list("ijSD", cell_origin, c, inv_cell, pb, r,
+                                       radii if radii is not None else cutoff)
+        got = set(zip(i.tolist(), j.tolist(), *S.T.tolist()))
+        assert got == _brute_force_full(pos, cell, pbc, cutoff, radii), (
+            f"trial {trials}: pbc={pbc.tolist()} cutoff={cutoff:.3f}")
+        np.testing.assert_allclose(D, pos[j] - pos[i] + S @ cell, atol=1e-9)

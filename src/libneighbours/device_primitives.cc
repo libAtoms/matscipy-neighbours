@@ -17,6 +17,9 @@
 
 #include "device.hh"
 
+#include <cstdio>
+#include <cstdlib>
+
 #if defined(MATSCIPY_ENABLE_CUDA)
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
@@ -28,16 +31,28 @@ namespace gpuprim = hipcub;
 
 namespace matscipy {
 
+/* CUB / hipCUB take the item count as a 32-bit int in all versions; the
+   callers guarantee n < 2^31 (see kMaxDeviceAtoms in neighbour_list_gpu.cc). */
+static int item_count(index_t n) {
+    if (n > 0x7fffffff) {
+        std::fprintf(stderr, "[matscipy] device primitive called with %lld items "
+                     "(limit 2^31-1)\n", static_cast<long long>(n));
+        std::abort();
+    }
+    return static_cast<int>(n);
+}
+
 index_t device_exclusive_scan(const index_t *d_in, index_t *d_out, index_t n) {
     if (n <= 0) return 0;
+    const int num_items = item_count(n);
 
     void *d_temp = nullptr;
     std::size_t temp_bytes = 0;
     GPU_CHECK(gpuprim::DeviceScan::ExclusiveSum(d_temp, temp_bytes, d_in, d_out,
-                                                n));
+                                                num_items));
     GPU_CHECK(gpuMalloc(&d_temp, temp_bytes));
     GPU_CHECK(gpuprim::DeviceScan::ExclusiveSum(d_temp, temp_bytes, d_in, d_out,
-                                                n));
+                                                num_items));
     GPU_CHECK(gpuFree(d_temp));
 
     /* Grand total = last exclusive entry + last input. Read both back. */
@@ -51,6 +66,7 @@ index_t device_exclusive_scan(const index_t *d_in, index_t *d_out, index_t n) {
 
 void device_sort_pairs(std::uint64_t *d_keys, index_t *d_values, index_t n) {
     if (n <= 1) return;
+    const int num_items = item_count(n);
 
     /* CUB sorts into double buffers; allocate the alternates and let it pick. */
     std::uint64_t *d_keys_alt = nullptr;
@@ -64,10 +80,10 @@ void device_sort_pairs(std::uint64_t *d_keys, index_t *d_values, index_t n) {
     void *d_temp = nullptr;
     std::size_t temp_bytes = 0;
     GPU_CHECK(gpuprim::DeviceRadixSort::SortPairs(d_temp, temp_bytes, keys,
-                                                  values, n));
+                                                  values, num_items));
     GPU_CHECK(gpuMalloc(&d_temp, temp_bytes));
     GPU_CHECK(gpuprim::DeviceRadixSort::SortPairs(d_temp, temp_bytes, keys,
-                                                  values, n));
+                                                  values, num_items));
 
     /* If the sorted data ended up in the alternate buffer, copy it back so the
        caller's pointers hold the result. */

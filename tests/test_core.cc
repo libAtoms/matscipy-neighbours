@@ -16,6 +16,8 @@
 #include <random>
 #include <vector>
 
+#include "cell_list.hh"
+#include "error.hh"
 #include "first_neighbours.hh"
 #include "neighbour_list.hh"
 #include "triplet_list.hh"
@@ -180,40 +182,195 @@ TEST(NeighbourList, PerTypeCutoffs) {
 TEST(FirstNeighbours, ReferenceValues) {
     std::vector<index_t> i_n = {1, 1, 1, 1, 3, 3, 3};
     std::vector<index_t> seed(6);
-    first_neighbours(5, static_cast<index_t>(i_n.size()), i_n.data(),
-                     seed.data());
+    ASSERT_EQ(first_neighbours(5, static_cast<index_t>(i_n.size()), i_n.data(),
+                               seed.data()),
+              NL_SUCCESS);
     EXPECT_EQ(seed, (std::vector<index_t>{-1, 0, 4, 4, 7, 7}));
 }
 
 TEST(FirstNeighbours, EmptyListDoesNotReadOutOfBounds) {
     std::vector<index_t> seed(6);
-    first_neighbours(5, 0, nullptr, seed.data());
+    ASSERT_EQ(first_neighbours(5, 0, nullptr, seed.data()), NL_SUCCESS);
     EXPECT_EQ(seed, (std::vector<index_t>{0, 0, 0, 0, 0, 0}));
+}
+
+TEST(FirstNeighbours, RejectsBadInputWithoutWriting) {
+    std::vector<index_t> seed(4, 99);
+    std::vector<index_t> too_large = {0, 1, 7};
+    EXPECT_EQ(first_neighbours(3, 3, too_large.data(), seed.data()),
+              NL_INVALID_ARGUMENT);
+    EXPECT_TRUE(has_error);
+    std::vector<index_t> negative = {-2, 1};
+    EXPECT_EQ(first_neighbours(3, 2, negative.data(), seed.data()),
+              NL_INVALID_ARGUMENT);
+    std::vector<index_t> unsorted = {2, 1};
+    EXPECT_EQ(first_neighbours(3, 2, unsorted.data(), seed.data()),
+              NL_INVALID_ARGUMENT);
+    EXPECT_EQ(first_neighbours(-5, 0, nullptr, seed.data()),
+              NL_INVALID_ARGUMENT);
+    EXPECT_EQ(seed, (std::vector<index_t>{99, 99, 99, 99}));
 }
 
 TEST(GetJumpIndicies, Basic) {
     std::vector<index_t> sorted = {0, 0, 0, 1, 1, 1, 1, 1, 2, 2,
                                    2, 3, 3, 3, 3, 4, 4, 4, 4};
-    auto jumps = get_jump_indicies(static_cast<index_t>(sorted.size()),
-                                   sorted.data());
+    std::vector<index_t> jumps;
+    ASSERT_EQ(get_jump_indicies(static_cast<index_t>(sorted.size()),
+                                sorted.data(), jumps),
+              NL_SUCCESS);
     EXPECT_EQ(jumps, (std::vector<index_t>{0, 3, 8, 11, 15, 19}));
+}
+
+TEST(GetJumpIndicies, RejectsGapsAndNonZeroStart) {
+    std::vector<index_t> jumps;
+    std::vector<index_t> gap = {0, 0, 2};
+    EXPECT_EQ(get_jump_indicies(3, gap.data(), jumps), NL_INVALID_ARGUMENT);
+    std::vector<index_t> start = {1, 1, 2};
+    EXPECT_EQ(get_jump_indicies(3, start.data(), jumps), NL_INVALID_ARGUMENT);
 }
 
 TEST(TripletList, WithAndWithoutCutoff) {
     std::vector<index_t> first_i = {0, 2, 6, 10};
     std::vector<index_t> ij, ik;
 
-    triplet_list(static_cast<index_t>(first_i.size()), first_i.data(), nullptr,
-                 0.0, ij, ik);
+    ASSERT_EQ(triplet_list(static_cast<index_t>(first_i.size()), first_i.data(),
+                           0, nullptr, 0.0, ij, ik),
+              NL_SUCCESS);
     EXPECT_EQ(ij.size(), 26u);
     EXPECT_EQ(ik.size(), 26u);
 
     std::vector<real_t> absdist = {2.2, 2.2, 2.2, 2.2, 3.0,
                                    3.0, 2.0, 2.0, 2.0, 2.0};
-    triplet_list(static_cast<index_t>(first_i.size()), first_i.data(),
-                 absdist.data(), 2.6, ij, ik);
+    ASSERT_EQ(triplet_list(static_cast<index_t>(first_i.size()), first_i.data(),
+                           static_cast<index_t>(absdist.size()), absdist.data(),
+                           2.6, ij, ik),
+              NL_SUCCESS);
     EXPECT_EQ(ij.size(), 16u);
     EXPECT_EQ(ik.size(), 16u);
+}
+
+TEST(TripletList, LeadingMinusOneIsNoEntries) {
+    // first_neighbours() emits -1 for atoms before the first pair.
+    std::vector<index_t> first_i = {-1, -1, 0, 2};
+    std::vector<real_t> absdist = {1.0, 1.0};
+    std::vector<index_t> ij, ik;
+    ASSERT_EQ(triplet_list(4, first_i.data(), 2, absdist.data(), 2.0, ij, ik),
+              NL_SUCCESS);
+    EXPECT_EQ(ij, (std::vector<index_t>{0, 1}));
+    EXPECT_EQ(ik, (std::vector<index_t>{1, 0}));
+}
+
+TEST(TripletList, RejectsBadRowStarts) {
+    std::vector<index_t> ij, ik;
+    std::vector<real_t> absdist = {1.0, 1.0, 1.0};
+    std::vector<index_t> beyond = {0, 10};
+    EXPECT_EQ(triplet_list(2, beyond.data(), 3, absdist.data(), 1.0, ij, ik),
+              NL_INVALID_ARGUMENT);
+    std::vector<index_t> decreasing = {5, 0};
+    EXPECT_EQ(triplet_list(2, decreasing.data(), 0, nullptr, 0.0, ij, ik),
+              NL_INVALID_ARGUMENT);
+    std::vector<index_t> minus_one_then_three = {-1, 3};
+    EXPECT_EQ(triplet_list(2, minus_one_then_three.data(), 0, nullptr, 0.0, ij,
+                           ik),
+              NL_INVALID_ARGUMENT);
+    // A slice of a row-start array (no -1, not starting at 0) is fine.
+    std::vector<index_t> slice = {3, 5};
+    EXPECT_EQ(triplet_list(2, slice.data(), 0, nullptr, 0.0, ij, ik), NL_SUCCESS);
+    EXPECT_EQ(ij.size(), 2u);
+}
+
+TEST(NeighbourList, RejectsInvalidArguments) {
+    const bool pbc[3] = {true, true, true};
+    const real_t pos[6] = {0.2, 0.2, 0.2, 0.7, 0.7, 0.7};
+    NeighbourList nl;
+    auto call = [&](index_t nat, real_t cutoff, const real_t *per_atom,
+                    const real_t *per_type_sq, index_t ncutoffs,
+                    const index_t *types) {
+        return neighbour_list(QUANTITY_FIRST, kOrigin, kIdentity, kIdentity, pbc,
+                              nat, pos, cutoff, per_atom, per_type_sq, ncutoffs,
+                              types, nl);
+    };
+    EXPECT_EQ(call(2, 0.0, nullptr, nullptr, 0, nullptr), NL_INVALID_ARGUMENT);
+    EXPECT_EQ(call(2, -1.0, nullptr, nullptr, 0, nullptr), NL_INVALID_ARGUMENT);
+    EXPECT_EQ(call(2, std::nan(""), nullptr, nullptr, 0, nullptr),
+              NL_INVALID_ARGUMENT);
+    EXPECT_EQ(call(2, INFINITY, nullptr, nullptr, 0, nullptr),
+              NL_INVALID_ARGUMENT);
+    EXPECT_EQ(call(-1, 1.0, nullptr, nullptr, 0, nullptr), NL_INVALID_ARGUMENT);
+
+    const real_t bad_radius[2] = {0.5, -0.5};
+    EXPECT_EQ(call(2, 1.0, bad_radius, nullptr, 0, nullptr), NL_INVALID_ARGUMENT);
+
+    const real_t per_type_sq[4] = {1.0, 1.0, 1.0, 1.0};
+    const index_t out_of_range[2] = {0, 5};
+    EXPECT_EQ(call(2, 1.0, nullptr, per_type_sq, 2, out_of_range),
+              NL_INVALID_ARGUMENT);
+    EXPECT_EQ(call(2, 1.0, nullptr, per_type_sq, 2, nullptr),
+              NL_INVALID_ARGUMENT);
+
+    const real_t nan_pos[6] = {0.2, 0.2, 0.2, NAN, 0.7, 0.7};
+    EXPECT_EQ(neighbour_list(QUANTITY_FIRST, kOrigin, kIdentity, kIdentity, pbc,
+                             2, nan_pos, 1.0, nullptr, nullptr, 0, nullptr, nl),
+              NL_INVALID_ARGUMENT);
+    EXPECT_EQ(nl.npairs, 0);
+}
+
+TEST(NeighbourList, HugeCoordinatesDoNotHang) {
+    // 1e30 cell widths away: the raw cell index is clamped, not UB, and the
+    // wrap is O(1). The far atom simply has no neighbours.
+    const bool pbc[3] = {true, true, true};
+    const real_t pos[6] = {0.5, 0.5, 0.5, 1e30, 0.5, 0.5};
+    NeighbourList nl;
+    ASSERT_EQ(neighbour_list(QUANTITY_FIRST | QUANTITY_SECOND, kOrigin,
+                             kIdentity, kIdentity, pbc, 2, pos, 1.1, nullptr,
+                             nullptr, 0, nullptr, nl),
+              NL_SUCCESS);
+    for (index_t p = 0; p < nl.npairs; p++) {
+        EXPECT_EQ(nl.first[p], nl.secnd[p]);  // only self-images
+    }
+}
+
+TEST(NeighbourList, MortonMatchesLinearOnHugeGrid) {
+    // 2.2M cells requested along x exceed the 21-bit Morton key range; the
+    // resolution is clamped so both orders bin identically.
+    const index_t nat = 2000;
+    const real_t L = 2.2e6;
+    const real_t cell[9] = {L, 0, 0, 0, 1, 0, 0, 0, 1};
+    const real_t inv[9] = {1 / L, 0, 0, 0, 1, 0, 0, 0, 1};
+    const bool pbc[3] = {true, true, true};
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<real_t> ux(0, L), u1(0, 1);
+    std::vector<real_t> r(3 * nat);
+    for (index_t a = 0; a < nat; a++) {
+        r[3 * a] = ux(rng);
+        r[3 * a + 1] = u1(rng);
+        r[3 * a + 2] = u1(rng);
+    }
+    NeighbourList lin, mor;
+    ASSERT_EQ(neighbour_list(QUANTITY_FIRST, kOrigin, cell, inv, pbc, nat,
+                             r.data(), 1.0, nullptr, nullptr, 0, nullptr, lin,
+                             CellOrder::Linear),
+              NL_SUCCESS);
+    ASSERT_EQ(neighbour_list(QUANTITY_FIRST, kOrigin, cell, inv, pbc, nat,
+                             r.data(), 1.0, nullptr, nullptr, 0, nullptr, mor,
+                             CellOrder::Morton),
+              NL_SUCCESS);
+    EXPECT_EQ(lin.npairs, mor.npairs);
+    EXPECT_EQ(lin.first, mor.first);
+}
+
+TEST(CellHash, SpreadsKeysThatDifferOnlyInHighBits) {
+    // A wire along z in a 1024^3 grid: keys k << 20. With an 18-bit mask these
+    // must not all collide.
+    const std::int64_t mask = (1 << 18) - 1;
+    std::vector<bool> used(mask + 1, false);
+    int collisions = 0;
+    for (std::int64_t k = 0; k < 1024; k++) {
+        std::int64_t h = cell_hash(k << 20) & mask;
+        if (used[h]) collisions++;
+        used[h] = true;
+    }
+    EXPECT_LT(collisions, 16);
 }
 
 namespace {
