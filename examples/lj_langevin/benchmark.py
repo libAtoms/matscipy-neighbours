@@ -2,8 +2,8 @@
 """Unified scaling benchmark for the LJ Langevin examples.
 
 Runs the per-step wall time across a logarithmic range of sizes for two
-systems -- the self-bound **droplet** in vacuum (non-periodic, sparse grid)
-and the bulk **liquid** in a periodic box (dense grid, periodic images) -- for
+systems -- the bulk **liquid** in a periodic box (dense grid, periodic images)
+and the self-bound **droplet** in vacuum (non-periodic, sparse grid) -- for
 the full cross-product of three dimensions:
 
     device   : CPU / GPU
@@ -18,8 +18,10 @@ threading controls the matscipy list (and the C++ OpenMP force loop). vesin's
 CPU list is single-threaded.
 
 Each configuration is launched as a subprocess and its printed `ms/step` is
-parsed. Output: a console table per system, a JSON file of raw timings, and
-per system a log-log plot of time vs. number of atoms, faceted by kernel.
+parsed. Output: a console table per system, a JSON file of raw timings, per
+system a log-log plot of time vs. number of atoms faceted by kernel, and a
+kernel-comparison plot (matscipy list only, single-threaded CPU and GPU) that
+isolates the cost of the Lennard-Jones implementations.
 """
 
 import argparse
@@ -41,13 +43,16 @@ def usable_cores():
     except AttributeError:
         return os.cpu_count()
 
-SYSTEM_ORDER = ["droplet", "liquid"]
-SYSTEM_NAME = {"droplet": "LJ droplet (vacuum, non-periodic)",
-               "liquid": "LJ liquid (periodic box)"}
+SYSTEM_ORDER = ["liquid", "droplet"]
+SYSTEM_NAME = {"liquid": "Periodic LJ liquid",
+               "droplet": "Non-periodic LJ droplet"}
 
 KERNEL_NAME = {"warp": "Warp", "array": "array (NumPy/CuPy)", "jax": "JAX",
                "cpp": "C++"}
-KERNEL_ORDER = ["warp", "array", "jax", "cpp"]
+# Facet order: top row array / JAX, bottom row Warp / C++.
+KERNEL_ORDER = ["array", "jax", "warp", "cpp"]
+KERNEL_COLOUR = {"array": "tab:blue", "jax": "tab:green", "warp": "tab:orange",
+                 "cpp": "tab:red"}
 
 # Neighbour-list backends. "matscipy" is this library (matscipy_neighbours);
 # "matscipy-classic" is the classic matscipy 1.2.0 package (CPU only); "vesin"
@@ -246,6 +251,47 @@ def make_plot(cfgs, sizes, path, system):
     print(f"wrote {path}", file=sys.stderr)
 
 
+def make_kernel_plot(results, sizes, path):
+    """One panel per system: the four kernels on top of the *same* neighbour
+    list (matscipy-neighbours), single-threaded on the CPU and on the GPU. The
+    list build is identical within a device, so the spread between curves is
+    the cost of the LJ implementation."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    systems = [sy for sy in SYSTEM_ORDER if sy in results]
+    fig, axes = plt.subplots(1, len(systems), figsize=(5.5 * len(systems), 4.8),
+                             sharex=True, sharey=True, squeeze=False)
+    for ax, system in zip(axes.flat, systems):
+        for cfg in results[system]:
+            pts = cfg.get("points")
+            if not pts or cfg["nl"] != "matscipy":
+                continue
+            if cfg["device"] == "gpu":
+                ls, mk, dev = "-", "o", "GPU"
+            elif cfg["threads"] == "1t":
+                ls, mk, dev = ":", "x", "CPU (1t)"
+            else:
+                continue
+            ax.plot([a for a, _ in pts], [t for _, t in pts],
+                    color=KERNEL_COLOUR[cfg["kernel"]], ls=ls, marker=mk, ms=5,
+                    label=f"{KERNEL_NAME[cfg['kernel']]} · {dev}")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_title(SYSTEM_NAME[system])
+        ax.grid(True, which="both", ls=":", alpha=0.4)
+        ax.set_xlabel("number of atoms")
+        ax.set_ylabel("time per step (ms)")
+        if ax.has_data():
+            ax.legend(fontsize=8)
+    fig.suptitle("Kernel comparison on the matscipy-neighbours list "
+                 "(GPU, and single-threaded CPU)", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    print(f"wrote {path}", file=sys.stderr)
+
+
 def table_markdown(cfgs, sizes):
     cols = sizes
     head = "| Configuration | " + " | ".join(f"{c} atoms" for c in cols) + " |"
@@ -258,15 +304,16 @@ def table_markdown(cfgs, sizes):
     return "\n".join(lines)
 
 
-def write_doc_page(path, plot_names, meta):
+def write_doc_page(path, plot_names, meta, kernel_plot_name):
     """Write the documentation page. ``plot_names`` maps system -> image file
-    name (relative to the page)."""
+    name (relative to the page); ``kernel_plot_name`` is the kernel-comparison
+    figure."""
     sizes = meta["sizes"]
     cpu_cap = meta.get("max_atoms_cpu")
     cpu_range = (f"\nCPU runs stop at {cpu_cap:,} atoms; the GPU runs cover the "
                  f"full range." if cpu_cap else "")
     sections = {
-        "droplet": f"""## Droplet in vacuum
+        "droplet": f"""## Non-periodic: droplet in vacuum
 
 A self-bound liquid droplet in a **non-periodic**, generously padded box: most
 of the cell grid is empty, so this exercises the sparse (hashed) grid and a
@@ -289,7 +336,7 @@ How to read it:
   about 10⁵ atoms on, even single-threaded matscipy-neighbours `(1t)` is faster
   than the classic matscipy 1.2.0 and vesin CPU lists.
 """,
-        "liquid": f"""## Bulk liquid in a periodic box
+        "liquid": f"""## Periodic: bulk liquid
 
 A homogeneous liquid at reduced number density {meta.get("density", 0.8442):g}
 in a **fully periodic** cubic box: every grid cell is occupied (dense grid), and
@@ -317,8 +364,8 @@ How to read it:
     body = f"""# Benchmark
 
 Per-step wall time of the [Lennard-Jones Langevin](examples.md) example for two
-systems — a **droplet in vacuum** (non-periodic) and a **bulk liquid in a
-periodic box** — across system sizes, for the full cross-product of **device**
+systems — a **bulk liquid in a periodic box** and a **droplet in vacuum**
+(non-periodic) — across system sizes, for the full cross-product of **device**
 (CPU / GPU), **neighbour list** and **kernels** (Warp / array (NumPy/CuPy) /
 JAX / C++). Lower is better. The neighbour-list backends are:
 
@@ -326,6 +373,15 @@ JAX / C++). Lower is better. The neighbour-list backends are:
 - **matscipy 1.2.0** — the classic [`matscipy`](https://pypi.org/project/matscipy/)
   package's `neighbour_list`, the CPU reference this library descends from;
 - **vesin** — [`vesin`](https://github.com/luthaf/vesin), CPU + GPU.
+
+!!! warning "What is being measured"
+    Every step rebuilds the neighbour list from scratch, and the list is the
+    dominant cost of a step here. That is deliberate: these runs are set up to
+    expose the neighbour-list performance as much as possible. In a real
+    application one would build the list with a Verlet shell (a skin added to
+    the cutoff) and reuse it for many steps until an atom has moved half the
+    skin, so the total time spent constructing neighbour lists plays a much
+    smaller role in the overall cost of a simulation than it does below.
 
 !!! info "Test machine"
     - **CPU:** {meta["cpu"]}
@@ -358,8 +414,35 @@ FCC lattice; the droplet uses lattice constant 1.6, the liquid fills its box at
 the stated density.
 
 """
-    body += "\n".join(sections[sy] for sy in meta["systems"] if sy in sections)
-    body += """
+    # Periodic first, whatever order the systems were run (or saved) in.
+    body += "\n".join(sections[sy] for sy in SYSTEM_ORDER
+                       if sy in meta["systems"] and sy in sections)
+    body += f"""
+## Kernel comparison: the cost of the Lennard-Jones implementation
+
+The figure below keeps the neighbour list fixed — **matscipy-neighbours** on
+the GPU, and on the CPU **single-threaded** — and varies only the kernels that
+consume it: array (NumPy/CuPy), JAX, Warp and C++/CUDA. Within one device the
+list build time is the same for all four curves, so the vertical spread between
+them is the cost of the potential, not of the list. This section therefore does
+**not** primarily benchmark the neighbour list but the implementation of the
+Lennard-Jones potential on top of it:
+
+- the **array** path materialises the per-pair distance vectors returned by the
+  list and scatters the forces with a `bincount` per component;
+- **JAX** `jit`-compiles a dense masked sum over the fixed-capacity
+  `neighbour_matrix` (no scatter, but padded rows);
+- **Warp** and **C++/CUDA** run one fused pass over the `ij` pairs (plus the
+  shift `S` in the periodic box) that recomputes each distance and never
+  materialises per-pair arrays.
+
+![Kernel comparison]({kernel_plot_name})
+
+The C++ force loop is OpenMP-parallel and honours the single-thread setting;
+the NumPy, Warp-CPU and JAX-CPU kernels use their own threading and are not
+pinned to one core, so on the CPU the comparison is indicative rather than
+strict.
+
 This page is generated by `examples/lj_langevin/benchmark.py`. Regenerate it on
 your own hardware with:
 
@@ -368,8 +451,9 @@ python examples/lj_langevin/benchmark.py --build build --doc-out docs/benchmark.
 ```
 
 The raw timings are written to `--results-out` (JSON); pass that file to
-`--replot` to redraw the plots and this page without re-running the benchmark.
-`--systems droplet` or `--systems liquid` restricts the run to one system. For
+`--replot` to redraw the plots and this page without re-running the benchmark
+(the kernel-comparison figure is drawn from the same results). `--systems
+liquid` or `--systems droplet` restricts the run to one system. For
 the C++ curves, build with `-DBUILD_EXAMPLES=ON` (and `-DENABLE_CUDA=ON` for
 the GPU binary); the others need `pip install jax warp-lang vesin muTimer
 matscipy==1.2.0 matplotlib` in the interpreter that runs this driver.
@@ -406,8 +490,8 @@ def main():
     ap.add_argument("--timeout", type=int, default=300,
                     help="per-run timeout in seconds (safety net)")
     ap.add_argument("--plot-dir", default=os.path.join(HERE, "..", "..", "docs"),
-                    help="directory for the plots, one benchmark_<system>.png "
-                         "per system")
+                    help="directory for the plots: one benchmark_<system>.png "
+                         "per system plus benchmark_kernels.png")
     ap.add_argument("--doc-out", default=None,
                     help="write a documentation page (with hardware info) here")
     ap.add_argument("--results-out", default=None,
@@ -490,14 +574,19 @@ def finish(results, meta, args):
     plot_dir = os.path.abspath(args.plot_dir)
     os.makedirs(plot_dir, exist_ok=True)
     plot_names = {}
-    for system, cfgs in results.items():
+    for system in [sy for sy in SYSTEM_ORDER if sy in results]:
+        cfgs = results[system]
         plot_names[system] = f"benchmark_{system}.png"
         make_plot(cfgs, meta["sizes"], os.path.join(plot_dir, plot_names[system]),
                   system)
         print(f"\n### {SYSTEM_NAME[system]}\n\n"
               + table_markdown(cfgs, meta["sizes"]) + "\n\n(values are ms/step)")
+    kernel_plot_name = "benchmark_kernels.png"
+    make_kernel_plot(results, meta["sizes"],
+                     os.path.join(plot_dir, kernel_plot_name))
     if args.doc_out:
-        write_doc_page(os.path.abspath(args.doc_out), plot_names, meta)
+        write_doc_page(os.path.abspath(args.doc_out), plot_names, meta,
+                       kernel_plot_name)
         print(f"\nwrote {args.doc_out}", file=sys.stderr)
 
 

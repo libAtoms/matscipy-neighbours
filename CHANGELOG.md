@@ -15,8 +15,11 @@ project adheres to [Semantic Versioning](https://semver.org/).
   the list for the periodic case; the array and JAX kernels are unchanged
   because the shifts are folded into the distance vectors.
 - `benchmark.py` sweeps both systems and writes one figure per system
-  (`docs/benchmark_droplet.png`, `docs/benchmark_liquid.png`); `--systems`
-  restricts the run, and older results files still replot.
+  (`docs/benchmark_liquid.png`, `docs/benchmark_droplet.png`; panels ordered
+  array / JAX / Warp / C++) plus a kernel-comparison figure
+  (`docs/benchmark_kernels.png`) on the matscipy-neighbours list alone; the
+  generated page leads with a note on Verlet shells versus per-step rebuilds.
+  `--systems` restricts the run, and older results files still replot.
 - The Langevin integrator in all example implementations applied the whole
   force kick with the old forces; it now follows the Allen-Tildesley scheme
   (half kick with the old forces, list and forces at the new positions, half

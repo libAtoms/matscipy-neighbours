@@ -87,9 +87,12 @@ Common flags: `--system`, `--atoms` (exact atom count), `--ncells` (used when
 
 `benchmark.py` sweeps logarithmically spaced system sizes (100, 1000, 10000, …
 up to GPU memory) for **both systems** over the full cross-product of **device**
-(CPU/GPU), **neighbour list** and **kernels** (Warp / array / JAX / C++), reports
-a combined `ms/step` table per system, and writes one time-vs-atoms plot per
-system (`benchmark_droplet.png`, `benchmark_liquid.png`) faceted by kernel:
+(CPU/GPU), **neighbour list** and **kernels** (array / JAX / Warp / C++), reports
+a combined `ms/step` table per system, writes one time-vs-atoms plot per
+system (`benchmark_liquid.png`, `benchmark_droplet.png`) faceted by kernel, and
+a kernel-comparison plot (`benchmark_kernels.png`: matscipy-neighbours list
+only, GPU and single-threaded CPU) that isolates the cost of the four
+Lennard-Jones implementations:
 
 ```bash
 python examples/lj_langevin/benchmark.py --build build --doc-out docs/benchmark.md
