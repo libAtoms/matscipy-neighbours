@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lennard-Jones liquid droplet with a Langevin thermostat — NVIDIA Warp.
+"""Lennard-Jones Langevin dynamics (droplet or periodic liquid) — NVIDIA Warp.
 
 The Lennard-Jones force/energy and the Langevin integrator are written as
 `warp` kernels (compiled once, then launched every step), but the neighbour
@@ -12,7 +12,9 @@ GPU, NumPy on the CPU); Warp wraps it zero-copy through DLPack, and the
 neighbour-list builder reads the very same buffer. The builder returns the
 directed pair list ``(i, j)`` (full list, sorted by ``i``); the fused Warp
 kernel recomputes the distance for each pair and atomically accumulates the
-force on ``i`` — never materialising per-pair arrays.
+force on ``i`` — never materialising per-pair arrays. For the periodic liquid
+(``--system liquid``) the builder also returns the cell shift ``S`` of each
+pair, and the kernel evaluates the periodic image D = r[j] - r[i] + S @ cell.
 
 Timing is broken down per phase with `muTimer` (build neighbour list / LJ
 forces / Langevin integrate), and the neighbour-list build time is reported
@@ -61,14 +63,43 @@ def lj_forces(pos: wp.array(dtype=vec3d),
 
 
 @wp.kernel
-def langevin(pos: wp.array(dtype=vec3d),
-             vel: wp.array(dtype=vec3d),
-             forces: wp.array(dtype=vec3d),
-             c0: wp.float64, c1: wp.float64, c2: wp.float64,
-             dt: wp.float64, mass: wp.float64,
-             sr: wp.float64, sv: wp.float64, crv: wp.float64,
-             seed: wp.int32):
-    """One Langevin update (Allen-Tildesley scheme), one thread per atom."""
+def lj_forces_pbc(pos: wp.array(dtype=vec3d),
+                  ii: wp.array(dtype=wp.int32),
+                  jj: wp.array(dtype=wp.int32),
+                  shift: wp.array(dtype=wp.vec3i),
+                  cell_t: wp.mat33d,
+                  cutoff_sq: wp.float64,
+                  forces: wp.array(dtype=vec3d),
+                  energy: wp.array(dtype=wp.float64)):
+    """As `lj_forces`, for a periodic box: the pair's cell shift selects the
+    periodic image, D = r[j] - r[i] + S @ cell (`cell_t` is the transposed
+    cell, rows = lattice vectors, so that S @ cell == cell_t * S)."""
+    p = wp.tid()
+    i = ii[p]
+    j = jj[p]
+    s = shift[p]
+    sd = vec3d(wp.float64(s[0]), wp.float64(s[1]), wp.float64(s[2]))
+    dr = pos[j] - pos[i] + cell_t * sd
+    r2 = wp.dot(dr, dr)
+    if r2 < cutoff_sq:
+        inv_r2 = wp.float64(1.0) / r2
+        inv_r6 = inv_r2 * inv_r2 * inv_r2
+        coef = wp.float64(-24.0) * inv_r2 * inv_r6 * (wp.float64(2.0) * inv_r6 - wp.float64(1.0))
+        wp.atomic_add(forces, i, coef * dr)
+        wp.atomic_add(energy, 0, wp.float64(2.0) * inv_r6 * (inv_r6 - wp.float64(1.0)))
+
+
+@wp.kernel
+def langevin_drift(pos: wp.array(dtype=vec3d),
+                   vel: wp.array(dtype=vec3d),
+                   forces: wp.array(dtype=vec3d),
+                   c0: wp.float64, c1: wp.float64, c2: wp.float64,
+                   dt: wp.float64, mass: wp.float64,
+                   sr: wp.float64, sv: wp.float64, crv: wp.float64,
+                   seed: wp.int32):
+    """First half of a Langevin step (Allen-Tildesley scheme), one thread per
+    atom: move the positions; friction, random kicks and the half kick with
+    the *old* forces on the velocities."""
     a = wp.tid()
     st = wp.rand_init(seed, a)
     g1 = vec3d(wp.float64(wp.randn(st)), wp.float64(wp.randn(st)), wp.float64(wp.randn(st)))
@@ -78,7 +109,16 @@ def langevin(pos: wp.array(dtype=vec3d),
     v = vel[a]
     fm = forces[a] / mass
     pos[a] = pos[a] + c1 * dt * v + c2 * dt * dt * fm + gr
-    vel[a] = v + (c0 - wp.float64(1.0)) * v + c1 * dt * fm + gv
+    vel[a] = c0 * v + (c1 - c2) * dt * fm + gv
+
+
+@wp.kernel
+def langevin_kick(vel: wp.array(dtype=vec3d),
+                  forces: wp.array(dtype=vec3d),
+                  c2: wp.float64, dt: wp.float64, mass: wp.float64):
+    """Second half of a Langevin step: the half kick with the *new* forces."""
+    a = wp.tid()
+    vel[a] = vel[a] + c2 * dt * forces[a] / mass
 
 
 # --------------------------------------------------------------------------- #
@@ -97,6 +137,21 @@ def fcc_droplet(xp, target_n, lattice):
     order = np.argsort((r * r).sum(axis=1))
     r = np.ascontiguousarray(r[order[:target_n]], dtype=float)
     return xp.asarray(r)
+
+
+def fcc_liquid_n(xp, target_n, density):
+    """Exactly ``target_n`` atoms on FCC sites filling a periodic cubic box at
+    the given number density; returns ``(positions, L)``. Same deterministic
+    site selection as the other implementations (see lj_langevin.py)."""
+    basis = np.array([[0, 0, 0], [0.5, 0.5, 0], [0.5, 0, 0.5], [0, 0.5, 0.5]])
+    L = (target_n / density) ** (1.0 / 3.0)
+    ncells = int(math.ceil((target_n / 4.0) ** (1.0 / 3.0)))
+    a = L / ncells
+    span = range(ncells)
+    r = np.array([(np.array([ix, iy, iz]) + b) * a
+                  for ix in span for iy in span for iz in span for b in basis])
+    keep = (np.arange(target_n) * r.shape[0]) // target_n
+    return xp.asarray(np.ascontiguousarray(r[keep], dtype=float)), L
 
 
 def langevin_constants(dt, gamma, kT, mass=1.0):
@@ -121,16 +176,31 @@ def fixed_box(xp_positions, cutoff):
     return origin, cell
 
 
-def make_neighbour_builder(kind, xp, on_gpu, cutoff, origin, cell):
-    """Return ``build(positions) -> (i_int32, j_int32, npairs)`` for the chosen
-    backend. Both return the device-resident directed pair list."""
+def periodic_box(L):
+    """The periodic cubic box [0, L)^3 of the bulk liquid."""
+    origin = np.zeros(3)
+    cell = np.ascontiguousarray(np.diag([L, L, L]).astype(float))
+    return origin, cell
+
+
+def make_neighbour_builder(kind, xp, on_gpu, cutoff, origin, cell, pbc):
+    """Return ``build(positions) -> (i_int32, j_int32, S_int32, npairs)`` for
+    the chosen backend: the device-resident directed pair list, with the cell
+    shifts ``S`` (shape (npairs, 3)) for a periodic box and ``None``
+    otherwise."""
+    quantities = "ijS" if pbc else "ij"
+
+    def pack(i, j, S=None):
+        S32 = None if S is None else xp.ascontiguousarray(S.astype(xp.int32))
+        return i.astype(xp.int32), j.astype(xp.int32), S32, int(i.shape[0])
+
     if kind == "matscipy":
         from matscipy_neighbours import neighbour_list
 
         def build(positions):
-            i, j = neighbour_list("ij", positions=positions, cell=cell,
-                                  cell_origin=origin, pbc=False, cutoff=cutoff)
-            return i.astype(xp.int32), j.astype(xp.int32), int(i.shape[0])
+            return pack(*neighbour_list(quantities, positions=positions,
+                                        cell=cell, cell_origin=origin, pbc=pbc,
+                                        cutoff=cutoff))
         return build
 
     if kind == "vesin":
@@ -140,21 +210,19 @@ def make_neighbour_builder(kind, xp, on_gpu, cutoff, origin, cell):
         nl = vesin.NeighborList(cutoff=cutoff, full_list=True, sorted=True)
 
         def build(positions):
-            i, j = nl.compute(points=positions, box=box, periodic=False,
-                              quantities="ij")
-            return i.astype(xp.int32), j.astype(xp.int32), int(i.shape[0])
+            return pack(*nl.compute(points=positions, box=box, periodic=pbc,
+                                    quantities=quantities))
         return build
 
     if kind == "matscipy-classic":
         # The classic matscipy package (pinned to 1.2.0). CPU/host only; shift
         # positions by -origin so they sit inside the cell for its C extension.
         from matscipy.neighbours import neighbour_list as ms_nl
-        pbc = [False, False, False]
+        pbc3 = [pbc, pbc, pbc]
 
         def build(positions):
-            i, j = ms_nl("ij", positions=positions - origin, cell=cell,
-                         pbc=pbc, cutoff=cutoff)
-            return i.astype(xp.int32), j.astype(xp.int32), int(i.shape[0])
+            return pack(*ms_nl(quantities, positions=positions - origin,
+                               cell=cell, pbc=pbc3, cutoff=cutoff))
         return build
 
     raise SystemExit(f"unknown neighbour backend: {kind}")
@@ -179,9 +247,16 @@ def main():
                     default="matscipy",
                     help="neighbour-list builder (matscipy = this library; "
                          "matscipy-classic = the matscipy 1.2.0 package, CPU only)")
+    ap.add_argument("--system", choices=["droplet", "liquid"], default="droplet",
+                    help="droplet in vacuum (non-periodic) or bulk liquid in a "
+                         "periodic box")
     ap.add_argument("--atoms", type=int, default=2048,
-                    help="target number of atoms in the droplet")
-    ap.add_argument("--lattice", type=float, default=1.6)
+                    help="number of atoms")
+    ap.add_argument("--lattice", type=float, default=1.6,
+                    help="droplet FCC lattice constant")
+    ap.add_argument("--density", type=float, default=0.8442,
+                    help="liquid number density (reduced units); the default "
+                         "with kT=0.7 is the Verlet (1967) liquid state point")
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--dt", type=float, default=0.005)
     ap.add_argument("--gamma", type=float, default=1.0)
@@ -204,7 +279,14 @@ def main():
         xp = np
 
     # Positions: a single device buffer, shared zero-copy with Warp.
-    pos_host = fcc_droplet(xp, args.atoms, args.lattice)
+    if args.system == "liquid":
+        pos_host, L = fcc_liquid_n(xp, args.atoms, args.density)
+        origin, cell = periodic_box(L)
+        pbc = True
+    else:
+        pos_host = fcc_droplet(xp, args.atoms, args.lattice)
+        origin, cell = fixed_box(pos_host, args.cutoff)
+        pbc = False
     positions = xp.ascontiguousarray(pos_host)
     n = int(positions.shape[0])
     velocities = xp.zeros_like(positions)
@@ -215,20 +297,28 @@ def main():
     energy_wp = wp.zeros(1, dtype=wp.float64, device=wp_device)
 
     lc = langevin_constants(args.dt, args.gamma, args.kT)
-    origin, cell = fixed_box(pos_host, args.cutoff)
     build_nl = make_neighbour_builder(args.neighbours, xp, on_gpu, args.cutoff,
-                                      origin, cell)
+                                      origin, cell, pbc)
     cutoff_sq = wp.float64(args.cutoff ** 2)
+    cell_t = wp.mat33d(np.ascontiguousarray(cell.T))   # S @ cell == cell.T @ S
 
-    def force_pass(i_wp, j_wp, npairs):
+    def force_pass(i_wp, j_wp, s_wp, npairs):
         forces_wp.zero_()
         energy_wp.zero_()
-        wp.launch(lj_forces, dim=npairs,
-                  inputs=[pos_wp, i_wp, j_wp, cutoff_sq, forces_wp, energy_wp],
-                  device=wp_device)
+        if s_wp is None:
+            wp.launch(lj_forces, dim=npairs,
+                      inputs=[pos_wp, i_wp, j_wp, cutoff_sq, forces_wp,
+                              energy_wp],
+                      device=wp_device)
+        else:
+            shift_wp = wp.from_dlpack(s_wp, dtype=wp.vec3i)
+            wp.launch(lj_forces_pbc, dim=npairs,
+                      inputs=[pos_wp, i_wp, j_wp, shift_wp, cell_t, cutoff_sq,
+                              forces_wp, energy_wp],
+                      device=wp_device)
 
-    def integrate(step):
-        wp.launch(langevin, dim=n,
+    def drift(step):
+        wp.launch(langevin_drift, dim=n,
                   inputs=[pos_wp, vel_wp, forces_wp,
                           wp.float64(lc["c0"]), wp.float64(lc["c1"]),
                           wp.float64(lc["c2"]), wp.float64(lc["dt"]),
@@ -237,31 +327,49 @@ def main():
                           wp.int32(step + 1)],
                   device=wp_device)
 
-    print(f"device={args.device}  neighbours={args.neighbours}  atoms={n}")
+    def kick():
+        wp.launch(langevin_kick, dim=n,
+                  inputs=[vel_wp, forces_wp, wp.float64(lc["c2"]),
+                          wp.float64(lc["dt"]), wp.float64(lc["mass"])],
+                  device=wp_device)
+
+    print(f"device={args.device}  neighbours={args.neighbours}  "
+          f"system={args.system}  atoms={n}")
 
     # Warm-up: build once and trigger the one-time Warp kernel compilation.
-    iw, jw, npairs = build_nl(positions)
-    force_pass(iw, jw, npairs)
-    integrate(0)
+    iw, jw, sw, npairs = build_nl(positions)
+    force_pass(iw, jw, sw, npairs)
     wp.synchronize_device(wp_device)
-    print(f"pairs~{npairs}")
+    # The kernel already carries the 1/2 factor for directed pairs.
+    print(f"pairs~{npairs}  E_pot={float(energy_wp.numpy()[0]):.6f}")
+    # One complete (untimed) step so both integrator kernels are compiled too.
+    drift(0)
+    iw, jw, sw, npairs = build_nl(positions)
+    force_pass(iw, jw, sw, npairs)
+    kick()
+    wp.synchronize_device(wp_device)
 
     out = open(args.out, "w") if args.out else None
     timer = Timer()
     for step in range(args.steps):
+        with timer("integrate"):
+            drift(step + 1)
+            wp.synchronize_device(wp_device)
         with timer("neighbour list"):
-            iw, jw, npairs = build_nl(positions)
+            iw, jw, sw, npairs = build_nl(positions)
             wp.synchronize_device(wp_device)
         with timer("LJ forces"):
-            force_pass(iw, jw, npairs)
+            force_pass(iw, jw, sw, npairs)
             wp.synchronize_device(wp_device)
         with timer("integrate"):
-            integrate(step)
+            kick()
             wp.synchronize_device(wp_device)
         if out is not None and step % args.write_every == 0:
-            e = 0.5 * float(energy_wp.numpy()[0])
+            e = float(energy_wp.numpy()[0])
             host = xp.asnumpy(positions) if on_gpu else np.asarray(positions)
-            write_xyz(out, host, f"step={step} E_pot={e:.4f}")
+            vel_host = xp.asnumpy(velocities) if on_gpu else np.asarray(velocities)
+            T = float((vel_host * vel_host).sum()) / (3.0 * n)
+            write_xyz(out, host, f"step={step} E_pot={e:.4f} T={T:.4f}")
     if out is not None:
         out.close()
 

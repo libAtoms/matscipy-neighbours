@@ -1,33 +1,57 @@
-# Lennard-Jones Langevin droplet
+# Lennard-Jones Langevin dynamics
 
-A self-bound Lennard-Jones liquid droplet (non-periodic) thermostatted with a
-Langevin integrator, in reduced LJ units (ε = σ = m = kB = 1). The integrator is
-the Allen–Tildesley scheme. Every implementation writes an XYZ trajectory.
+Lennard-Jones dynamics thermostatted with a Langevin integrator, in reduced LJ
+units (ε = σ = m = kB = 1). The integrator is the Allen–Tildesley scheme (drift
+and half kick with the old forces, neighbour list and forces at the new
+positions, second half kick; velocity Verlet in the zero-friction limit). Every
+implementation writes an XYZ trajectory and offers two systems (`--system`):
 
-Three implementations make the same physics but illustrate different points. The
+- **`droplet`** (default) — a self-bound liquid droplet in vacuum (non-periodic,
+  padded box; sparse cell grid).
+- **`liquid`** — a bulk liquid at reduced number density `--density` (default
+  0.8442) in a fully periodic cubic box, started from an FCC lattice filling
+  the box (dense cell grid; pairs across the boundary carry a cell shift `S`,
+  with `D = r[j] - r[i] + S @ cell`). With kT = 0.7 the default density is the
+  Verlet (1967) state point, also used by the LAMMPS LJ benchmark: a liquid at
+  positive pressure that does not cavitate at constant volume.
+
+The implementations make the same physics but illustrate different points. The
 library itself stays neighbour-list-only — all Lennard-Jones code lives in the
 examples.
 
 - **`lj_langevin.py`** — *prototyping (NumPy/CuPy)*. The neighbour list returns
   the distance vectors `D`, so the LJ force is a few array operations; per-atom
   forces are accumulated with a `bincount`-per-component scatter. The same code
-  runs on the CPU (NumPy) or the GPU (CuPy) via `--device`.
+  runs on the CPU (NumPy) or the GPU (CuPy) via `--device`, and the same code
+  handles both systems (the periodic shifts are already folded into `D`). The
+  virial pressure of the liquid is one more reduction over the same pair
+  arrays; temperature and pressure are written to the trajectory and averaged
+  over the second half of the run. From the lattice the liquid needs about
+  3000 steps to melt and equilibrate; at the default state point it then sits
+  at a pressure of about 0.8.
 - **`lj_langevin_jax.py`** — *JAX*. Uses the dense fixed-capacity
   `neighbour_matrix` (`array_namespace=jax.numpy`), so the shapes are static and
   the per-step force + Langevin update `jit`-compile once; forces are a masked
   sum over the neighbour axis (no scatter). The list is exchanged zero-copy
   through DLPack.
 - **`lj_langevin_cpu.cc` / `lj_langevin_gpu.cu`** — *performance*. The neighbour
-  list supplies only the `ij` connectivity; a single fused pass recomputes the
-  distances and accumulates the LJ force, never materialising per-pair arrays.
+  list supplies only the `ij` connectivity (plus the shift `S` for the periodic
+  liquid); a single fused pass recomputes the distances and accumulates the LJ
+  force, never materialising per-pair arrays.
 - **`lj_langevin_warp.py`** — *interop*. The LJ force/energy and the Langevin
   integrator are [NVIDIA Warp](https://github.com/NVIDIA/warp) kernels, but the
   neighbour list is built by this library — or, with `--neighbours vesin`, by
   [vesin](https://github.com/luthaf/vesin), feeding the *same* kernels.
-  Positions live in one device buffer shared zero-copy with Warp through DLPack.
-  Per-phase timing (build list / force / integrate) is reported with
+  Positions live in one device buffer shared zero-copy with Warp through DLPack;
+  the periodic kernel applies the shift array from the list. Per-phase timing
+  (build list / force / integrate) is reported with
   [muTimer](https://pypi.org/project/muTimer/), with the neighbour-list build
   listed separately. Needs `pip install warp-lang muTimer vesin`.
+
+Every implementation prints the initial potential energy `E_pot`; all of them
+agree on the same initial configuration for both systems and every list
+backend. `tests/test_examples.py` checks the array and C++ paths against a
+brute-force reference.
 
 ## Running
 
@@ -37,11 +61,13 @@ Python (needs the built extension on `PYTHONPATH`):
 export PYTHONPATH=$PWD/build:$PWD/language_bindings/python
 python examples/lj_langevin/lj_langevin.py     --device cpu --steps 2000 --out traj.xyz
 python examples/lj_langevin/lj_langevin.py     --device gpu --steps 2000 --out traj.xyz
+python examples/lj_langevin/lj_langevin.py     --system liquid --atoms 4000 --steps 2000 --out liquid.xyz
 python examples/lj_langevin/lj_langevin_jax.py --device cpu --steps 2000 --out traj.xyz
 
 # Warp kernels + this library's neighbour list (or vesin)
 python examples/lj_langevin/lj_langevin_warp.py --device gpu --neighbours matscipy --atoms 2000
 python examples/lj_langevin/lj_langevin_warp.py --device gpu --neighbours vesin    --atoms 2000
+python examples/lj_langevin/lj_langevin_warp.py --device gpu --system liquid       --atoms 2000
 ```
 
 C++ (built when `BUILD_EXAMPLES=ON`; the GPU binary needs `ENABLE_CUDA=ON`):
@@ -49,20 +75,25 @@ C++ (built when `BUILD_EXAMPLES=ON`; the GPU binary needs `ENABLE_CUDA=ON`):
 ```bash
 ./build/examples/lj_langevin/lj_langevin_cpu --steps 2000 --out traj.xyz
 ./build/examples/lj_langevin/lj_langevin_gpu --steps 2000 --out traj.xyz   # CUDA
+./build/examples/lj_langevin/lj_langevin_cpu --system liquid --atoms 4000 --steps 2000 --out liquid.xyz
 ```
 
-Common flags: `--ncells`, `--lattice`, `--dt`, `--gamma`, `--kT`, `--cutoff`,
+Common flags: `--system`, `--atoms` (exact atom count), `--ncells` (used when
+`--atoms` is 0: droplet radius, or liquid box edge in FCC cells), `--lattice`
+(droplet), `--density` (liquid), `--dt`, `--gamma`, `--kT`, `--cutoff`,
 `--steps`, `--write-every`, `--out`.
 
 ## Scaling benchmark
 
-`benchmark.py` sweeps logarithmically spaced droplet sizes (100, 1000, 10000, …
-up to GPU memory) over the full cross-product of **device** (CPU/GPU),
-**neighbour list** and **kernels** (Warp / array / JAX / C++), reports a combined
-`ms/step` table, and writes a time-vs-atoms plot faceted by kernel:
+`benchmark.py` sweeps logarithmically spaced system sizes (100, 1000, 10000, …
+up to GPU memory) for **both systems** over the full cross-product of **device**
+(CPU/GPU), **neighbour list** and **kernels** (Warp / array / JAX / C++), reports
+a combined `ms/step` table per system, and writes one time-vs-atoms plot per
+system (`benchmark_droplet.png`, `benchmark_liquid.png`) faceted by kernel:
 
 ```bash
 python examples/lj_langevin/benchmark.py --build build --doc-out docs/benchmark.md
+python examples/lj_langevin/benchmark.py --build build --systems liquid   # one system only
 ```
 
 The three neighbour-list backends are **matscipy-neighbours** (this library,
@@ -73,7 +104,7 @@ matscipy-neighbours list is run **single-threaded** (`OMP_NUM_THREADS=1`, the
 and vesin are single-threaded. vesin and matscipy 1.2.0 only feed the Warp and
 array kernels (JAX uses the dense `neighbour_matrix`, C++ uses the in-tree core),
 and matscipy 1.2.0 is CPU-only, so those cells are empty. See the
-[Benchmark](../../docs/benchmark.md) page for the generated table, plot and
+[Benchmark](../../docs/benchmark.md) page for the generated figures and
 discussion.
 
 The benchmark rows need `pip install jax warp-lang vesin muTimer matscipy==1.2.0`.

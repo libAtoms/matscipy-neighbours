@@ -4,6 +4,39 @@ All notable changes to matscipy-neighbours are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Examples and benchmark
+
+- The Lennard-Jones Langevin examples (NumPy/CuPy, JAX, Warp, C++ CPU and
+  CUDA) gain a second system, `--system liquid`: a bulk liquid at a chosen
+  reduced density in a fully periodic box, next to the existing droplet in
+  vacuum. The fused Warp and C++ kernels consume the cell-shift array `S` of
+  the list for the periodic case; the array and JAX kernels are unchanged
+  because the shifts are folded into the distance vectors.
+- `benchmark.py` sweeps both systems and writes one figure per system
+  (`docs/benchmark_droplet.png`, `docs/benchmark_liquid.png`); `--systems`
+  restricts the run, and older results files still replot.
+- The Langevin integrator in all example implementations applied the whole
+  force kick with the old forces; it now follows the Allen-Tildesley scheme
+  (half kick with the old forces, list and forces at the new positions, half
+  kick with the new forces), which reduces to velocity Verlet at zero
+  friction. The old scheme ran the droplet at 0.9 instead of 0.7 and heated
+  the periodic liquid until it exploded. The examples now write the kinetic
+  temperature to the trajectory.
+- The liquid's default density is 0.8442, the Verlet (1967) state point at
+  kT 0.7 (positive pressure, no cavitation at constant volume); the
+  benchmark driver takes `--density` and records it.
+- The NumPy/CuPy example computes the virial from the pair arrays and reports
+  the pressure of the periodic liquid.
+- The C++ examples print the potential energy, and the Warp example no longer
+  halves the energy twice.
+- `tests/test_examples.py` checks the array example's forces, energy and
+  virial against a brute-force reference for both systems, checks that the
+  integrator holds the target temperature with the liquid stable at positive
+  pressure, and, when built, compares the C++ example against the array
+  example.
+
 ## [1.0.0] - 2026-09-26
 
 Initial release. The neighbour-list code of
@@ -74,4 +107,5 @@ Python-free C++ core, an optional GPU backend and zero-copy array interop.
   references, benchmarks) and a Lennard-Jones Langevin example in C++, NumPy,
   JAX and Warp.
 
+[Unreleased]: https://github.com/libAtoms/matscipy-neighbours/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/libAtoms/matscipy-neighbours/releases/tag/v1.0.0

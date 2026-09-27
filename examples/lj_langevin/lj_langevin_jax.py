@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lennard-Jones liquid droplet with a Langevin thermostat — JAX.
+"""Lennard-Jones Langevin dynamics (droplet or periodic liquid) — JAX.
 
 Uses the dense fixed-capacity neighbour list (`neighbour_matrix`): each atom's
 neighbours occupy a row of an ``n x K`` matrix, so the shapes are static and the
@@ -7,8 +7,10 @@ per-step force + Langevin update can be `jit`-compiled once (no per-step
 recompilation). Forces are a masked sum over the neighbour axis — no scatter. The
 neighbour list is exchanged with JAX zero-copy through DLPack
 (`array_namespace=jax.numpy`). Select CPU or GPU with ``--device`` (the GPU path
-needs a CUDA build of JAX). Reduced LJ units (epsilon = sigma = mass = kB = 1);
-output is an XYZ trajectory.
+needs a CUDA build of JAX). ``--system liquid`` runs a bulk liquid in a fully
+periodic box instead of the droplet in vacuum; the periodic shifts are folded
+into the distance vectors of the dense list, so the kernel is unchanged.
+Reduced LJ units (epsilon = sigma = mass = kB = 1); output is an XYZ trajectory.
 """
 
 import argparse
@@ -42,6 +44,22 @@ def fcc_droplet_n(target_n, lattice):
     return np.ascontiguousarray(r[order[:target_n]], dtype=float)
 
 
+def fcc_liquid_n(target_n, density):
+    """Exactly ``target_n`` atoms on FCC sites filling a periodic cubic box at
+    the given number density; returns ``(positions, L)``. Same deterministic
+    site selection as the other implementations (see lj_langevin.py)."""
+    import math
+    basis = np.array([[0, 0, 0], [0.5, 0.5, 0], [0.5, 0, 0.5], [0, 0.5, 0.5]])
+    L = (target_n / density) ** (1.0 / 3.0)
+    ncells = int(math.ceil((target_n / 4.0) ** (1.0 / 3.0)))
+    a = L / ncells
+    span = range(ncells)
+    r = np.array([(np.array([ix, iy, iz]) + b) * a
+                  for ix in span for iy in span for iz in span for b in basis])
+    keep = (np.arange(target_n) * r.shape[0]) // target_n
+    return np.ascontiguousarray(r[keep], dtype=float), L
+
+
 def langevin_constants(dt, gamma, kT, mass=1.0):
     D = kT / (mass * gamma)
     c0 = np.exp(-gamma * dt)
@@ -55,10 +73,19 @@ def langevin_constants(dt, gamma, kT, mass=1.0):
 
 def make_step(jnp, jrandom, lc):
     """A jit-compiled Langevin step. The dense `(idx, dist, count)` have static
-    shapes, so this compiles once and reruns without recompilation."""
+    shapes, so this compiles once and reruns without recompilation.
+
+    The Allen-Tildesley scheme needs the forces at the new positions for the
+    second half kick, i.e. a neighbour-list rebuild in the middle of the step.
+    To keep one force evaluation per step, the step is shifted by half a kick:
+    it receives the list at the *current* positions, first finishes the
+    previous step's half kick with these (new) forces, then drifts the
+    positions and applies the half kick with the same (now old) forces.
+    ``finish`` is 0.0 on the very first step (nothing to finish) and 1.0
+    afterwards; passing it as a traced scalar avoids a recompilation."""
 
     @jax.jit
-    def step(positions, velocities, dist, count, key):
+    def step(positions, velocities, dist, count, key, finish):
         K = dist.shape[1]
         mask = jnp.arange(K)[None, :] < count[:, None]      # valid neighbours
         r2 = (dist * dist).sum(axis=-1)
@@ -68,18 +95,23 @@ def make_step(jnp, jrandom, lc):
         coef = jnp.where(mask, -24.0 * inv_r2 * inv_r6 * (2.0 * inv_r6 - 1.0), 0.0)
         forces = (coef[..., None] * dist).sum(axis=1)        # (n, 3), no scatter
         energy = 0.5 * jnp.where(mask, 4.0 * inv_r6 * (inv_r6 - 1.0), 0.0).sum()
+        a = forces / lc["mass"]
 
+        # Second half kick of the previous step (forces at the new positions).
+        velocities = velocities + finish * lc["c2"] * lc["dt"] * a
+        temperature = (velocities * velocities).sum() / (3.0 * positions.shape[0])
+
+        # Drift plus the first half kick of this step (forces at the old positions).
         k1, k2 = jrandom.split(key)
         g1 = jrandom.normal(k1, positions.shape)
         g2 = jrandom.normal(k2, positions.shape)
         gr = lc["sr"] * g1
         gv = lc["sv"] * (lc["crv"] * g1 + (1.0 - lc["crv"] ** 2) ** 0.5 * g2)
-        fm = forces / lc["mass"]
         positions = positions + lc["c1"] * lc["dt"] * velocities + \
-            lc["c2"] * lc["dt"] ** 2 * fm + gr
-        velocities = velocities + (lc["c0"] - 1.0) * velocities + \
-            lc["c1"] * lc["dt"] * fm + gv
-        return positions, velocities, energy
+            lc["c2"] * lc["dt"] ** 2 * a + gr
+        velocities = lc["c0"] * velocities + \
+            (lc["c1"] - lc["c2"]) * lc["dt"] * a + gv
+        return positions, velocities, energy, temperature
 
     return step
 
@@ -99,10 +131,19 @@ jax = None
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--device", choices=["cpu", "gpu"], default="cpu")
-    ap.add_argument("--ncells", type=int, default=6)
+    ap.add_argument("--system", choices=["droplet", "liquid"], default="droplet",
+                    help="droplet in vacuum (non-periodic) or bulk liquid in a "
+                         "periodic box")
+    ap.add_argument("--ncells", type=int, default=6,
+                    help="FCC cells each way (droplet: radius; liquid: box "
+                         "edge, 4*ncells^3 atoms) unless --atoms is given")
     ap.add_argument("--atoms", type=int, default=0,
                     help="exact atom count (overrides --ncells if > 0)")
-    ap.add_argument("--lattice", type=float, default=1.6)
+    ap.add_argument("--lattice", type=float, default=1.6,
+                    help="droplet FCC lattice constant")
+    ap.add_argument("--density", type=float, default=0.8442,
+                    help="liquid number density (reduced units); the default "
+                         "with kT=0.7 is the Verlet (1967) liquid state point")
     ap.add_argument("--steps", type=int, default=2000)
     ap.add_argument("--dt", type=float, default=0.005)
     ap.add_argument("--gamma", type=float, default=1.0)
@@ -127,12 +168,18 @@ def main():
     dev = devices[0]
 
     cutoff, K = args.cutoff, args.max_neighbours
-    if args.atoms > 0:
+    if args.system == "liquid":
+        n_target = args.atoms if args.atoms > 0 else 4 * args.ncells ** 3
+        pos_np, L = fcc_liquid_n(n_target, args.density)
+        lo, pbc = 0.0, True
+    elif args.atoms > 0:
         pos_np = fcc_droplet_n(args.atoms, args.lattice)
         half = float(abs(pos_np).max()) + cutoff + 5.0
+        lo, L, pbc = -half, 2.0 * half, False
     else:
         pos_np = fcc_droplet(args.ncells, args.lattice)
         half = args.ncells * args.lattice + cutoff + 5.0
+        lo, L, pbc = -half, 2.0 * half, False
     n = pos_np.shape[0]
     positions = jax.device_put(jnp.asarray(pos_np), dev)
     velocities = jnp.zeros_like(positions)
@@ -140,20 +187,20 @@ def main():
     key = jrandom.PRNGKey(12345)
     step = make_step(jnp, jrandom, lc)
 
-    L = 2.0 * half
-    origin = np.ascontiguousarray(np.full(3, -half))
+    origin = np.ascontiguousarray(np.full(3, lo))
     cell = np.ascontiguousarray(np.diag([L, L, L]).astype(float))
 
     def neighbours(p):
         return neighbour_matrix(positions=p, cell=cell, cell_origin=origin,
-                                pbc=False, cutoff=cutoff, max_neighbours=K,
+                                pbc=pbc, cutoff=cutoff, max_neighbours=K,
                                 array_namespace=jnp)
 
     _, dist, count = neighbours(positions)
-    print(f"device={args.device}  atoms={n}  K={K}  backend={dev.platform}")
+    print(f"device={args.device}  system={args.system}  atoms={n}  K={K}  "
+          f"backend={dev.platform}")
 
     # Warm up: trigger the one-time jit compilation before timing.
-    _wp, _wv, _ = step(positions, velocities, dist, count, key)
+    _wp, _wv, _, _ = step(positions, velocities, dist, count, key, 1.0)
     jax.block_until_ready(_wp)
 
     out = open(args.out, "w")
@@ -162,12 +209,12 @@ def main():
     energy = 0.0
     for s in range(args.steps):
         key, sub = jrandom.split(key)
-        positions, velocities, energy = step(positions, velocities, dist, count,
-                                             sub)
+        positions, velocities, energy, temperature = step(
+            positions, velocities, dist, count, sub, 0.0 if s == 0 else 1.0)
         _, dist, count = neighbours(positions)
         if s % args.write_every == 0:
             write_xyz(out, np.asarray(positions),
-                      f"step={s} E_pot={float(energy):.4f}")
+                      f"step={s} E_pot={float(energy):.4f} T={float(temperature):.4f}")
     jax.block_until_ready(positions)
     elapsed = time.perf_counter() - t0
     out.close()

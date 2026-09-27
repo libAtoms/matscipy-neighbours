@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Unified scaling benchmark for the LJ Langevin droplet examples.
+"""Unified scaling benchmark for the LJ Langevin examples.
 
-Runs the per-step wall time of the droplet across a logarithmic range of sizes
-for the full cross-product of three dimensions:
+Runs the per-step wall time across a logarithmic range of sizes for two
+systems -- the self-bound **droplet** in vacuum (non-periodic, sparse grid)
+and the bulk **liquid** in a periodic box (dense grid, periodic images) -- for
+the full cross-product of three dimensions:
 
     device   : CPU / GPU
     list     : matscipy (this library) / vesin (https://github.com/luthaf/vesin)
@@ -16,8 +18,8 @@ threading controls the matscipy list (and the C++ OpenMP force loop). vesin's
 CPU list is single-threaded.
 
 Each configuration is launched as a subprocess and its printed `ms/step` is
-parsed. Output: a console table, a JSON file of raw timings, and a log-log plot of time vs. number of atoms,
-faceted by kernel.
+parsed. Output: a console table per system, a JSON file of raw timings, and
+per system a log-log plot of time vs. number of atoms, faceted by kernel.
 """
 
 import argparse
@@ -38,6 +40,10 @@ def usable_cores():
         return len(os.sched_getaffinity(0))
     except AttributeError:
         return os.cpu_count()
+
+SYSTEM_ORDER = ["droplet", "liquid"]
+SYSTEM_NAME = {"droplet": "LJ droplet (vacuum, non-periodic)",
+               "liquid": "LJ liquid (periodic box)"}
 
 KERNEL_NAME = {"warp": "Warp", "array": "array (NumPy/CuPy)", "jax": "JAX",
                "cpp": "C++"}
@@ -133,19 +139,21 @@ def adaptive_steps(base, atoms):
     return max(5, min(base, round(base * 20000 / max(atoms, 1))))
 
 
-def build_command(cfg, atoms, steps, build, base_env):
+def build_command(cfg, system, density, atoms, steps, build, base_env):
     """Return (cmd, env) for one configuration, or None if its binary/script is
     missing."""
     env = dict(base_env)
     if cfg["device"] == "cpu" and cfg["nl"] == "matscipy":
         env["OMP_NUM_THREADS"] = "1" if cfg["threads"] == "1t" else \
             str(usable_cores())
-    common = ["--atoms", str(atoms), "--steps", str(steps),
+    common = ["--system", system, "--density", str(density),
+              "--atoms", str(atoms), "--steps", str(steps),
               "--write-every", str(steps + 1), "--out", os.devnull]
     kernel = cfg["kernel"]
     if kernel == "warp":
         return [sys.executable, os.path.join(HERE, "lj_langevin_warp.py"),
                 "--device", cfg["device"], "--neighbours", cfg["nl"],
+                "--system", system, "--density", str(density),
                 "--atoms", str(atoms), "--steps", str(steps)], env
     if kernel == "array":
         return [sys.executable, os.path.join(HERE, "lj_langevin.py"),
@@ -164,10 +172,10 @@ def build_command(cfg, atoms, steps, build, base_env):
     return None
 
 
-def run(cfg, atoms, base_steps, build, base_env, timeout):
+def run(cfg, system, density, atoms, base_steps, build, base_env, timeout):
     """Run one point; return per-step ms (float) or None on failure."""
     steps = adaptive_steps(base_steps, atoms)
-    built = build_command(cfg, atoms, steps, build, base_env)
+    built = build_command(cfg, system, density, atoms, steps, build, base_env)
     if built is None:
         return None
     cmd, env = built
@@ -204,7 +212,7 @@ def within_budget(points, atoms, base_steps, budget):
     return budget is None or predicted is None or predicted <= budget
 
 
-def make_plot(cfgs, sizes, path):
+def make_plot(cfgs, sizes, path, system):
     """2x2 log-log facets (one per kernel): time per step vs. number of atoms."""
     import matplotlib
     matplotlib.use("Agg")
@@ -231,7 +239,7 @@ def make_plot(cfgs, sizes, path):
         ax.set_ylabel("time per step (ms)")
         if ax.has_data():
             ax.legend(fontsize=8)
-    fig.suptitle("LJ droplet — time vs. number of atoms "
+    fig.suptitle(f"{SYSTEM_NAME[system]} — time vs. number of atoms "
                  "(device × neighbour list × kernels)", fontsize=13)
     fig.tight_layout()
     fig.savefig(path, dpi=120)
@@ -250,17 +258,69 @@ def table_markdown(cfgs, sizes):
     return "\n".join(lines)
 
 
-def write_doc_page(path, plot_name, meta):
+def write_doc_page(path, plot_names, meta):
+    """Write the documentation page. ``plot_names`` maps system -> image file
+    name (relative to the page)."""
     sizes = meta["sizes"]
     cpu_cap = meta.get("max_atoms_cpu")
     cpu_range = (f"\nCPU runs stop at {cpu_cap:,} atoms; the GPU runs cover the "
                  f"full range." if cpu_cap else "")
+    sections = {
+        "droplet": f"""## Droplet in vacuum
+
+A self-bound liquid droplet in a **non-periodic**, generously padded box: most
+of the cell grid is empty, so this exercises the sparse (hashed) grid and a
+list without periodic images.
+
+![Droplet: time vs. number of atoms]({plot_names.get("droplet", "")})
+
+How to read it:
+
+- The neighbour-list build dominates the step, so the **list** choice drives the
+  scaling: matscipy-neighbours' cell list stays close to linear on both devices
+  (on the GPU up to the largest size), the classic matscipy 1.2.0 list is a
+  single-threaded CPU reference, and vesin's GPU path grows super-linearly and
+  falls far behind for these large, low-density droplets.
+- The **kernel** choice mostly shifts the curve: the fused C++/CUDA and Warp
+  kernels avoid materialising per-pair arrays, the array (NumPy/CuPy) path is the
+  simplest, and JAX `jit`-compiles a dense masked sum.
+- On the CPU, the matscipy-neighbours `(mt)` curves pull away from `(1t)` as the
+  system grows (at small sizes the thread start-up cost dominates); and from
+  about 10⁵ atoms on, even single-threaded matscipy-neighbours `(1t)` is faster
+  than the classic matscipy 1.2.0 and vesin CPU lists.
+""",
+        "liquid": f"""## Bulk liquid in a periodic box
+
+A homogeneous liquid at reduced number density {meta.get("density", 0.8442):g}
+in a **fully periodic** cubic box: every grid cell is occupied (dense grid), and
+pairs across the boundary carry a non-zero cell shift. At temperature 0.7 the
+default density is the Verlet (1967) state point (also the LAMMPS LJ
+benchmark's), a liquid at positive pressure well away from coexistence. This is the geometry a
+bulk molecular-dynamics or structure-analysis workload sees, and it removes the
+vacuum that favours cell lists in the droplet case, so it is the fairer
+comparison between the list implementations.
+
+![Liquid: time vs. number of atoms]({plot_names.get("liquid", "")})
+
+How to read it:
+
+- The same list/kernel combinations as above; compare curve by curve with the
+  droplet figure. Per atom the liquid has more neighbours within the cutoff
+  than the droplet's surface-heavy clusters, so the absolute times are higher
+  and the per-pair cost is the better like-for-like number.
+- The periodic shifts are folded into the distance vectors by the list (array
+  and JAX kernels) or applied from the shift array in the fused kernels (Warp
+  and C++), so no kernel wraps positions itself; atoms are free to drift out
+  of the box.
+""",
+    }
     body = f"""# Benchmark
 
-Per-step wall time of the [Lennard-Jones Langevin droplet](examples.md) example
-across droplet sizes, for the full cross-product of **device** (CPU / GPU),
-**neighbour list** and **kernels** (Warp / array (NumPy/CuPy) / JAX / C++).
-Lower is better. The neighbour-list backends are:
+Per-step wall time of the [Lennard-Jones Langevin](examples.md) example for two
+systems — a **droplet in vacuum** (non-periodic) and a **bulk liquid in a
+periodic box** — across system sizes, for the full cross-product of **device**
+(CPU / GPU), **neighbour list** and **kernels** (Warp / array (NumPy/CuPy) /
+JAX / C++). Lower is better. The neighbour-list backends are:
 
 - **matscipy-neighbours** — this library (`matscipy_neighbours`), CPU + GPU;
 - **matscipy 1.2.0** — the classic [`matscipy`](https://pypi.org/project/matscipy/)
@@ -293,25 +353,13 @@ Lower is better. The neighbour-list backends are:
 Run configuration: reduced LJ units, cutoff 2.5, dt 0.005, friction 1.0,
 temperature 0.7; sizes from {sizes[0]:,} to {sizes[-1]:,} atoms.{cpu_range}
 Up to {meta["steps"]} steps per point (fewer for the largest systems; JAX and
-Warp are compiled once during an untimed warm-up).
+Warp are compiled once during an untimed warm-up). Both systems start from an
+FCC lattice; the droplet uses lattice constant 1.6, the liquid fills its box at
+the stated density.
 
-![Time vs. number of atoms]({plot_name})
-
-How to read it:
-
-- The neighbour-list build dominates the step, so the **list** choice drives the
-  scaling: matscipy-neighbours' cell list stays close to linear on both devices
-  (on the GPU up to the largest size), the classic matscipy 1.2.0 list is a
-  single-threaded CPU reference, and vesin's GPU path grows super-linearly and
-  falls far behind for these large, low-density droplets.
-- The **kernel** choice mostly shifts the curve: the fused C++/CUDA and Warp
-  kernels avoid materialising per-pair arrays, the array (NumPy/CuPy) path is the
-  simplest, and JAX `jit`-compiles a dense masked sum.
-- On the CPU, the matscipy-neighbours `(mt)` curves pull away from `(1t)` as the
-  system grows (at small sizes the thread start-up cost dominates); and from
-  about 10⁵ atoms on, even single-threaded matscipy-neighbours `(1t)` is faster
-  than the classic matscipy 1.2.0 and vesin CPU lists.
-
+"""
+    body += "\n".join(sections[sy] for sy in meta["systems"] if sy in sections)
+    body += """
 This page is generated by `examples/lj_langevin/benchmark.py`. Regenerate it on
 your own hardware with:
 
@@ -320,8 +368,9 @@ python examples/lj_langevin/benchmark.py --build build --doc-out docs/benchmark.
 ```
 
 The raw timings are written to `--results-out` (JSON); pass that file to
-`--replot` to redraw the plot and this page without re-running the benchmark.
-For the C++ curves, build with `-DBUILD_EXAMPLES=ON` (and `-DENABLE_CUDA=ON` for
+`--replot` to redraw the plots and this page without re-running the benchmark.
+`--systems droplet` or `--systems liquid` restricts the run to one system. For
+the C++ curves, build with `-DBUILD_EXAMPLES=ON` (and `-DENABLE_CUDA=ON` for
 the GPU binary); the others need `pip install jax warp-lang vesin muTimer
 matscipy==1.2.0 matplotlib` in the interpreter that runs this driver.
 """
@@ -334,6 +383,13 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--build", default=os.path.join(HERE, "..", "..", "build"),
                     help="CMake build directory (C++ binaries + Python extension)")
+    ap.add_argument("--systems", choices=SYSTEM_ORDER, nargs="+",
+                    default=list(SYSTEM_ORDER),
+                    help="which systems to run (default: both)")
+    ap.add_argument("--density", type=float, default=0.8442,
+                    help="number density of the periodic liquid (reduced "
+                         "units); the default with kT=0.7 is the Verlet (1967) "
+                         "liquid state point")
     ap.add_argument("--sizes", type=int, nargs="+",
                     default=[100, 1000, 10000, 100000, 1000000])
     ap.add_argument("--max-atoms-cpu", type=int, default=None,
@@ -349,8 +405,9 @@ def main():
                          "single-threaded CPU runs from dominating the runtime")
     ap.add_argument("--timeout", type=int, default=300,
                     help="per-run timeout in seconds (safety net)")
-    ap.add_argument("--plot-out", default=os.path.join(HERE, "..", "..",
-                                                       "docs", "benchmark.png"))
+    ap.add_argument("--plot-dir", default=os.path.join(HERE, "..", "..", "docs"),
+                    help="directory for the plots, one benchmark_<system>.png "
+                         "per system")
     ap.add_argument("--doc-out", default=None,
                     help="write a documentation page (with hardware info) here")
     ap.add_argument("--results-out", default=None,
@@ -363,7 +420,12 @@ def main():
     if args.replot:
         with open(args.replot) as fh:
             saved = json.load(fh)
-        finish(saved["configs"], saved["meta"], args)
+        if "systems" in saved:
+            results = saved["systems"]
+        else:   # results file from before the liquid system was added
+            results = {"droplet": saved["configs"]}
+        saved["meta"].setdefault("systems", list(results))
+        finish(results, saved["meta"], args)
         return
 
     build = os.path.abspath(args.build)
@@ -372,57 +434,70 @@ def main():
                     PYTHONPATH=os.pathsep.join(
                         [build, pkg, os.environ.get("PYTHONPATH", "")]))
 
-    cfgs = make_configs()
-    for cfg in cfgs:
-        if not cfg["supported"]:
-            continue
-        cfg["points"] = []
-        for atoms in args.sizes:
-            if (cfg["device"] == "cpu" and args.max_atoms_cpu is not None
-                    and atoms > args.max_atoms_cpu):
-                break
-            if not within_budget(cfg["points"], atoms, args.steps,
-                                 args.max_run_seconds):
-                print(f"  {label(cfg):44s} atoms={atoms} -> predicted run "
-                      f"exceeds {args.max_run_seconds:g} s; stopping this "
-                      f"configuration", file=sys.stderr)
-                break
-            ms = run(cfg, atoms, args.steps, build, base_env, args.timeout)
-            if ms is None:
-                print(f"  {label(cfg):44s} atoms={atoms} -> failed/timed out "
-                      f"(out of memory?); stopping this configuration",
-                      file=sys.stderr)
-                break
-            if cfg["points"]:
-                pa, pm = cfg["points"][-1]
-                if (ms / pm) / (atoms / pa) > THRASH_GROWTH:
-                    print(f"  {label(cfg):44s} atoms={atoms} -> {ms:.0f} ms/step "
-                          f"looks like a memory-thrash artifact (super-linear "
-                          f"blow-up); dropping and stopping", file=sys.stderr)
+    results = {}
+    for system in args.systems:
+        print(f"=== {SYSTEM_NAME[system]}", file=sys.stderr)
+        cfgs = make_configs()
+        results[system] = cfgs
+        for cfg in cfgs:
+            if not cfg["supported"]:
+                continue
+            cfg["points"] = []
+            for atoms in args.sizes:
+                if (cfg["device"] == "cpu" and args.max_atoms_cpu is not None
+                        and atoms > args.max_atoms_cpu):
                     break
-            cfg["points"].append((atoms, ms))
-            print(f"  {label(cfg):44s} atoms={atoms:>8d} -> {ms:.2f} ms/step",
-                  file=sys.stderr)
+                if not within_budget(cfg["points"], atoms, args.steps,
+                                     args.max_run_seconds):
+                    print(f"  {label(cfg):44s} atoms={atoms} -> predicted run "
+                          f"exceeds {args.max_run_seconds:g} s; stopping this "
+                          f"configuration", file=sys.stderr)
+                    break
+                ms = run(cfg, system, args.density, atoms, args.steps, build,
+                         base_env, args.timeout)
+                if ms is None:
+                    print(f"  {label(cfg):44s} atoms={atoms} -> failed/timed "
+                          f"out (out of memory?); stopping this configuration",
+                          file=sys.stderr)
+                    break
+                if cfg["points"]:
+                    pa, pm = cfg["points"][-1]
+                    if (ms / pm) / (atoms / pa) > THRASH_GROWTH:
+                        print(f"  {label(cfg):44s} atoms={atoms} -> {ms:.0f} "
+                              f"ms/step looks like a memory-thrash artifact "
+                              f"(super-linear blow-up); dropping and stopping",
+                              file=sys.stderr)
+                        break
+                cfg["points"].append((atoms, ms))
+                print(f"  {label(cfg):44s} atoms={atoms:>8d} -> {ms:.2f} ms/step",
+                      file=sys.stderr)
 
     meta = dict(cpu=detect_cpu(), gpu=detect_gpu(), ncores=usable_cores(),
-                sizes=args.sizes, steps=args.steps, timeout=args.timeout,
-                max_run_seconds=args.max_run_seconds,
+                systems=args.systems, density=args.density,
+                sizes=args.sizes, steps=args.steps,
+                timeout=args.timeout, max_run_seconds=args.max_run_seconds,
                 max_atoms_cpu=args.max_atoms_cpu)
     if args.results_out:
         with open(args.results_out, "w") as fh:
-            json.dump(dict(meta=meta, configs=cfgs), fh, indent=1)
+            json.dump(dict(meta=meta, systems=results), fh, indent=1)
         print(f"wrote {args.results_out}", file=sys.stderr)
-    finish(cfgs, meta, args)
+    finish(results, meta, args)
 
 
-def finish(cfgs, meta, args):
-    """Plot, print the console table, and optionally write the doc page."""
-    plot_path = os.path.abspath(args.plot_out)
-    make_plot(cfgs, meta["sizes"], plot_path)
-    print("\n" + table_markdown(cfgs, meta["sizes"]) + "\n\n(values are ms/step)")
+def finish(results, meta, args):
+    """Plot and print the console table per system, and optionally write the
+    doc page."""
+    plot_dir = os.path.abspath(args.plot_dir)
+    os.makedirs(plot_dir, exist_ok=True)
+    plot_names = {}
+    for system, cfgs in results.items():
+        plot_names[system] = f"benchmark_{system}.png"
+        make_plot(cfgs, meta["sizes"], os.path.join(plot_dir, plot_names[system]),
+                  system)
+        print(f"\n### {SYSTEM_NAME[system]}\n\n"
+              + table_markdown(cfgs, meta["sizes"]) + "\n\n(values are ms/step)")
     if args.doc_out:
-        write_doc_page(os.path.abspath(args.doc_out),
-                       os.path.basename(plot_path), meta)
+        write_doc_page(os.path.abspath(args.doc_out), plot_names, meta)
         print(f"\nwrote {args.doc_out}", file=sys.stderr)
 
 

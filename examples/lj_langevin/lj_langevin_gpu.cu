@@ -1,8 +1,9 @@
 /*
- * Lennard-Jones liquid droplet with a Langevin thermostat — GPU (CUDA).
+ * Lennard-Jones Langevin dynamics (droplet or periodic liquid) — GPU (CUDA).
  *
  * Mirrors the CPU example: the neighbour list provides the device-resident `ij`
- * connectivity, then a fused kernel recomputes the distance vectors and
+ * connectivity (plus the cell shift `S` for the periodic liquid), then a fused
+ * kernel recomputes the distance vectors D = r[j] - r[i] + S @ cell and
  * accumulates the LJ force per atom. The Langevin update runs in a second kernel
  * with a per-atom cuRAND stream. Positions stay on the device; only the XYZ
  * frames are copied back.
@@ -54,16 +55,25 @@ __global__ void k_init_rng(curandState *st, index_t n, unsigned long long seed) 
     if (a < n) curand_init(seed, a, 0, &st[a]);
 }
 
-/* Fused LJ force pass: recompute the distance from positions, accumulate onto
-   atom i (each directed pair contributes to its own i). */
+/* Fused LJ force pass: recompute the distance from positions (plus the
+   periodic shift when `shift` is non-null), accumulate onto atom i (each
+   directed pair contributes to its own i) and the potential energy. */
 __global__ void k_lj_forces(const index_t *first, const index_t *secnd,
+                            const index_t *shift, lj::Cell cell,
                             index_t npairs, const double *pos, double *f,
-                            double rc2) {
+                            double *epot, double rc2) {
     index_t p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= npairs) return;
     const index_t i = first[p], j = secnd[p];
-    const double dx = pos[3 * j] - pos[3 * i], dy = pos[3 * j + 1] - pos[3 * i + 1],
-                 dz = pos[3 * j + 2] - pos[3 * i + 2];
+    double dx = pos[3 * j] - pos[3 * i], dy = pos[3 * j + 1] - pos[3 * i + 1],
+           dz = pos[3 * j + 2] - pos[3 * i + 2];
+    if (shift) {
+        const double s0 = shift[3 * p], s1 = shift[3 * p + 1],
+                     s2 = shift[3 * p + 2];
+        dx += s0 * cell.m[0] + s1 * cell.m[3] + s2 * cell.m[6];
+        dy += s0 * cell.m[1] + s1 * cell.m[4] + s2 * cell.m[7];
+        dz += s0 * cell.m[2] + s1 * cell.m[5] + s2 * cell.m[8];
+    }
     const double r2 = dx * dx + dy * dy + dz * dz;
     if (r2 >= rc2) return;
     const double ir2 = 1.0 / r2, ir6 = ir2 * ir2 * ir2;
@@ -71,10 +81,13 @@ __global__ void k_lj_forces(const index_t *first, const index_t *secnd,
     atomicAddD(&f[3 * i], coef * dx);
     atomicAddD(&f[3 * i + 1], coef * dy);
     atomicAddD(&f[3 * i + 2], coef * dz);
+    atomicAddD(epot, 2.0 * ir6 * (ir6 - 1.0));  /* 4 eps (...) / 2: directed pairs */
 }
 
-__global__ void k_langevin(double *pos, double *vel, const double *f, index_t n,
-                           lj::Langevin lc, curandState *st) {
+/* First half of an Allen-Tildesley Langevin step: move the positions; friction,
+   noise and the half kick with the *old* forces on the velocities. */
+__global__ void k_langevin_drift(double *pos, double *vel, const double *f,
+                                 index_t n, lj::Langevin lc, curandState *st) {
     index_t a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= n) return;
     curandState s = st[a];
@@ -86,9 +99,17 @@ __global__ void k_langevin(double *pos, double *vel, const double *f, index_t n,
         const double gv = lc.sv * (lc.crv * g1 + kk * g2);
         const double fm = f[q] / lc.mass;
         pos[q] += lc.c1 * lc.dt * vel[q] + lc.c2 * lc.dt * lc.dt * fm + gr;
-        vel[q] += (lc.c0 - 1.0) * vel[q] + lc.c1 * lc.dt * fm + gv;
+        vel[q] = lc.c0 * vel[q] + (lc.c1 - lc.c2) * lc.dt * fm + gv;
     }
     st[a] = s;
+}
+
+/* Second half: the half kick with the *new* forces. */
+__global__ void k_langevin_kick(double *vel, const double *f, index_t n,
+                                lj::Langevin lc) {
+    index_t q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= 3 * n) return;
+    vel[q] += lc.c2 * lc.dt * f[q] / lc.mass;
 }
 
 static double argd(int argc, char **argv, const char *key, double def) {
@@ -103,9 +124,11 @@ static const char *args(int argc, char **argv, const char *key, const char *def)
 }
 
 int main(int argc, char **argv) {
+    const std::string system = args(argc, argv, "--system", "droplet");
     const int ncells = (int)argd(argc, argv, "--ncells", 6);
     const index_t atoms = (index_t)argd(argc, argv, "--atoms", 0);
     const real_t lattice = argd(argc, argv, "--lattice", 1.6);
+    const real_t density = argd(argc, argv, "--density", 0.8442);
     const int steps = (int)argd(argc, argv, "--steps", 300);
     const real_t dt = argd(argc, argv, "--dt", 0.005);
     const real_t gamma = argd(argc, argv, "--gamma", 1.0);
@@ -115,25 +138,26 @@ int main(int argc, char **argv) {
     const char *outfile = args(argc, argv, "--out", "traj_gpu.xyz");
 
     std::vector<real_t> pos;
-    const index_t n = atoms > 0 ? lj::fcc_droplet_n(atoms, lattice, pos)
-                                : lj::fcc_droplet(ncells, lattice, pos);
+    real_t origin[3], cell[9], inv_cell[9];
+    bool periodic;
+    const index_t n = lj::make_system(system, atoms, ncells, lattice, density,
+                                      cutoff, pos, origin, cell, inv_cell,
+                                      periodic);
     std::vector<real_t> host_pos(3 * n);
 
-    real_t origin[3], cell[9], inv_cell[9];
-    if (atoms > 0)
-        lj::fixed_box_pos(pos, cutoff, origin, cell, inv_cell);
-    else
-        lj::fixed_box(ncells, lattice, cutoff, origin, cell, inv_cell);
-    const bool pbc[3] = {false, false, false};
+    const bool pbc[3] = {periodic, periodic, periodic};
+    lj::Cell cell_val;
+    for (int k = 0; k < 9; k++) cell_val.m[k] = cell[k];
     const lj::Langevin lc = lj::langevin_constants(dt, gamma, kT);
     const real_t rc2 = cutoff * cutoff;
     const int BLK = 256;
 
-    double *d_pos, *d_vel, *d_f;
+    double *d_pos, *d_vel, *d_f, *d_e;
     curandState *d_st;
     CUDA_CHECK(cudaMalloc(&d_pos, 3 * n * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_vel, 3 * n * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_f, 3 * n * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_e, sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_st, n * sizeof(curandState)));
     CUDA_CHECK(cudaMemcpy(d_pos, pos.data(), 3 * n * sizeof(double),
                           cudaMemcpyHostToDevice));
@@ -141,7 +165,8 @@ int main(int argc, char **argv) {
     k_init_rng<<<(n + BLK - 1) / BLK, BLK>>>(d_st, n, 12345ULL);
 
     NeighbourListRequest req;
-    req.quantities = QUANTITY_FIRST | QUANTITY_SECOND;
+    req.quantities = QUANTITY_FIRST | QUANTITY_SECOND |
+                     (periodic ? QUANTITY_SHIFT : 0);
     req.cell_origin = origin;
     req.cell = cell;
     req.inv_cell = inv_cell;
@@ -158,35 +183,49 @@ int main(int argc, char **argv) {
         neighbour_list_gpu_device(req, dev);
         npairs = dev.npairs;
         CUDA_CHECK(cudaMemset(d_f, 0, 3 * n * sizeof(double)));
+        CUDA_CHECK(cudaMemset(d_e, 0, sizeof(double)));
         k_lj_forces<<<((int)npairs + BLK - 1) / BLK, BLK>>>(
-            dev.first.data(), dev.secnd.data(), npairs, d_pos, d_f, rc2);
+            dev.first.data(), dev.secnd.data(),
+            periodic ? dev.shift.data() : nullptr, cell_val, npairs, d_pos,
+            d_f, d_e, rc2);
+    };
+    auto energy = [&]() {
+        double e;
+        CUDA_CHECK(cudaMemcpy(&e, d_e, sizeof(double), cudaMemcpyDeviceToHost));
+        return e;
     };
 
     compute_forces();
     CUDA_CHECK(cudaDeviceSynchronize());
-    std::printf("device=gpu  atoms=%d  pairs~%d\n", (int)n, (int)npairs);
+    std::printf("device=gpu  system=%s  atoms=%lld  pairs~%lld  E_pot=%.6f\n",
+                system.c_str(), (long long)n, (long long)npairs, energy());
 
     std::ofstream out(outfile);
     const auto t0 = clock_type::now();
     for (int step = 0; step < steps; step++) {
-        k_langevin<<<(n + BLK - 1) / BLK, BLK>>>(d_pos, d_vel, d_f, n, lc, d_st);
+        k_langevin_drift<<<(n + BLK - 1) / BLK, BLK>>>(d_pos, d_vel, d_f, n, lc,
+                                                       d_st);
         compute_forces();
+        k_langevin_kick<<<(3 * n + BLK - 1) / BLK, BLK>>>(d_vel, d_f, n, lc);
         if (step % write_every == 0) {
             CUDA_CHECK(cudaMemcpy(host_pos.data(), d_pos, 3 * n * sizeof(double),
                                   cudaMemcpyDeviceToHost));
-            lj::write_xyz(out, host_pos.data(), n, "step=" + std::to_string(step));
+            lj::write_xyz(out, host_pos.data(), n,
+                          "step=" + std::to_string(step) +
+                              " E_pot=" + std::to_string(energy()));
         }
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     const double elapsed =
         std::chrono::duration<double>(clock_type::now() - t0).count();
-    const double per_step = elapsed / steps;
+    const double per_step = elapsed / std::max(steps, 1);
     std::printf("steps=%d  total=%.3fs  %.3f ms/step  %.1f ns/pair\n", steps,
                 elapsed, per_step * 1e3, per_step * 1e9 / npairs);
 
     cudaFree(d_pos);
     cudaFree(d_vel);
     cudaFree(d_f);
+    cudaFree(d_e);
     cudaFree(d_st);
     return 0;
 }
