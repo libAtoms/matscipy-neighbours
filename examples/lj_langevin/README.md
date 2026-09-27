@@ -41,12 +41,16 @@ examples.
 - **`lj_langevin_warp.py`** — *interop*. The LJ force/energy and the Langevin
   integrator are [NVIDIA Warp](https://github.com/NVIDIA/warp) kernels, but the
   neighbour list is built by this library — or, with `--neighbours vesin`, by
-  [vesin](https://github.com/luthaf/vesin), feeding the *same* kernels.
+  [vesin](https://github.com/luthaf/vesin), or with `--neighbours alchemi` by
+  NVIDIA ALCHEMI's [nvalchemiops](https://github.com/NVIDIA/nvalchemi-toolkit-ops)
+  (GPU only), feeding the *same* kernels. `--format matrix` switches from the
+  pair list to the fixed-capacity neighbour matrix (matscipy and ALCHEMI).
   Positions live in one device buffer shared zero-copy with Warp through DLPack;
   the periodic kernel applies the shift array from the list. Per-phase timing
   (build list / force / integrate) is reported with
   [muTimer](https://pypi.org/project/muTimer/), with the neighbour-list build
-  listed separately. Needs `pip install warp-lang muTimer vesin`.
+  listed separately. Needs `pip install warp-lang muTimer vesin` (plus
+  `nvalchemi-toolkit-ops` and a CUDA build of PyTorch for ALCHEMI).
 
 Every implementation prints the initial potential energy `E_pot`; all of them
 agree on the same initial configuration for both systems and every list
@@ -67,6 +71,7 @@ python examples/lj_langevin/lj_langevin_jax.py --device cpu --steps 2000 --out t
 # Warp kernels + this library's neighbour list (or vesin)
 python examples/lj_langevin/lj_langevin_warp.py --device gpu --neighbours matscipy --atoms 2000
 python examples/lj_langevin/lj_langevin_warp.py --device gpu --neighbours vesin    --atoms 2000
+python examples/lj_langevin/lj_langevin_warp.py --device gpu --neighbours alchemi  --format matrix --atoms 2000
 python examples/lj_langevin/lj_langevin_warp.py --device gpu --system liquid       --atoms 2000
 ```
 
@@ -99,18 +104,23 @@ python examples/lj_langevin/benchmark.py --build build --doc-out docs/benchmark.
 python examples/lj_langevin/benchmark.py --build build --systems liquid   # one system only
 ```
 
-The three neighbour-list backends are **matscipy-neighbours** (this library,
+The four neighbour-list backends are **matscipy-neighbours** (this library,
 CPU+GPU), **matscipy 1.2.0** (the classic `matscipy` package, the CPU reference
-this library descends from), and **vesin** (CPU+GPU). On the CPU the
+this library descends from), **vesin** (CPU+GPU) and NVIDIA **ALCHEMI** (GPU
+only). On the CPU the
 matscipy-neighbours list is run **single-threaded** (`OMP_NUM_THREADS=1`, the
 `(1t)` rows) and **multi-threaded** (all cores, the `(mt)` rows); matscipy 1.2.0
 and vesin are single-threaded. vesin and matscipy 1.2.0 only feed the Warp and
-array kernels (JAX uses the dense `neighbour_matrix`, C++ uses the in-tree core),
-and matscipy 1.2.0 is CPU-only, so those cells are empty. See the
+array kernels, and ALCHEMI the Warp, array and JAX kernels (JAX needs a
+fixed-capacity neighbour matrix, C++ uses the in-tree core); matscipy 1.2.0 is
+CPU-only and ALCHEMI GPU-only, so those cells are empty. On the GPU the Warp
+kernels also run on the neighbour matrix of matscipy and ALCHEMI (the
+`(matrix)` rows). See the
 [Benchmark](../../docs/benchmark.md) page for the generated figures and
 discussion.
 
-The benchmark rows need `pip install jax warp-lang vesin muTimer matscipy==1.2.0`.
+The benchmark rows need `pip install jax warp-lang vesin muTimer matscipy==1.2.0
+nvalchemi-toolkit-ops` and a CUDA build of PyTorch (for ALCHEMI).
 
 ## JAX and the dense neighbour list
 

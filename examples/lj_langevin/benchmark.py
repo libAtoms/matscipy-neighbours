@@ -7,12 +7,16 @@ and the self-bound **droplet** in vacuum (non-periodic, sparse grid) -- for
 the full cross-product of three dimensions:
 
     device   : CPU / GPU
-    list     : matscipy (this library) / vesin (https://github.com/luthaf/vesin)
+    list     : matscipy (this library) / matscipy 1.2.0 / vesin
+               (https://github.com/luthaf/vesin) / NVIDIA ALCHEMI
+               (https://github.com/NVIDIA/nvalchemi-toolkit-ops, GPU only)
     kernels  : Warp / array (NumPy or CuPy) / JAX / C++
 
-Not every combination exists: JAX uses the dense `neighbour_matrix` and the C++
-example uses the in-tree C++ core, so neither can be driven by vesin — those
-cells are left empty. On the CPU the matscipy neighbour list is run **both
+Not every combination exists: JAX uses a fixed-capacity neighbour matrix, which
+only matscipy and ALCHEMI provide, and the C++ example uses the in-tree C++
+core — the other cells are left empty. On the GPU the Warp kernels are run on
+the pair list and, for matscipy and ALCHEMI, also on the neighbour matrix
+(``--format matrix``). On the CPU the matscipy neighbour list is run **both
 single-threaded** (`OMP_NUM_THREADS=1`) **and multi-threaded** (all cores); the
 threading controls the matscipy list (and the C++ OpenMP force loop). vesin's
 CPU list is single-threaded.
@@ -56,10 +60,18 @@ KERNEL_COLOUR = {"array": "tab:blue", "jax": "tab:green", "warp": "tab:orange",
 
 # Neighbour-list backends. "matscipy" is this library (matscipy_neighbours);
 # "matscipy-classic" is the classic matscipy 1.2.0 package (CPU only); "vesin"
-# is https://github.com/luthaf/vesin.
-NL_ORDER = ["matscipy", "matscipy-classic", "vesin"]
+# is https://github.com/luthaf/vesin; "alchemi" is NVIDIA ALCHEMI's
+# nvalchemiops (GPU only here).
+NL_ORDER = ["matscipy", "matscipy-classic", "vesin", "alchemi"]
 NL_DISPLAY = {"matscipy": "matscipy-neighbours",
-              "matscipy-classic": "matscipy 1.2.0", "vesin": "vesin"}
+              "matscipy-classic": "matscipy 1.2.0", "vesin": "vesin",
+              "alchemi": "ALCHEMI"}
+# Kernels each backend can feed: JAX needs the fixed-capacity neighbour matrix,
+# C++ is tied to the in-tree core.
+NL_KERNELS = {"matscipy": {"warp", "array", "jax", "cpp"},
+              "matscipy-classic": {"warp", "array"},
+              "vesin": {"warp", "array"},
+              "alchemi": {"warp", "array", "jax"}}
 
 # Plot style per (device, list, threads): colour by list, dash by device, with
 # the single-threaded matscipy CPU line dotted. Shared across all facets.
@@ -76,7 +88,18 @@ STYLE = {
                                  label="GPU · vesin"),
     ("cpu", "vesin", None): dict(c="tab:orange", ls="--", m="s",
                                  label="CPU · vesin"),
+    ("gpu", "alchemi", None): dict(c="tab:purple", ls="-", m="v",
+                                   label="GPU · ALCHEMI"),
 }
+
+
+def style(cfg):
+    """Plot style of a configuration; the neighbour-matrix variant of a GPU
+    curve keeps its colour and is drawn dash-dotted with diamonds."""
+    st = dict(STYLE[(cfg["device"], cfg["nl"], cfg["threads"])])
+    if cfg.get("fmt", "list") == "matrix":
+        st.update(ls="-.", m="D", label=st["label"] + " (matrix)")
+    return st
 
 
 def detect_cpu():
@@ -109,34 +132,47 @@ def detect_gpu():
 
 
 def nl_devices(nl):
-    """Devices a neighbour-list backend can run on (classic matscipy is CPU)."""
-    return ["cpu"] if nl == "matscipy-classic" else ["gpu", "cpu"]
+    """Devices a neighbour-list backend is run on (classic matscipy is CPU
+    only; ALCHEMI is benchmarked on the GPU only)."""
+    return {"matscipy-classic": ["cpu"], "alchemi": ["gpu"]}.get(nl, ["gpu", "cpu"])
+
+
+def formats(kernel, nl, device):
+    """Neighbour-list formats run for a configuration: the Warp GPU kernels
+    also consume the neighbour matrix of the backends that provide one."""
+    if kernel == "warp" and device == "gpu" and nl in ("matscipy", "alchemi"):
+        return ["list", "matrix"]
+    return ["list"]
 
 
 def make_configs():
-    """The full matrix. vesin and matscipy 1.2.0 only feed the Warp and array
-    kernels (JAX needs the dense matrix, C++ uses the in-tree core), so those
-    (kernel, list) cells are kept but marked unsupported -> empty in the table.
-    Only the matscipy (this library) CPU list is split into single/multi-thread."""
+    """The full matrix. A backend only feeds the kernels in `NL_KERNELS`; the
+    other (kernel, list) cells are kept but marked unsupported -> empty in the
+    table. Only the matscipy (this library) CPU list is split into single/multi-
+    thread."""
     cfgs = []
     for kernel in KERNEL_ORDER:
         for nl in NL_ORDER:
-            supported = nl == "matscipy" or kernel in ("warp", "array")
+            supported = kernel in NL_KERNELS[nl]
             for device in nl_devices(nl):
                 if device == "cpu" and nl == "matscipy":
                     threads_list = ["mt", "1t"]
                 else:
                     threads_list = [None]
                 for threads in threads_list:
-                    cfgs.append(dict(kernel=kernel, nl=nl, device=device,
-                                     threads=threads, supported=supported))
+                    for fmt in formats(kernel, nl, device):
+                        cfgs.append(dict(kernel=kernel, nl=nl, device=device,
+                                         threads=threads, fmt=fmt,
+                                         supported=supported))
     return cfgs
 
 
 def label(cfg):
     thr = {"mt": " (mt)", "1t": " (1t)", None: ""}[cfg["threads"]]
     dev = cfg["device"].upper()
-    return f"{KERNEL_NAME[cfg['kernel']]} · {NL_DISPLAY[cfg['nl']]} · {dev}{thr}"
+    fmt = " (matrix)" if cfg.get("fmt", "list") == "matrix" else ""
+    return (f"{KERNEL_NAME[cfg['kernel']]} · {NL_DISPLAY[cfg['nl']]} · "
+            f"{dev}{thr}{fmt}")
 
 
 def adaptive_steps(base, atoms):
@@ -153,12 +189,12 @@ def build_command(cfg, system, density, atoms, steps, build, base_env):
             str(usable_cores())
     common = ["--system", system, "--density", str(density),
               "--atoms", str(atoms), "--steps", str(steps),
-              "--write-every", str(steps + 1), "--out", os.devnull]
+              "--write-every", "0", "--out", os.devnull]   # no frames in the timing
     kernel = cfg["kernel"]
     if kernel == "warp":
         return [sys.executable, os.path.join(HERE, "lj_langevin_warp.py"),
                 "--device", cfg["device"], "--neighbours", cfg["nl"],
-                "--system", system, "--density", str(density),
+                "--format", cfg.get("fmt", "list"), "--system", system, "--density", str(density),
                 "--atoms", str(atoms), "--steps", str(steps)], env
     if kernel == "array":
         return [sys.executable, os.path.join(HERE, "lj_langevin.py"),
@@ -166,8 +202,12 @@ def build_command(cfg, system, density, atoms, steps, build, base_env):
     if kernel == "jax":
         if cfg["device"] == "cpu":
             env["JAX_PLATFORMS"] = "cpu"
+        # By default JAX reserves 75% of GPU memory up front; the neighbour
+        # list allocates outside that pool, so it would run out of memory long
+        # before the card is full.
+        env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
         return [sys.executable, os.path.join(HERE, "lj_langevin_jax.py"),
-                "--device", cfg["device"]] + common, env
+                "--device", cfg["device"], "--neighbours", cfg["nl"]] + common, env
     if kernel == "cpp":
         exe = os.path.join(build, "examples", "lj_langevin",
                            f"lj_langevin_{cfg['device']}")
@@ -199,7 +239,9 @@ def run(cfg, system, density, atoms, base_steps, build, base_env, timeout):
 # GPU memory, WSL silently spills it to host RAM and the run limps to the end
 # (it never cleanly OOMs). Healthy near-linear scaling grows at most ~2.5x per
 # 10x atoms here; this catches the ~90x blow-ups (e.g. the JAX dense matrix at
-# 1M on a 6 GB card) without touching genuinely-slow-but-real points.
+# 1M on a 6 GB card) without touching genuinely-slow-but-real points. Where
+# running out of GPU memory fails cleanly (native Linux), a backend with a real
+# super-linear step can trip it; `--thrash-growth 0` switches the check off.
 THRASH_GROWTH = 6.0
 
 
@@ -229,7 +271,7 @@ def make_plot(cfgs, sizes, path, system):
         pts = cfg.get("points")
         if not pts:
             continue
-        st = STYLE[(cfg["device"], cfg["nl"], cfg["threads"])]
+        st = style(cfg)
         ax = panels[cfg["kernel"]]
         xs = [a for a, _ in pts]
         ys = [t for _, t in pts]
@@ -266,7 +308,8 @@ def make_kernel_plot(results, sizes, path):
     for ax, system in zip(axes.flat, systems):
         for cfg in results[system]:
             pts = cfg.get("points")
-            if not pts or cfg["nl"] != "matscipy":
+            if (not pts or cfg["nl"] != "matscipy"
+                    or cfg.get("fmt", "list") != "list"):
                 continue
             if cfg["device"] == "gpu":
                 ls, mk, dev = "-", "o", "GPU"
@@ -321,20 +364,20 @@ list without periodic images.
 
 ![Droplet: time vs. number of atoms]({plot_names.get("droplet", "")})
 
-How to read it:
+How to read it (on the test machine):
 
-- The neighbour-list build dominates the step, so the **list** choice drives the
-  scaling: matscipy-neighbours' cell list stays close to linear on both devices
-  (on the GPU up to the largest size), the classic matscipy 1.2.0 list is a
-  single-threaded CPU reference, and vesin's GPU path grows super-linearly and
-  falls far behind for these large, low-density droplets.
-- The **kernel** choice mostly shifts the curve: the fused C++/CUDA and Warp
-  kernels avoid materialising per-pair arrays, the array (NumPy/CuPy) path is the
-  simplest, and JAX `jit`-compiles a dense masked sum.
-- On the CPU, the matscipy-neighbours `(mt)` curves pull away from `(1t)` as the
-  system grows (at small sizes the thread start-up cost dominates); and from
-  about 10⁵ atoms on, even single-threaded matscipy-neighbours `(1t)` is faster
-  than the classic matscipy 1.2.0 and vesin CPU lists.
+- matscipy-neighbours' list scales linearly on the GPU up to the largest size
+  and, on the pair list, is the fastest GPU list from about 10⁶ atoms on.
+- ALCHEMI is fast up to a few million atoms, fastest of all in its native
+  matrix format, but its list build grows super-linearly beyond that on this
+  sparse geometry: from 3×10⁶ to 10⁷ atoms its build time rises about twentyfold
+  for 3.3× the atoms, and its curves end well above matscipy-neighbours'.
+- vesin's GPU path grows super-linearly and falls far behind for these large,
+  low-density droplets.
+- On the CPU, single-threaded matscipy-neighbours `(1t)` is faster than the
+  classic matscipy 1.2.0 and vesin CPU lists from about 10⁵ atoms on; the
+  multi-threaded `(mt)` curves pull away as the system grows (at small sizes
+  the thread start-up cost dominates).
 """,
         "liquid": f"""## Periodic: bulk liquid
 
@@ -349,12 +392,26 @@ comparison between the list implementations.
 
 ![Liquid: time vs. number of atoms]({plot_names.get("liquid", "")})
 
-How to read it:
+How to read it (on the test machine):
 
-- The same list/kernel combinations as above; compare curve by curve with the
-  droplet figure. Per atom the liquid has more neighbours within the cutoff
-  than the droplet's surface-heavy clusters, so the absolute times are higher
-  and the per-pair cost is the better like-for-like number.
+- On the GPU the list build dominates the step for the Warp and C++ kernels,
+  which avoid per-pair arrays; the array and JAX kernels add a roughly constant
+  factor on top. The **list** choice therefore drives the scaling.
+- On the pair list, ALCHEMI is ahead of matscipy-neighbours up to a few million
+  atoms (by 20–40%), matscipy-neighbours is ahead at 10⁷ atoms (by about 20%),
+  and only matscipy-neighbours reaches the largest size. ALCHEMI's native
+  **matrix** format is the fastest GPU list here at every size from 10⁵ atoms
+  on; matscipy-neighbours' `neighbour_matrix` is slower than its own pair
+  list, because it also writes the distance vectors (and int64 indices).
+- In the **JAX** panel ALCHEMI's jit-compiled cell list is faster than
+  matscipy-neighbours' `neighbour_matrix` but runs out of GPU memory above
+  3×10⁶ atoms, where matscipy-neighbours reaches 10⁷.
+- vesin's GPU path is more than an order of magnitude slower than both at 10⁶
+  atoms and grows super-linearly.
+- On the CPU, single-threaded matscipy-neighbours `(1t)` is faster than both
+  the classic matscipy 1.2.0 and the vesin CPU lists at every size measured.
+- Per atom the liquid has more neighbours within the cutoff than the droplet,
+  whose surface atoms have fewer, so absolute times are somewhat higher.
 - The periodic shifts are folded into the distance vectors by the list (array
   and JAX kernels) or applied from the shift array in the fused kernels (Warp
   and C++), so no kernel wraps positions itself; atoms are free to drift out
@@ -372,7 +429,11 @@ JAX / C++). Lower is better. The neighbour-list backends are:
 - **matscipy-neighbours** — this library (`matscipy_neighbours`), CPU + GPU;
 - **matscipy 1.2.0** — the classic [`matscipy`](https://pypi.org/project/matscipy/)
   package's `neighbour_list`, the CPU reference this library descends from;
-- **vesin** — [`vesin`](https://github.com/luthaf/vesin), CPU + GPU.
+- **vesin** — [`vesin`](https://github.com/luthaf/vesin), CPU + GPU;
+- **ALCHEMI** — NVIDIA ALCHEMI's
+  [`nvalchemiops`](https://github.com/NVIDIA/nvalchemi-toolkit-ops) cell list
+  (`method="cell_list"`), GPU only, through its PyTorch interface (Warp and
+  array kernels) and its JAX interface (JAX kernel).
 
 !!! warning "What is being measured"
     Every step rebuilds the neighbour list from scratch, and the list is the
@@ -396,20 +457,34 @@ JAX / C++). Lower is better. The neighbour-list backends are:
     **matscipy 1.2.0** and **vesin** CPU lists are single-threaded. The GPU
     curves are unaffected.
 
+!!! note "Pair list or neighbour matrix"
+    A neighbour list comes in two layouts. The **pair list** is three flat
+    arrays `i`, `j`, `S` with one entry per pair; every backend returns it, and
+    the array, Warp and C++ kernels run one thread (or array element) per
+    pair. The **neighbour matrix** gives each atom a row of fixed capacity
+    (here 96 slots) plus a neighbour count; its shapes are static, so the JAX
+    kernel uses it, and it is ALCHEMI's native layout (its pair list is
+    compacted from the matrix). The Warp panels therefore show the GPU curves
+    of matscipy-neighbours (`neighbour_matrix`) and ALCHEMI twice: on the pair
+    list, and on the matrix (`(matrix)`, one thread per atom summing its own
+    row).
+
 !!! note "Missing curves"
-    vesin and matscipy 1.2.0 only feed the Warp and array kernels: JAX uses the
-    dense `neighbour_matrix` and the C++ example uses the in-tree C++ core, so
-    those panels show matscipy-neighbours only. matscipy 1.2.0 is CPU-only, so it
-    has no GPU curve. A curve that ends before the largest size either ran
-    **out of GPU memory** at the next size (e.g. the JAX dense neighbour
-    matrix, or the per-pair arrays of the array kernels) or was stopped because
-    its next run was predicted to take longer than
-    {meta.get("max_run_seconds", 60):g} s.
+    vesin and matscipy 1.2.0 only feed the Warp and array kernels, and ALCHEMI
+    the Warp, array and JAX kernels: JAX needs a fixed-capacity neighbour
+    matrix, and the C++ example uses the in-tree C++ core. matscipy 1.2.0 is
+    CPU-only, and ALCHEMI is benchmarked on the GPU only. A curve that ends
+    before the largest size either ran **out of GPU memory** at the next size
+    (e.g. the JAX dense neighbour matrix, or the per-pair arrays of the array
+    kernels) or was stopped because its next run was predicted to take longer
+    than {meta.get("max_run_seconds", 60):g} s.
 
 Run configuration: reduced LJ units, cutoff 2.5, dt 0.005, friction 1.0,
 temperature 0.7; sizes from {sizes[0]:,} to {sizes[-1]:,} atoms.{cpu_range}
 Up to {meta["steps"]} steps per point (fewer for the largest systems; JAX and
-Warp are compiled once during an untimed warm-up). Both systems start from an
+Warp are compiled once during an untimed warm-up; JAX runs without its
+default up-front reservation of GPU memory, which would leave too little for
+the neighbour list). Both systems start from an
 FCC lattice; the droplet uses lattice constant 1.6, the liquid fills its box at
 the stated density.
 
@@ -423,8 +498,10 @@ the stated density.
 The figure below keeps the neighbour list fixed — **matscipy-neighbours** on
 the GPU, and on the CPU **single-threaded** — and varies only the kernels that
 consume it: array (NumPy/CuPy), JAX, Warp and C++/CUDA. Within one device the
-list build time is the same for all four curves, so the vertical spread between
-them is the cost of the potential, not of the list. This section therefore does
+array, Warp and C++ curves share the same pair-list build, so the vertical
+spread between them is the cost of the potential, not of the list; JAX
+consumes `neighbour_matrix` instead, whose build is slower on the GPU (see the
+matrix curves in the Warp panels). This section therefore does
 **not** primarily benchmark the neighbour list but the implementation of the
 Lennard-Jones potential on top of it:
 
@@ -434,7 +511,8 @@ Lennard-Jones potential on top of it:
   `neighbour_matrix` (no scatter, but padded rows);
 - **Warp** and **C++/CUDA** run one fused pass over the `ij` pairs (plus the
   shift `S` in the periodic box) that recomputes each distance and never
-  materialises per-pair arrays.
+  materialises per-pair arrays; on the GPU the potential energy is reduced
+  within each thread block and added with one atomic per block.
 
 ![Kernel comparison]({kernel_plot_name})
 
@@ -456,7 +534,8 @@ The raw timings are written to `--results-out` (JSON); pass that file to
 liquid` or `--systems droplet` restricts the run to one system. For
 the C++ curves, build with `-DBUILD_EXAMPLES=ON` (and `-DENABLE_CUDA=ON` for
 the GPU binary); the others need `pip install jax warp-lang vesin muTimer
-matscipy==1.2.0 matplotlib` in the interpreter that runs this driver.
+matscipy==1.2.0 matplotlib nvalchemi-toolkit-ops` and a CUDA build of PyTorch
+(for ALCHEMI) in the interpreter that runs this driver.
 """
     with open(path, "w") as fh:
         fh.write(body)
@@ -487,6 +566,10 @@ def main():
                          "is predicted, from the previous size, to take longer "
                          "than this; keeps slow configurations such as large "
                          "single-threaded CPU runs from dominating the runtime")
+    ap.add_argument("--thrash-growth", type=float, default=THRASH_GROWTH,
+                    help="drop a point, and stop its configuration, when the "
+                         "time per step grows this many times faster than the "
+                         "atom count (a WSL memory-spill artifact); 0 disables")
     ap.add_argument("--timeout", type=int, default=300,
                     help="per-run timeout in seconds (safety net)")
     ap.add_argument("--plot-dir", default=os.path.join(HERE, "..", "..", "docs"),
@@ -499,6 +582,11 @@ def main():
     ap.add_argument("--replot", default=None, metavar="JSON",
                     help="skip the runs; redraw plot/page from a --results-out "
                          "file")
+    ap.add_argument("--resume", default=None, metavar="JSON",
+                    help="continue an interrupted run: configurations that a "
+                         "--results-out file records as finished are taken "
+                         "from it instead of being re-run (use the same "
+                         "--sizes and settings)")
     args = ap.parse_args()
 
     if args.replot:
@@ -518,6 +606,25 @@ def main():
                     PYTHONPATH=os.pathsep.join(
                         [build, pkg, os.environ.get("PYTHONPATH", "")]))
 
+    meta = dict(cpu=detect_cpu(), gpu=detect_gpu(), ncores=usable_cores(),
+                systems=args.systems, density=args.density,
+                sizes=args.sizes, steps=args.steps,
+                timeout=args.timeout, max_run_seconds=args.max_run_seconds,
+                max_atoms_cpu=args.max_atoms_cpu,
+                thrash_growth=args.thrash_growth)
+    finished = {}
+    if args.resume:
+        with open(args.resume) as fh:
+            for system, cfgs in json.load(fh)["systems"].items():
+                finished[system] = {label(c): c for c in cfgs if c.get("done")}
+
+    def save(results):
+        """Write the results so far; runs are long, and an interrupted one can
+        be continued with --resume."""
+        if args.results_out:
+            with open(args.results_out, "w") as fh:
+                json.dump(dict(meta=meta, systems=results), fh, indent=1)
+
     results = {}
     for system in args.systems:
         print(f"=== {SYSTEM_NAME[system]}", file=sys.stderr)
@@ -525,6 +632,10 @@ def main():
         results[system] = cfgs
         for cfg in cfgs:
             if not cfg["supported"]:
+                continue
+            done = finished.get(system, {}).get(label(cfg))
+            if done is not None:
+                cfg["points"], cfg["done"] = done["points"], True
                 continue
             cfg["points"] = []
             for atoms in args.sizes:
@@ -546,7 +657,8 @@ def main():
                     break
                 if cfg["points"]:
                     pa, pm = cfg["points"][-1]
-                    if (ms / pm) / (atoms / pa) > THRASH_GROWTH:
+                    if (args.thrash_growth > 0
+                            and (ms / pm) / (atoms / pa) > args.thrash_growth):
                         print(f"  {label(cfg):44s} atoms={atoms} -> {ms:.0f} "
                               f"ms/step looks like a memory-thrash artifact "
                               f"(super-linear blow-up); dropping and stopping",
@@ -555,15 +667,11 @@ def main():
                 cfg["points"].append((atoms, ms))
                 print(f"  {label(cfg):44s} atoms={atoms:>8d} -> {ms:.2f} ms/step",
                       file=sys.stderr)
+            cfg["done"] = True
+            save(results)
 
-    meta = dict(cpu=detect_cpu(), gpu=detect_gpu(), ncores=usable_cores(),
-                systems=args.systems, density=args.density,
-                sizes=args.sizes, steps=args.steps,
-                timeout=args.timeout, max_run_seconds=args.max_run_seconds,
-                max_atoms_cpu=args.max_atoms_cpu)
+    save(results)
     if args.results_out:
-        with open(args.results_out, "w") as fh:
-            json.dump(dict(meta=meta, systems=results), fh, indent=1)
         print(f"wrote {args.results_out}", file=sys.stderr)
     finish(results, meta, args)
 

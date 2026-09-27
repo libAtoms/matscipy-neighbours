@@ -4,17 +4,28 @@
 The Lennard-Jones force/energy and the Langevin integrator are written as
 `warp` kernels (compiled once, then launched every step), but the neighbour
 list is built by *this* library — `matscipy_neighbours` — or, for comparison,
-by `vesin` (https://github.com/luthaf/vesin). Select the builder with
-``--neighbours {matscipy,vesin}``.
+by `vesin` (https://github.com/luthaf/vesin) or by NVIDIA ALCHEMI
+(`nvalchemiops`, https://github.com/NVIDIA/nvalchemi-toolkit-ops; GPU only,
+through its PyTorch interface). Select the builder with
+``--neighbours {matscipy,vesin,alchemi}``.
 
 The point is interop: positions live in a single device buffer (CuPy on the
 GPU, NumPy on the CPU); Warp wraps it zero-copy through DLPack, and the
 neighbour-list builder reads the very same buffer. The builder returns the
 directed pair list ``(i, j)`` (full list, sorted by ``i``); the fused Warp
 kernel recomputes the distance for each pair and atomically accumulates the
-force on ``i`` — never materialising per-pair arrays. For the periodic liquid
+force on ``i`` — never materialising per-pair arrays. The potential energy is
+reduced within each thread block and added with one atomic per block. For the periodic liquid
 (``--system liquid``) the builder also returns the cell shift ``S`` of each
 pair, and the kernel evaluates the periodic image D = r[j] - r[i] + S @ cell.
+
+``--format matrix`` swaps the pair list for the fixed-capacity *neighbour
+matrix* (one row of ``--max-neighbours`` slots per atom plus a per-atom count),
+consumed by a kernel with one thread per atom that sums its own row — no
+atomics on the forces. Each library supplies the matrix in its native form:
+matscipy-neighbours (`neighbour_matrix`) with the distance vectors ``D``,
+ALCHEMI with neighbour indices (and cell shifts for a periodic box), from
+which the kernel recomputes ``D``.
 
 Timing is broken down per phase with `muTimer` (build neighbour list / LJ
 forces / Langevin integrate), and the neighbour-list build time is reported
@@ -28,6 +39,7 @@ velocities and forces are double precision.
 
 import argparse
 import math
+from typing import Any
 
 import numpy as np
 import warp as wp
@@ -39,10 +51,26 @@ vec3d = wp.vec3d
 # --------------------------------------------------------------------------- #
 # Warp kernels
 # --------------------------------------------------------------------------- #
+# Threads per block of the force kernels. The launch is rounded up to whole
+# blocks (see `launch_forces`); threads past the end contribute nothing.
+BLOCK_DIM = 256
+
+
+# Energy reduction: each thread holds the energy of its pair (or row), zero if
+# it has none. `wp.tile(e)` gathers these values across the thread block,
+# `wp.tile_sum` reduces them cooperatively (warp shuffles, then shared memory),
+# and `wp.tile_atomic_add` adds the block's total to the global energy: one
+# atomic per block instead of one per pair, which would serialise every thread
+# of the launch on a single address. All threads of a block must reach the
+# tile operations, so the kernels guard their work with `if` rather than
+# returning early.
+
+
 @wp.kernel
 def lj_forces(pos: wp.array(dtype=vec3d),
               ii: wp.array(dtype=wp.int32),
               jj: wp.array(dtype=wp.int32),
+              npairs: int,
               cutoff_sq: wp.float64,
               forces: wp.array(dtype=vec3d),
               energy: wp.array(dtype=wp.float64)):
@@ -50,16 +78,18 @@ def lj_forces(pos: wp.array(dtype=vec3d),
     beforehand; the full (both-directions) list means the force is accumulated
     on ``i`` only and the energy carries the 1/2 double-counting factor."""
     p = wp.tid()
-    i = ii[p]
-    j = jj[p]
-    dr = pos[j] - pos[i]
-    r2 = wp.dot(dr, dr)
-    if r2 < cutoff_sq:
-        inv_r2 = wp.float64(1.0) / r2
-        inv_r6 = inv_r2 * inv_r2 * inv_r2
-        coef = wp.float64(-24.0) * inv_r2 * inv_r6 * (wp.float64(2.0) * inv_r6 - wp.float64(1.0))
-        wp.atomic_add(forces, i, coef * dr)
-        wp.atomic_add(energy, 0, wp.float64(2.0) * inv_r6 * (inv_r6 - wp.float64(1.0)))
+    e = wp.float64(0.0)
+    if p < npairs:
+        i = ii[p]
+        dr = pos[jj[p]] - pos[i]
+        r2 = wp.dot(dr, dr)
+        if r2 < cutoff_sq:
+            inv_r2 = wp.float64(1.0) / r2
+            inv_r6 = inv_r2 * inv_r2 * inv_r2
+            coef = wp.float64(-24.0) * inv_r2 * inv_r6 * (wp.float64(2.0) * inv_r6 - wp.float64(1.0))
+            wp.atomic_add(forces, i, coef * dr)
+            e = wp.float64(2.0) * inv_r6 * (inv_r6 - wp.float64(1.0))
+    wp.tile_atomic_add(energy, wp.tile_sum(wp.tile(e)))
 
 
 @wp.kernel
@@ -67,6 +97,7 @@ def lj_forces_pbc(pos: wp.array(dtype=vec3d),
                   ii: wp.array(dtype=wp.int32),
                   jj: wp.array(dtype=wp.int32),
                   shift: wp.array(dtype=wp.vec3i),
+                  npairs: int,
                   cell_t: wp.mat33d,
                   cutoff_sq: wp.float64,
                   forces: wp.array(dtype=vec3d),
@@ -75,18 +106,109 @@ def lj_forces_pbc(pos: wp.array(dtype=vec3d),
     periodic image, D = r[j] - r[i] + S @ cell (`cell_t` is the transposed
     cell, rows = lattice vectors, so that S @ cell == cell_t * S)."""
     p = wp.tid()
-    i = ii[p]
-    j = jj[p]
-    s = shift[p]
-    sd = vec3d(wp.float64(s[0]), wp.float64(s[1]), wp.float64(s[2]))
-    dr = pos[j] - pos[i] + cell_t * sd
-    r2 = wp.dot(dr, dr)
-    if r2 < cutoff_sq:
-        inv_r2 = wp.float64(1.0) / r2
-        inv_r6 = inv_r2 * inv_r2 * inv_r2
-        coef = wp.float64(-24.0) * inv_r2 * inv_r6 * (wp.float64(2.0) * inv_r6 - wp.float64(1.0))
-        wp.atomic_add(forces, i, coef * dr)
-        wp.atomic_add(energy, 0, wp.float64(2.0) * inv_r6 * (inv_r6 - wp.float64(1.0)))
+    e = wp.float64(0.0)
+    if p < npairs:
+        i = ii[p]
+        s = shift[p]
+        sd = vec3d(wp.float64(s[0]), wp.float64(s[1]), wp.float64(s[2]))
+        dr = pos[jj[p]] - pos[i] + cell_t * sd
+        r2 = wp.dot(dr, dr)
+        if r2 < cutoff_sq:
+            inv_r2 = wp.float64(1.0) / r2
+            inv_r6 = inv_r2 * inv_r2 * inv_r2
+            coef = wp.float64(-24.0) * inv_r2 * inv_r6 * (wp.float64(2.0) * inv_r6 - wp.float64(1.0))
+            wp.atomic_add(forces, i, coef * dr)
+            e = wp.float64(2.0) * inv_r6 * (inv_r6 - wp.float64(1.0))
+    wp.tile_atomic_add(energy, wp.tile_sum(wp.tile(e)))
+
+
+@wp.kernel
+def lj_forces_matrix(pos: wp.array(dtype=vec3d),
+                     nbr: wp.array2d(dtype=Any),
+                     count: wp.array(dtype=Any),
+                     n: int,
+                     cutoff_sq: wp.float64,
+                     forces: wp.array(dtype=vec3d),
+                     energy: wp.array(dtype=wp.float64)):
+    """Neighbour-matrix form: one thread per atom sums the pairs in its row
+    (the first ``count[a]`` slots), so the force is written, not accumulated
+    atomically. ``energy`` must be zeroed beforehand."""
+    a = wp.tid()
+    e = wp.float64(0.0)
+    if a < n:
+        f = vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
+        for k in range(int(count[a])):
+            dr = pos[int(nbr[a, k])] - pos[a]
+            r2 = wp.dot(dr, dr)
+            if r2 < cutoff_sq:
+                inv_r2 = wp.float64(1.0) / r2
+                inv_r6 = inv_r2 * inv_r2 * inv_r2
+                f += wp.float64(-24.0) * inv_r2 * inv_r6 * (wp.float64(2.0) * inv_r6 - wp.float64(1.0)) * dr
+                e += wp.float64(2.0) * inv_r6 * (inv_r6 - wp.float64(1.0))
+        forces[a] = f
+    wp.tile_atomic_add(energy, wp.tile_sum(wp.tile(e)))
+
+
+@wp.kernel
+def lj_forces_matrix_pbc(pos: wp.array(dtype=vec3d),
+                         nbr: wp.array2d(dtype=Any),
+                         count: wp.array(dtype=Any),
+                         shift: wp.array2d(dtype=wp.vec3i),
+                         n: int,
+                         cell_t: wp.mat33d,
+                         cutoff_sq: wp.float64,
+                         forces: wp.array(dtype=vec3d),
+                         energy: wp.array(dtype=wp.float64)):
+    """As `lj_forces_matrix`, with the per-slot cell shift of a periodic box."""
+    a = wp.tid()
+    e = wp.float64(0.0)
+    if a < n:
+        f = vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
+        for k in range(int(count[a])):
+            s = shift[a, k]
+            sd = vec3d(wp.float64(s[0]), wp.float64(s[1]), wp.float64(s[2]))
+            dr = pos[int(nbr[a, k])] - pos[a] + cell_t * sd
+            r2 = wp.dot(dr, dr)
+            if r2 < cutoff_sq:
+                inv_r2 = wp.float64(1.0) / r2
+                inv_r6 = inv_r2 * inv_r2 * inv_r2
+                f += wp.float64(-24.0) * inv_r2 * inv_r6 * (wp.float64(2.0) * inv_r6 - wp.float64(1.0)) * dr
+                e += wp.float64(2.0) * inv_r6 * (inv_r6 - wp.float64(1.0))
+        forces[a] = f
+    wp.tile_atomic_add(energy, wp.tile_sum(wp.tile(e)))
+
+
+@wp.kernel
+def lj_forces_matrix_D(dist: wp.array2d(dtype=vec3d),
+                       count: wp.array(dtype=Any),
+                       n: int,
+                       cutoff_sq: wp.float64,
+                       forces: wp.array(dtype=vec3d),
+                       energy: wp.array(dtype=wp.float64)):
+    """As `lj_forces_matrix`, from precomputed distance vectors (periodic
+    images already applied), so neither positions nor indices are read."""
+    a = wp.tid()
+    e = wp.float64(0.0)
+    if a < n:
+        f = vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
+        for k in range(int(count[a])):
+            dr = dist[a, k]
+            r2 = wp.dot(dr, dr)
+            if r2 < cutoff_sq:
+                inv_r2 = wp.float64(1.0) / r2
+                inv_r6 = inv_r2 * inv_r2 * inv_r2
+                f += wp.float64(-24.0) * inv_r2 * inv_r6 * (wp.float64(2.0) * inv_r6 - wp.float64(1.0)) * dr
+                e += wp.float64(2.0) * inv_r6 * (inv_r6 - wp.float64(1.0))
+        forces[a] = f
+    wp.tile_atomic_add(energy, wp.tile_sum(wp.tile(e)))
+
+
+def launch_forces(kernel, count, inputs, device):
+    """Launch a force kernel over ``count`` threads, rounded up to whole blocks
+    of `BLOCK_DIM` so that every block takes part in the tile reduction."""
+    dim = (count + BLOCK_DIM - 1) // BLOCK_DIM * BLOCK_DIM
+    wp.launch(kernel, dim=dim, inputs=inputs, block_dim=BLOCK_DIM,
+              device=device)
 
 
 @wp.kernel
@@ -183,7 +305,8 @@ def periodic_box(L):
     return origin, cell
 
 
-def make_neighbour_builder(kind, xp, on_gpu, cutoff, origin, cell, pbc):
+def make_neighbour_builder(kind, xp, on_gpu, cutoff, origin, cell, pbc,
+                           max_neighbours):
     """Return ``build(positions) -> (i_int32, j_int32, S_int32, npairs)`` for
     the chosen backend: the device-resident directed pair list, with the cell
     shifts ``S`` (shape (npairs, 3)) for a periodic box and ``None``
@@ -191,8 +314,10 @@ def make_neighbour_builder(kind, xp, on_gpu, cutoff, origin, cell, pbc):
     quantities = "ijS" if pbc else "ij"
 
     def pack(i, j, S=None):
-        S32 = None if S is None else xp.ascontiguousarray(S.astype(xp.int32))
-        return i.astype(xp.int32), j.astype(xp.int32), S32, int(i.shape[0])
+        S32 = None if S is None else \
+            xp.ascontiguousarray(S.astype(xp.int32, copy=False))
+        return (i.astype(xp.int32, copy=False), j.astype(xp.int32, copy=False),
+                S32, int(i.shape[0]))
 
     if kind == "matscipy":
         from matscipy_neighbours import neighbour_list
@@ -225,7 +350,78 @@ def make_neighbour_builder(kind, xp, on_gpu, cutoff, origin, cell, pbc):
                                cell=cell, pbc=pbc3, cutoff=cutoff))
         return build
 
+    if kind == "alchemi":
+        alchemi = alchemi_builder(xp, cutoff, origin, cell, pbc, max_neighbours,
+                                  matrix=False)
+
+        def build(positions):
+            # COO pairs (2, npairs), CSR row pointer, cell shifts (npairs, 3);
+            # zero-copy from PyTorch into CuPy.
+            nl, _, S = (xp.from_dlpack(t) for t in alchemi(positions))
+            return pack(nl[0], nl[1], S if pbc else None)
+        return build
+
     raise SystemExit(f"unknown neighbour backend: {kind}")
+
+
+def alchemi_builder(xp, cutoff, origin, cell, pbc, max_neighbours, matrix):
+    """NVIDIA ALCHEMI's cell list through its documented PyTorch entry point,
+    ``nvalchemiops.torch.neighbors.neighbor_list`` (which runs Warp kernels on
+    the tensors). Returns ``build(positions) -> tuple of torch tensors``:
+    ``(neighbor_matrix, num_neighbors, shifts)`` if ``matrix`` else
+    ``(neighbor_list, neighbor_ptr, shifts)``."""
+    import torch
+    from nvalchemiops.torch.neighbors import neighbor_list
+
+    cell_t = torch.as_tensor(cell, device="cuda")
+    pbc_t = torch.tensor([pbc] * 3, device="cuda")
+    origin_d = xp.asarray(origin)
+
+    def build(positions):
+        # ALCHEMI has no cell origin: shift the positions into the cell (the
+        # list is translation invariant).
+        p = torch.from_dlpack(positions - origin_d)
+        return neighbor_list(p, cutoff, cell=cell_t, pbc=pbc_t,
+                             method="cell_list", max_neighbors=max_neighbours,
+                             return_neighbor_list=not matrix)
+    return build
+
+
+def make_matrix_builder(kind, xp, cutoff, origin, cell, pbc, max_neighbours):
+    """Return ``build(positions) -> (nbr, count, extra)`` for the neighbour
+    matrix: ``extra`` is the distance vectors ``D`` (matscipy-neighbours), the
+    cell shifts of a periodic box (ALCHEMI), or ``None``. Capacity overflow is
+    checked by :func:`check_capacity`, outside the timed loop."""
+    if kind == "matscipy":
+        from matscipy_neighbours import neighbour_matrix
+
+        def build(positions):
+            nbr, D, count = neighbour_matrix(
+                positions=positions, cell=cell, cell_origin=origin, pbc=pbc,
+                cutoff=cutoff, max_neighbours=max_neighbours)
+            return nbr, count, D
+        return build
+
+    if kind == "alchemi":
+        alchemi = alchemi_builder(xp, cutoff, origin, cell, pbc, max_neighbours,
+                                  matrix=True)
+
+        def build(positions):
+            nbr, count, S = (xp.from_dlpack(t) for t in alchemi(positions))
+            return nbr, count, (S if pbc else None)
+        return build
+
+    raise SystemExit(f"--format matrix supports matscipy and alchemi, not {kind}")
+
+
+def check_capacity(count, max_neighbours):
+    """ALCHEMI's matrix output truncates rows that overflow the capacity
+    without raising (the count stays exact; its list output does raise), so
+    check the counts explicitly."""
+    most = int(count.max())
+    if most > max_neighbours:
+        raise SystemExit(f"--max-neighbours={max_neighbours} is too small "
+                         f"(an atom has {most} neighbours)")
 
 
 def write_xyz(handle, positions_host, comment):
@@ -243,10 +439,18 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--device", choices=["cpu", "gpu"], default="gpu")
     ap.add_argument("--neighbours",
-                    choices=["matscipy", "matscipy-classic", "vesin"],
+                    choices=["matscipy", "matscipy-classic", "vesin", "alchemi"],
                     default="matscipy",
                     help="neighbour-list builder (matscipy = this library; "
-                         "matscipy-classic = the matscipy 1.2.0 package, CPU only)")
+                         "matscipy-classic = the matscipy 1.2.0 package, CPU "
+                         "only; alchemi = NVIDIA ALCHEMI, GPU only)")
+    ap.add_argument("--format", choices=["list", "matrix"], default="list",
+                    help="pair list (one thread per pair) or fixed-capacity "
+                         "neighbour matrix (one thread per atom); matrix needs "
+                         "--neighbours matscipy or alchemi")
+    ap.add_argument("--max-neighbours", type=int, default=96,
+                    help="row capacity of the neighbour matrix (also sizes "
+                         "ALCHEMI's internal matrix in list format)")
     ap.add_argument("--system", choices=["droplet", "liquid"], default="droplet",
                     help="droplet in vacuum (non-periodic) or bulk liquid in a "
                          "periodic box")
@@ -263,12 +467,16 @@ def main():
     ap.add_argument("--kT", type=float, default=0.7)
     ap.add_argument("--cutoff", type=float, default=2.5)
     ap.add_argument("--out", default=None, help="optional XYZ trajectory")
-    ap.add_argument("--write-every", type=int, default=50)
+    ap.add_argument("--write-every", type=int, default=50,
+                    help="write a trajectory frame every N steps (0: none)")
     args = ap.parse_args()
 
     if args.neighbours == "matscipy-classic" and args.device == "gpu":
         raise SystemExit("matscipy-classic (the matscipy 1.2.0 package) is "
                          "CPU only; use --device cpu")
+    if args.neighbours == "alchemi" and args.device == "cpu":
+        raise SystemExit("alchemi is benchmarked on the GPU only; use "
+                         "--device gpu")
     on_gpu = args.device == "gpu"
     wp_device = "cuda:0" if on_gpu else "cpu"
     wp.init()
@@ -297,25 +505,59 @@ def main():
     energy_wp = wp.zeros(1, dtype=wp.float64, device=wp_device)
 
     lc = langevin_constants(args.dt, args.gamma, args.kT)
-    build_nl = make_neighbour_builder(args.neighbours, xp, on_gpu, args.cutoff,
-                                      origin, cell, pbc)
+    matrix = args.format == "matrix"
+    if matrix:
+        build_matrix = make_matrix_builder(args.neighbours, xp, args.cutoff,
+                                           origin, cell, pbc,
+                                           args.max_neighbours)
+
+        def build_nl(positions):
+            nbr, count, extra = build_matrix(positions)
+            return nbr, count, extra, None
+    else:
+        build_nl = make_neighbour_builder(args.neighbours, xp, on_gpu,
+                                          args.cutoff, origin, cell, pbc,
+                                          args.max_neighbours)
     cutoff_sq = wp.float64(args.cutoff ** 2)
     cell_t = wp.mat33d(np.ascontiguousarray(cell.T))   # S @ cell == cell.T @ S
 
+    def matrix_force_pass(nbr, count, extra):
+        energy_wp.zero_()
+        count_wp = wp.from_dlpack(count)
+        if extra is None:
+            launch_forces(lj_forces_matrix, n,
+                          [pos_wp, wp.from_dlpack(nbr), count_wp, n, cutoff_sq,
+                           forces_wp, energy_wp],
+                          wp_device)
+        elif args.neighbours == "matscipy":        # extra = distance vectors D
+            launch_forces(lj_forces_matrix_D, n,
+                          [wp.from_dlpack(extra, dtype=vec3d), count_wp, n,
+                           cutoff_sq, forces_wp, energy_wp],
+                          wp_device)
+        else:                                      # extra = cell shifts S
+            launch_forces(lj_forces_matrix_pbc, n,
+                          [pos_wp, wp.from_dlpack(nbr), count_wp,
+                           wp.from_dlpack(extra, dtype=wp.vec3i), n, cell_t,
+                           cutoff_sq, forces_wp, energy_wp],
+                          wp_device)
+
     def force_pass(i_wp, j_wp, s_wp, npairs):
+        if npairs is None:                         # neighbour-matrix format
+            matrix_force_pass(i_wp, j_wp, s_wp)
+            return
         forces_wp.zero_()
         energy_wp.zero_()
         if s_wp is None:
-            wp.launch(lj_forces, dim=npairs,
-                      inputs=[pos_wp, i_wp, j_wp, cutoff_sq, forces_wp,
-                              energy_wp],
-                      device=wp_device)
+            launch_forces(lj_forces, npairs,
+                          [pos_wp, i_wp, j_wp, npairs, cutoff_sq, forces_wp,
+                           energy_wp],
+                          wp_device)
         else:
             shift_wp = wp.from_dlpack(s_wp, dtype=wp.vec3i)
-            wp.launch(lj_forces_pbc, dim=npairs,
-                      inputs=[pos_wp, i_wp, j_wp, shift_wp, cell_t, cutoff_sq,
-                              forces_wp, energy_wp],
-                      device=wp_device)
+            launch_forces(lj_forces_pbc, npairs,
+                          [pos_wp, i_wp, j_wp, shift_wp, npairs, cell_t,
+                           cutoff_sq, forces_wp, energy_wp],
+                          wp_device)
 
     def drift(step):
         wp.launch(langevin_drift, dim=n,
@@ -334,14 +576,19 @@ def main():
                   device=wp_device)
 
     print(f"device={args.device}  neighbours={args.neighbours}  "
-          f"system={args.system}  atoms={n}")
+          f"format={args.format}  system={args.system}  atoms={n}")
 
     # Warm-up: build once and trigger the one-time Warp kernel compilation.
     iw, jw, sw, npairs = build_nl(positions)
     force_pass(iw, jw, sw, npairs)
     wp.synchronize_device(wp_device)
+    if matrix:
+        check_capacity(jw, args.max_neighbours)
+        npairs_report = int(jw.sum())
+    else:
+        npairs_report = npairs
     # The kernel already carries the 1/2 factor for directed pairs.
-    print(f"pairs~{npairs}  E_pot={float(energy_wp.numpy()[0]):.6f}")
+    print(f"pairs~{npairs_report}  E_pot={float(energy_wp.numpy()[0]):.6f}")
     # One complete (untimed) step so both integrator kernels are compiled too.
     drift(0)
     iw, jw, sw, npairs = build_nl(positions)
@@ -364,7 +611,8 @@ def main():
         with timer("integrate"):
             kick()
             wp.synchronize_device(wp_device)
-        if out is not None and step % args.write_every == 0:
+        if (out is not None and args.write_every > 0
+                and step % args.write_every == 0):
             e = float(energy_wp.numpy()[0])
             host = xp.asnumpy(positions) if on_gpu else np.asarray(positions)
             vel_host = xp.asnumpy(velocities) if on_gpu else np.asarray(velocities)
@@ -373,6 +621,9 @@ def main():
     if out is not None:
         out.close()
 
+    if matrix:
+        check_capacity(jw, args.max_neighbours)
+        npairs = int(jw.sum())
     timer.print_summary()
     nl_ms = timer.get_time("neighbour list") / args.steps * 1e3
     force_ms = timer.get_time("LJ forces") / args.steps * 1e3

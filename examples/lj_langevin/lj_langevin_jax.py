@@ -10,6 +10,9 @@ neighbour list is exchanged with JAX zero-copy through DLPack
 needs a CUDA build of JAX). ``--system liquid`` runs a bulk liquid in a fully
 periodic box instead of the droplet in vacuum; the periodic shifts are folded
 into the distance vectors of the dense list, so the kernel is unchanged.
+``--neighbours alchemi`` builds the same fixed-capacity matrix with NVIDIA
+ALCHEMI's JAX cell list (`nvalchemiops.jax`, GPU only) instead, asking it for
+the distance vectors (``return_vectors``) so that the kernel is shared.
 Reduced LJ units (epsilon = sigma = mass = kB = 1); output is an XYZ trajectory.
 """
 
@@ -123,6 +126,41 @@ def write_xyz(handle, positions_host, comment):
         handle.write(f"Ar {p[0]:.5f} {p[1]:.5f} {p[2]:.5f}\n")
 
 
+def alchemi_neighbours(jnp, positions, cutoff, origin, cell, pbc, K):
+    """``neighbours(p) -> (idx, dist, count)`` from NVIDIA ALCHEMI's JAX cell
+    list, in the layout of `neighbour_matrix`. The cell-grid sizing is
+    host-side and not jit-compatible, so it is estimated once here; the build
+    itself is then `jit`-compiled."""
+    from nvalchemiops.jax.neighbors.cell_list import (cell_list,
+                                                      estimate_cell_list_sizes)
+    origin = jnp.asarray(origin)
+    cell3 = jnp.asarray(cell)[None]
+    pbc3 = jnp.full((1, 3), pbc)
+    max_total_cells, _, radius = estimate_cell_list_sizes(
+        positions - origin, cell3, cutoff, pbc3)
+    max_total_cells = int(max_total_cells)
+    radius = np.asarray(radius)          # concrete, so ALCHEMI may pick a strategy
+
+    @jax.jit
+    def neighbours(p):
+        # ALCHEMI has no cell origin: shift into the cell (translation invariant).
+        idx, count, _, dist = cell_list(
+            p - origin, cutoff, cell=cell3, pbc=pbc3, max_neighbors=K,
+            max_total_cells=max_total_cells, neighbor_search_radius=radius,
+            return_vectors=True)
+        return idx, dist, count
+    return neighbours
+
+
+def check_capacity(count, K):
+    """ALCHEMI's matrix output truncates overflowing rows without raising (the
+    count stays exact), so check explicitly; `neighbour_matrix` raises itself."""
+    most = int(count.max())
+    if most > K:
+        raise SystemExit(f"--max-neighbours={K} is too small (an atom has "
+                         f"{most} neighbours)")
+
+
 # `jax` is imported in main() (after enabling x64); referenced by make_step's
 # decorator at call time.
 jax = None
@@ -150,8 +188,13 @@ def main():
     ap.add_argument("--kT", type=float, default=0.7)
     ap.add_argument("--cutoff", type=float, default=2.5)
     ap.add_argument("--max-neighbours", type=int, default=96)
+    ap.add_argument("--neighbours", choices=["matscipy", "alchemi"],
+                    default="matscipy",
+                    help="builder of the neighbour matrix (matscipy = this "
+                         "library; alchemi = NVIDIA ALCHEMI, GPU only)")
     ap.add_argument("--out", default="traj_jax.xyz")
-    ap.add_argument("--write-every", type=int, default=50)
+    ap.add_argument("--write-every", type=int, default=50,
+                    help="write a trajectory frame every N steps (0: none)")
     args = ap.parse_args()
 
     global jax
@@ -190,18 +233,29 @@ def main():
     origin = np.ascontiguousarray(np.full(3, lo))
     cell = np.ascontiguousarray(np.diag([L, L, L]).astype(float))
 
-    def neighbours(p):
-        return neighbour_matrix(positions=p, cell=cell, cell_origin=origin,
-                                pbc=pbc, cutoff=cutoff, max_neighbours=K,
-                                array_namespace=jnp)
+    if args.neighbours == "alchemi":
+        if args.device != "gpu":
+            raise SystemExit("alchemi is benchmarked on the GPU only; use "
+                             "--device gpu")
+        neighbours = alchemi_neighbours(jnp, positions, cutoff, origin, cell,
+                                        pbc, K)
+    else:
+        def neighbours(p):
+            return neighbour_matrix(positions=p, cell=cell, cell_origin=origin,
+                                    pbc=pbc, cutoff=cutoff, max_neighbours=K,
+                                    array_namespace=jnp)
 
     _, dist, count = neighbours(positions)
-    print(f"device={args.device}  system={args.system}  atoms={n}  K={K}  "
-          f"backend={dev.platform}")
+    check_capacity(count, K)
+    print(f"device={args.device}  neighbours={args.neighbours}  "
+          f"system={args.system}  atoms={n}  K={K}  backend={dev.platform}")
 
-    # Warm up: trigger the one-time jit compilation before timing.
-    _wp, _wv, _, _ = step(positions, velocities, dist, count, key, 1.0)
-    jax.block_until_ready(_wp)
+    # Warm up: one full, discarded iteration of the loop below (key split, step,
+    # list rebuild at the moved positions), so that every one-time compilation
+    # happens before timing.
+    _, _sub = jrandom.split(key)
+    _wp, _wv, _, _ = step(positions, velocities, dist, count, _sub, 1.0)
+    jax.block_until_ready(neighbours(_wp))
 
     out = open(args.out, "w")
     jax.block_until_ready(positions)
@@ -212,12 +266,13 @@ def main():
         positions, velocities, energy, temperature = step(
             positions, velocities, dist, count, sub, 0.0 if s == 0 else 1.0)
         _, dist, count = neighbours(positions)
-        if s % args.write_every == 0:
+        if args.write_every > 0 and s % args.write_every == 0:
             write_xyz(out, np.asarray(positions),
                       f"step={s} E_pot={float(energy):.4f} T={float(temperature):.4f}")
     jax.block_until_ready(positions)
     elapsed = time.perf_counter() - t0
     out.close()
+    check_capacity(count, K)
 
     per_step = elapsed / args.steps
     print(f"steps={args.steps}  total={elapsed:.3f}s  {per_step * 1e3:.3f} ms/step")

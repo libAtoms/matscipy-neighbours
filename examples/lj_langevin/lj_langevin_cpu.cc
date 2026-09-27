@@ -149,7 +149,7 @@ int main(int argc, char **argv) {
         drift();
         compute_forces();
         kick();
-        if (step % write_every == 0)
+        if (write_every > 0 && step % write_every == 0)  /* 0: no trajectory */
             lj::write_xyz(out, pos.data(), n,
                           "step=" + std::to_string(step) +
                               " E_pot=" + std::to_string(energy) +

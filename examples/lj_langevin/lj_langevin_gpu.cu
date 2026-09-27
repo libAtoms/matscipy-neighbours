@@ -24,12 +24,14 @@
 using namespace matscipy;
 using clock_type = std::chrono::steady_clock;
 
+/* The status variable has a name no caller uses: a plain `e` would shadow a
+   caller's `e` inside `call`, e.g. in CUDA_CHECK(cudaMemcpy(&e, ...)). */
 #define CUDA_CHECK(call)                                                    \
     do {                                                                    \
-        cudaError_t e = (call);                                            \
-        if (e != cudaSuccess) {                                            \
+        cudaError_t cuda_check_err_ = (call);                              \
+        if (cuda_check_err_ != cudaSuccess) {                              \
             std::fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__,        \
-                         __LINE__, cudaGetErrorString(e));                  \
+                         __LINE__, cudaGetErrorString(cuda_check_err_));    \
             std::exit(1);                                                   \
         }                                                                   \
     } while (0)
@@ -55,33 +57,69 @@ __global__ void k_init_rng(curandState *st, index_t n, unsigned long long seed) 
     if (a < n) curand_init(seed, a, 0, &st[a]);
 }
 
+/* Threads per block of the force kernel (a multiple of the warp size). */
+constexpr int FORCE_BLOCK = 256;
+
+/* Sum over the 32 lanes of a warp by register shuffles (16, 8, 4, 2, 1); the
+   total ends up in lane 0. CUDA only: the example is not built for HIP, where
+   a wavefront has 64 lanes. */
+__device__ inline double warp_sum(double v) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        v += __shfl_down_sync(0xffffffffu, v, offset);
+    return v;
+}
+
+/* Sum over the thread block, valid in thread 0: each warp reduces its values,
+   lane 0 of every warp parks the partial sum in shared memory, and the first
+   warp reduces the partials. Every thread of the block must call this. */
+__device__ inline double block_sum(double v) {
+    __shared__ double partial[FORCE_BLOCK / 32];
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    v = warp_sum(v);
+    if (lane == 0) partial[warp] = v;
+    __syncthreads();
+    if (warp == 0) {
+        v = lane < FORCE_BLOCK / 32 ? partial[lane] : 0.0;
+        v = warp_sum(v);
+    }
+    return v;
+}
+
 /* Fused LJ force pass: recompute the distance from positions (plus the
-   periodic shift when `shift` is non-null), accumulate onto atom i (each
-   directed pair contributes to its own i) and the potential energy. */
+   periodic shift when `shift` is non-null) and accumulate onto atom i (each
+   directed pair contributes to its own i). The potential energy is reduced
+   within the block and added with one atomic per block rather than one per
+   pair, which would serialise the whole launch on a single address; so no
+   thread returns early, a thread without a pair in range contributes 0. */
 __global__ void k_lj_forces(const index_t *first, const index_t *secnd,
                             const index_t *shift, lj::Cell cell,
                             index_t npairs, const double *pos, double *f,
                             double *epot, double rc2) {
-    index_t p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= npairs) return;
-    const index_t i = first[p], j = secnd[p];
-    double dx = pos[3 * j] - pos[3 * i], dy = pos[3 * j + 1] - pos[3 * i + 1],
-           dz = pos[3 * j + 2] - pos[3 * i + 2];
-    if (shift) {
-        const double s0 = shift[3 * p], s1 = shift[3 * p + 1],
-                     s2 = shift[3 * p + 2];
-        dx += s0 * cell.m[0] + s1 * cell.m[3] + s2 * cell.m[6];
-        dy += s0 * cell.m[1] + s1 * cell.m[4] + s2 * cell.m[7];
-        dz += s0 * cell.m[2] + s1 * cell.m[5] + s2 * cell.m[8];
+    const index_t p = (index_t)blockIdx.x * blockDim.x + threadIdx.x;
+    double e = 0.0;
+    if (p < npairs) {
+        const index_t i = first[p], j = secnd[p];
+        double dx = pos[3 * j] - pos[3 * i], dy = pos[3 * j + 1] - pos[3 * i + 1],
+               dz = pos[3 * j + 2] - pos[3 * i + 2];
+        if (shift) {
+            const double s0 = shift[3 * p], s1 = shift[3 * p + 1],
+                         s2 = shift[3 * p + 2];
+            dx += s0 * cell.m[0] + s1 * cell.m[3] + s2 * cell.m[6];
+            dy += s0 * cell.m[1] + s1 * cell.m[4] + s2 * cell.m[7];
+            dz += s0 * cell.m[2] + s1 * cell.m[5] + s2 * cell.m[8];
+        }
+        const double r2 = dx * dx + dy * dy + dz * dz;
+        if (r2 < rc2) {
+            const double ir2 = 1.0 / r2, ir6 = ir2 * ir2 * ir2;
+            const double coef = -24.0 * ir2 * ir6 * (2.0 * ir6 - 1.0);
+            atomicAddD(&f[3 * i], coef * dx);
+            atomicAddD(&f[3 * i + 1], coef * dy);
+            atomicAddD(&f[3 * i + 2], coef * dz);
+            e = 2.0 * ir6 * (ir6 - 1.0);  /* 4 eps (...) / 2: directed pairs */
+        }
     }
-    const double r2 = dx * dx + dy * dy + dz * dz;
-    if (r2 >= rc2) return;
-    const double ir2 = 1.0 / r2, ir6 = ir2 * ir2 * ir2;
-    const double coef = -24.0 * ir2 * ir6 * (2.0 * ir6 - 1.0);
-    atomicAddD(&f[3 * i], coef * dx);
-    atomicAddD(&f[3 * i + 1], coef * dy);
-    atomicAddD(&f[3 * i + 2], coef * dz);
-    atomicAddD(epot, 2.0 * ir6 * (ir6 - 1.0));  /* 4 eps (...) / 2: directed pairs */
+    e = block_sum(e);
+    if (threadIdx.x == 0) atomicAddD(epot, e);
 }
 
 /* First half of an Allen-Tildesley Langevin step: move the positions; friction,
@@ -184,7 +222,10 @@ int main(int argc, char **argv) {
         npairs = dev.npairs;
         CUDA_CHECK(cudaMemset(d_f, 0, 3 * n * sizeof(double)));
         CUDA_CHECK(cudaMemset(d_e, 0, sizeof(double)));
-        k_lj_forces<<<((int)npairs + BLK - 1) / BLK, BLK>>>(
+        /* 64-bit grid arithmetic: large lists exceed 2^31 - FORCE_BLOCK pairs. */
+        const auto blocks =
+            static_cast<unsigned>((npairs + FORCE_BLOCK - 1) / FORCE_BLOCK);
+        k_lj_forces<<<blocks, FORCE_BLOCK>>>(
             dev.first.data(), dev.secnd.data(),
             periodic ? dev.shift.data() : nullptr, cell_val, npairs, d_pos,
             d_f, d_e, rc2);
@@ -207,7 +248,7 @@ int main(int argc, char **argv) {
                                                        d_st);
         compute_forces();
         k_langevin_kick<<<(3 * n + BLK - 1) / BLK, BLK>>>(d_vel, d_f, n, lc);
-        if (step % write_every == 0) {
+        if (write_every > 0 && step % write_every == 0) {  /* 0: no trajectory */
             CUDA_CHECK(cudaMemcpy(host_pos.data(), d_pos, 3 * n * sizeof(double),
                                   cudaMemcpyDeviceToHost));
             lj::write_xyz(out, host_pos.data(), n,

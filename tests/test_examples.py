@@ -4,12 +4,15 @@ The array example (``examples/lj_langevin/lj_langevin.py``) is imported as a
 module and its force routine is compared against an O(N^2) brute-force
 reference for both systems: the droplet in vacuum (no periodicity) and the
 bulk liquid in a periodic box (minimum-image reference; the box is larger than
-twice the cutoff). If the C++ example binary has been built
-(``BUILD_EXAMPLES=ON``) its initial potential energy is checked against the
-array example too, which exercises the shift-array path of the fused kernel.
+twice the cutoff). If the C++ example binaries have been built
+(``BUILD_EXAMPLES=ON``; the GPU one with ``ENABLE_CUDA=ON``) their initial
+potential energy is checked against the array example too, which exercises the
+shift-array path of the fused kernels. They are looked up in the source tree,
+or in ``$MATSCIPY_EXAMPLES_BUILD`` for an out-of-tree build directory.
 """
 
 import importlib.util
+import os
 import pathlib
 import re
 import subprocess
@@ -94,18 +97,25 @@ def test_liquid_lattice_is_homogeneous_and_inside_box(lj):
         assert r.min() > 1.0
 
 
-def _cpp_binary():
-    for p in _ROOT.rglob("lj_langevin_cpu"):
-        if p.is_file() and ".git" not in p.parts and "CMakeFiles" not in p.parts:
-            return p
+def _cpp_binary(name):
+    roots = [_ROOT]
+    if os.environ.get("MATSCIPY_EXAMPLES_BUILD"):
+        roots.insert(0, pathlib.Path(os.environ["MATSCIPY_EXAMPLES_BUILD"]))
+    for root in roots:
+        for p in root.rglob(name):
+            if (p.is_file() and ".git" not in p.parts
+                    and "CMakeFiles" not in p.parts):
+                return p
     return None
 
 
+@pytest.mark.parametrize("device", ["cpu", "gpu"])
 @pytest.mark.parametrize("system", ["droplet", "liquid"])
-def test_cpp_example_matches_array_example(lj, system):
-    exe = _cpp_binary()
+def test_cpp_example_matches_array_example(lj, system, device):
+    exe = _cpp_binary(f"lj_langevin_{device}")
     if exe is None:
-        pytest.skip("lj_langevin_cpu not built (BUILD_EXAMPLES=ON)")
+        pytest.skip(f"lj_langevin_{device} not built (BUILD_EXAMPLES=ON"
+                    + (", ENABLE_CUDA=ON)" if device == "gpu" else ")"))
     from matscipy_neighbours import neighbour_list
     n = 500
     positions, origin, cell, pbc = _system(lj, system, n)
@@ -113,9 +123,14 @@ def test_cpp_example_matches_array_example(lj, system):
                                   origin, cell, pbc)
     _, energy, _, npairs = lj.lj_forces_energy(np, build, positions)
 
-    out = subprocess.run([str(exe), "--system", system, "--atoms", str(n),
+    run = subprocess.run([str(exe), "--system", system, "--atoms", str(n),
                           "--steps", "0", "--out", "/dev/null"],
-                         capture_output=True, text=True, check=True).stdout
+                         capture_output=True, text=True)
+    if device == "gpu" and run.returncode != 0:
+        pytest.skip(f"lj_langevin_gpu did not run (no usable GPU?): "
+                    f"{run.stderr.strip()[:200]}")
+    assert run.returncode == 0, run.stderr
+    out = run.stdout
     m = re.search(r"pairs~(\d+)\s+E_pot=([-\d.]+)", out)
     assert m, out
     assert int(m.group(1)) == npairs

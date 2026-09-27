@@ -141,7 +141,8 @@ def make_system(xp, system, atoms, ncells, lattice, density, cutoff):
     return positions, origin, cell, False
 
 
-def make_pairs_builder(kind, neighbour_list, xp, cutoff, origin, cell, pbc):
+def make_pairs_builder(kind, neighbour_list, xp, cutoff, origin, cell, pbc,
+                       max_neighbours=96):
     """Return ``build(positions) -> (i, j, D)`` for the chosen neighbour-list
     backend. ``D == r[j] - r[i] + S @ cell`` (all backends share this
     convention; ``S`` is the cell shift of the periodic image)."""
@@ -169,6 +170,30 @@ def make_pairs_builder(kind, neighbour_list, xp, cutoff, origin, cell, pbc):
         def build(positions):
             return ms_nl("ijD", positions=positions - origin, cell=cell,
                          pbc=pbc3, cutoff=cutoff)
+        return build
+    if kind == "alchemi":
+        # NVIDIA ALCHEMI (nvalchemiops) through its PyTorch entry point, GPU
+        # only. It has no cell origin (shift the positions into the cell; the
+        # list is translation invariant) and returns indices and cell shifts,
+        # not distance vectors, so D is assembled here.
+        import torch
+        from nvalchemiops.torch.neighbors import neighbor_list as alchemi_nl
+        cell_t = torch.as_tensor(cell, device="cuda")
+        pbc_t = torch.tensor([pbc] * 3, device="cuda")
+        origin_d = xp.asarray(origin)
+        cell_d = xp.asarray(cell)
+
+        def build(positions):
+            nl, _, S = alchemi_nl(torch.from_dlpack(positions - origin_d),
+                                  cutoff, cell=cell_t, pbc=pbc_t,
+                                  method="cell_list",
+                                  max_neighbors=max_neighbours,
+                                  return_neighbor_list=True)
+            i, j = xp.from_dlpack(nl[0]), xp.from_dlpack(nl[1])
+            D = positions[j] - positions[i]
+            if pbc:
+                D += xp.from_dlpack(S).astype(D.dtype) @ cell_d
+            return i, j, D
         return build
     raise SystemExit(f"unknown neighbour backend: {kind}")
 
@@ -270,10 +295,14 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--device", choices=["cpu", "gpu"], default="cpu")
     ap.add_argument("--neighbours",
-                    choices=["matscipy", "matscipy-classic", "vesin"],
+                    choices=["matscipy", "matscipy-classic", "vesin", "alchemi"],
                     default="matscipy",
                     help="neighbour-list builder (matscipy = this library; "
-                         "matscipy-classic = the matscipy 1.2.0 package, CPU only)")
+                         "matscipy-classic = the matscipy 1.2.0 package, CPU "
+                         "only; alchemi = NVIDIA ALCHEMI, GPU only)")
+    ap.add_argument("--max-neighbours", type=int, default=96,
+                    help="per-atom capacity of ALCHEMI's internal neighbour "
+                         "matrix (alchemi only)")
     add_system_arguments(ap)
     ap.add_argument("--steps", type=int, default=2000)
     ap.add_argument("--dt", type=float, default=0.005)
@@ -281,12 +310,16 @@ def main():
     ap.add_argument("--kT", type=float, default=0.7)
     ap.add_argument("--cutoff", type=float, default=2.5)
     ap.add_argument("--out", default="traj.xyz")
-    ap.add_argument("--write-every", type=int, default=50)
+    ap.add_argument("--write-every", type=int, default=50,
+                    help="write a trajectory frame every N steps (0: none)")
     args = ap.parse_args()
 
     if args.neighbours == "matscipy-classic" and args.device == "gpu":
         raise SystemExit("matscipy-classic (the matscipy 1.2.0 package) is "
                          "CPU only; use --device cpu")
+    if args.neighbours == "alchemi" and args.device == "cpu":
+        raise SystemExit("alchemi is benchmarked on the GPU only; use "
+                         "--device gpu")
     xp, on_gpu = get_backend(args.device)
     from matscipy_neighbours import neighbour_list
 
@@ -299,7 +332,8 @@ def main():
 
     to_host = (lambda a: xp.asnumpy(a)) if on_gpu else (lambda a: np.asarray(a))
     build_ijD = make_pairs_builder(args.neighbours, neighbour_list, xp,
-                                   args.cutoff, origin, cell, pbc)
+                                   args.cutoff, origin, cell, pbc,
+                                   args.max_neighbours)
 
     volume = float(np.linalg.det(cell))
     forces, energy, virial, npairs = lj_forces_energy(xp, build_ijD, positions)
@@ -313,7 +347,7 @@ def main():
         langevin_drift(xp, positions, velocities, forces, lc)
         forces, energy, virial, npairs = lj_forces_energy(xp, build_ijD, positions)
         langevin_kick(velocities, forces, lc)
-        if step % args.write_every == 0:
+        if args.write_every > 0 and step % args.write_every == 0:
             T = kinetic_temperature(xp, velocities)
             comment = f"step={step} E_pot={energy:.4f} T={T:.4f}"
             if pbc:   # the pressure of the padded droplet box is not meaningful

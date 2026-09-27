@@ -39,6 +39,40 @@ project adheres to [Semantic Versioning](https://semver.org/).
   integrator holds the target temperature with the liquid stable at positive
   pressure, and, when built, compares the C++ example against the array
   example.
+- NVIDIA ALCHEMI (`nvalchemiops`) is a fourth neighbour-list backend
+  (`--neighbours alchemi`, GPU only): through its PyTorch interface in the
+  array and Warp examples, and through its JAX interface (jit-compiled) in the
+  JAX example, which gains `--neighbours {matscipy,alchemi}`. The Warp example
+  gains `--format matrix`, which consumes the fixed-capacity neighbour matrix
+  (matscipy-neighbours' `neighbour_matrix` or ALCHEMI's native output) with one
+  thread per atom instead of the pair list. The benchmark adds the ALCHEMI
+  curves and, in the Warp panels, the matrix-format GPU curves.
+- The JAX benchmark runs no longer let JAX reserve 75% of GPU memory up front;
+  the neighbour list allocates outside that pool, so the JAX GPU curves ran
+  out of memory at a fraction of the card's capacity.
+- The CUDA example printed and logged `E_pot=0`: its `CUDA_CHECK` macro
+  declared a local `e` that shadowed the caller's `e` in
+  `CUDA_CHECK(cudaMemcpy(&e, ...))`. Forces and timings were unaffected. The
+  example test now also checks the GPU binary when it is built, and finds
+  binaries of an out-of-tree build through `$MATSCIPY_EXAMPLES_BUILD`.
+- The GPU force kernels of the Warp and CUDA examples added every pair's
+  energy to one global value with an atomic, which serialised the launch:
+  95 of the 110 ms of a Warp step at 10⁶ atoms went to the energy sum. The
+  energy is now reduced within each thread block (Warp tiles; warp shuffles
+  and shared memory in CUDA) and added with one atomic per block. The CUDA
+  kernel also sizes its grid in 64-bit arithmetic.
+- The array, JAX and C++ examples wrote a trajectory frame at step 0 even
+  with `--write-every` larger than the step count, inside the timed loop, so
+  their benchmark timings included one full XYZ frame (with only 5 steps
+  per point at large sizes, several times the actual step time).
+  `--write-every 0` now disables the trajectory, and the benchmark uses it.
+  The JAX warm-up also runs a full discarded iteration, so that no
+  compilation falls into the timed loop.
+- `benchmark.py` stops a configuration before a run predicted to exceed
+  `--max-run-seconds` (default 60 s), caps CPU sizes with `--max-atoms-cpu`,
+  runs the multi-threaded CPU curves on the cores the process may use (not
+  all cores of the machine), saves the results after every configuration and
+  continues an interrupted run with `--resume`.
 
 ## [1.0.0] - 2026-09-26
 
