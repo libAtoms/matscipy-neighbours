@@ -35,8 +35,8 @@ i, j, D = neighbour_list("ijD", positions=positions, cell=cell, pbc=True,
 
 ## Where to go next
 
-- [Installation](installation.md) — build the CPU core and the optional GPU
-  backends.
+- [Installation](installation.md) — `pip install matscipy-neighbours` (CPU
+  only), or a source build with the CUDA/HIP GPU backend.
 - [Python API](python.md) — the high-level `neighbour_list` / `coordination`
   interface, device selection, and DLPack output.
 - [C++ API](cpp.md) — the Python-free core, the `CellGrid`, and the GPU entry

@@ -4,6 +4,15 @@ All notable changes to matscipy-neighbours are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Packaging
+
+- The package version is taken from the git tag (setuptools-scm) instead of
+  being hard-coded; `matscipy_neighbours.__version__` is available.
+- CPU-only binary wheels for Linux (x86_64, aarch64), macOS (arm64) and Windows
+  (x86_64), CPython 3.10–3.14, built and published to PyPI on each tag.
+
 ## [1.0.0] - 2026-09-26
 
 Initial release. The neighbour-list code of
@@ -74,4 +83,4 @@ Python-free C++ core, an optional GPU backend and zero-copy array interop.
   references, benchmarks) and a Lennard-Jones Langevin example in C++, NumPy,
   JAX and Warp.
 
-[1.0.0]: https://github.com/libAtoms/matscipy-neighbours/releases/tag/v1.0.0
+[1.0.0]: https://github.com/libAtoms/matscipy-neighbours/releases/tag/1.0.0

@@ -25,3 +25,4 @@
 /subprojects/packagecache/*
 /subprojects/eigen-*/*
 /subprojects/pybind11-*/*
+/dist

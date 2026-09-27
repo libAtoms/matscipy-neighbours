@@ -33,11 +33,18 @@ if _candidates:
     _candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     sys.path.insert(0, str(_candidates[0].parent))
 
-# Make the pure-Python wrapper package importable from the source tree
-# (it imports the compiled extension found above).
-_pkg_dir = _ROOT / "language_bindings" / "python"
-if _pkg_dir.is_dir():
-    sys.path.insert(0, str(_pkg_dir))
+    # Make the pure-Python wrapper package importable from the source tree
+    # (it imports the compiled extension found above).
+    _pkg_dir = _ROOT / "language_bindings" / "python"
+    if _pkg_dir.is_dir():
+        sys.path.insert(0, str(_pkg_dir))
+else:
+    # No build tree: test an installed wheel (e.g. under cibuildwheel), where
+    # the extension lives inside the package. Expose it under the top-level
+    # name the tests import.
+    import matscipy_neighbours._matscipy_neighbours as _ext
+
+    sys.modules.setdefault("_matscipy_neighbours", _ext)
 
 # test_neighbours.py is the verbatim upstream matscipy suite. It depends on ase,
 # matscipytest, the matscipy Python package and data files that are not part of
