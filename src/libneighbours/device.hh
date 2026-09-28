@@ -42,6 +42,22 @@ using gpuError_t = cudaError_t;
 #define gpuGetDevice cudaGetDevice
 #define gpuSetDevice cudaSetDevice
 #define gpuErrorUnloading cudaErrorCudartUnloading
+#define gpuErrorMemoryAllocation cudaErrorMemoryAllocation
+/* Stream-ordered memory pools (the caching allocator, memory_space_gpu.cc). */
+using gpuMemPool_t = cudaMemPool_t;
+using gpuMemPoolProps = cudaMemPoolProps;
+using gpuPointerAttributes = cudaPointerAttributes;
+#define gpuDeviceGetAttribute cudaDeviceGetAttribute
+#define gpuDevAttrMemoryPoolsSupported cudaDevAttrMemoryPoolsSupported
+#define gpuMemAllocationTypePinned cudaMemAllocationTypePinned
+#define gpuMemLocationTypeDevice cudaMemLocationTypeDevice
+#define gpuMemPoolCreate cudaMemPoolCreate
+#define gpuMemPoolSetAttribute cudaMemPoolSetAttribute
+#define gpuMemPoolAttrReleaseThreshold cudaMemPoolAttrReleaseThreshold
+#define gpuMemPoolTrimTo cudaMemPoolTrimTo
+#define gpuMallocFromPoolAsync cudaMallocFromPoolAsync
+#define gpuFreeAsync cudaFreeAsync
+#define gpuPointerGetAttributes cudaPointerGetAttributes
 #elif defined(MATSCIPY_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 using gpuError_t = hipError_t;
@@ -60,13 +76,30 @@ using gpuError_t = hipError_t;
 #define gpuGetDevice hipGetDevice
 #define gpuSetDevice hipSetDevice
 #define gpuErrorUnloading hipErrorDeinitialized
+#define gpuErrorMemoryAllocation hipErrorOutOfMemory
+using gpuMemPool_t = hipMemPool_t;
+using gpuMemPoolProps = hipMemPoolProps;
+using gpuPointerAttributes = hipPointerAttribute_t;
+#define gpuDeviceGetAttribute hipDeviceGetAttribute
+#define gpuDevAttrMemoryPoolsSupported hipDeviceAttributeMemoryPoolsSupported
+#define gpuMemAllocationTypePinned hipMemAllocationTypePinned
+#define gpuMemLocationTypeDevice hipMemLocationTypeDevice
+#define gpuMemPoolCreate hipMemPoolCreate
+#define gpuMemPoolSetAttribute hipMemPoolSetAttribute
+#define gpuMemPoolAttrReleaseThreshold hipMemPoolAttrReleaseThreshold
+#define gpuMemPoolTrimTo hipMemPoolTrimTo
+#define gpuMallocFromPoolAsync hipMallocFromPoolAsync
+#define gpuFreeAsync hipFreeAsync
+#define gpuPointerGetAttributes hipPointerGetAttributes
 #endif
 
 namespace matscipy {
 
-/* Abort with a diagnostic on a failed runtime call. The device path uses no
-   exceptions; unrecoverable runtime/allocation failures (out of memory, no
-   device) abort with a message. */
+/* Abort with a diagnostic on a failed runtime call, for unrecoverable runtime
+   failures (no device, a failed launch). Running out of memory is not one of
+   them: the allocator (memory_space_gpu.cc) checks allocations itself and
+   throws std::bad_alloc, which the public entry points turn into
+   NL_OUT_OF_MEMORY. */
 inline void gpu_check(gpuError_t err, const char *file, int line) {
     if (err != gpuSuccess) {
         std::fprintf(stderr, "[matscipy] GPU error at %s:%d: %s\n", file, line,

@@ -16,6 +16,7 @@
 #include "device_primitives.hh"
 
 #include "device.hh"
+#include "memory_space.hh"
 
 #include <cstdio>
 #include <cstdlib>
@@ -46,14 +47,13 @@ index_t device_exclusive_scan(const index_t *d_in, index_t *d_out, index_t n) {
     if (n <= 0) return 0;
     const int num_items = item_count(n);
 
-    void *d_temp = nullptr;
     std::size_t temp_bytes = 0;
-    GPU_CHECK(gpuprim::DeviceScan::ExclusiveSum(d_temp, temp_bytes, d_in, d_out,
+    GPU_CHECK(gpuprim::DeviceScan::ExclusiveSum(nullptr, temp_bytes, d_in, d_out,
                                                 num_items));
-    GPU_CHECK(gpuMalloc(&d_temp, temp_bytes));
-    GPU_CHECK(gpuprim::DeviceScan::ExclusiveSum(d_temp, temp_bytes, d_in, d_out,
-                                                num_items));
-    GPU_CHECK(gpuFree(d_temp));
+    /* At least one byte: a null scratch pointer makes CUB only report the size. */
+    Array<unsigned char, DeviceSpace> temp(temp_bytes > 0 ? temp_bytes : 1);
+    GPU_CHECK(gpuprim::DeviceScan::ExclusiveSum(temp.data(), temp_bytes, d_in,
+                                                d_out, num_items));
 
     /* Grand total = last exclusive entry + last input. Read both back. */
     index_t last_excl = 0, last_in = 0;
@@ -69,20 +69,17 @@ void device_sort_pairs(std::uint64_t *d_keys, index_t *d_values, index_t n) {
     const int num_items = item_count(n);
 
     /* CUB sorts into double buffers; allocate the alternates and let it pick. */
-    std::uint64_t *d_keys_alt = nullptr;
-    index_t *d_values_alt = nullptr;
-    GPU_CHECK(gpuMalloc(&d_keys_alt, n * sizeof(std::uint64_t)));
-    GPU_CHECK(gpuMalloc(&d_values_alt, n * sizeof(index_t)));
+    Array<std::uint64_t, DeviceSpace> keys_alt(n);
+    Array<index_t, DeviceSpace> values_alt(n);
+    gpuprim::DoubleBuffer<std::uint64_t> keys(d_keys, keys_alt.data());
+    gpuprim::DoubleBuffer<index_t> values(d_values, values_alt.data());
 
-    gpuprim::DoubleBuffer<std::uint64_t> keys(d_keys, d_keys_alt);
-    gpuprim::DoubleBuffer<index_t> values(d_values, d_values_alt);
-
-    void *d_temp = nullptr;
     std::size_t temp_bytes = 0;
-    GPU_CHECK(gpuprim::DeviceRadixSort::SortPairs(d_temp, temp_bytes, keys,
+    GPU_CHECK(gpuprim::DeviceRadixSort::SortPairs(nullptr, temp_bytes, keys,
                                                   values, num_items));
-    GPU_CHECK(gpuMalloc(&d_temp, temp_bytes));
-    GPU_CHECK(gpuprim::DeviceRadixSort::SortPairs(d_temp, temp_bytes, keys,
+    /* At least one byte: a null scratch pointer makes CUB only report the size. */
+    Array<unsigned char, DeviceSpace> temp(temp_bytes > 0 ? temp_bytes : 1);
+    GPU_CHECK(gpuprim::DeviceRadixSort::SortPairs(temp.data(), temp_bytes, keys,
                                                   values, num_items));
 
     /* If the sorted data ended up in the alternate buffer, copy it back so the
@@ -95,10 +92,6 @@ void device_sort_pairs(std::uint64_t *d_keys, index_t *d_values, index_t n) {
         GPU_CHECK(gpuMemcpy(d_values, values.Current(), n * sizeof(index_t),
                             gpuMemcpyDeviceToDevice));
     }
-
-    GPU_CHECK(gpuFree(d_temp));
-    GPU_CHECK(gpuFree(d_keys_alt));
-    GPU_CHECK(gpuFree(d_values_alt));
 }
 
 }  // namespace matscipy

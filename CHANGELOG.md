@@ -4,7 +4,100 @@ All notable changes to matscipy-neighbours are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.1.0] - Unreleased
+
+### Core
+
+- GPU buffers come from a per-device caching memory pool (stream-ordered
+  allocation with an unlimited release threshold) instead of a fresh
+  `cudaMalloc`/`cudaFree` per buffer and call; the device primitives' scratch
+  buffers use it too. A GPU pair list of 10⁶ atoms builds in about half the
+  time. `empty_gpu_cache()` (C++ and Python) returns the cached memory to the
+  driver.
+- The GPU `neighbour_matrix` is filled in a single pass of the cell-list
+  search, one thread per atom writing its own row, instead of building the
+  pair list and scattering it; it no longer clears the unused slots. About
+  4.7× faster at 10⁶ atoms, and faster than the pair list.
+- `neighbour_matrix` takes `quantities` (Python, default `"D"`) or a trailing
+  `quantities` flag argument (C++, default `QUANTITY_DISTVEC`) selecting the
+  per-slot extras: distance vectors `D`, cell shifts `S`, both or neither.
+  Indices stay int64.
+- **Behaviour change:** the unused slots of a neighbour matrix (beyond `count`)
+  are unspecified instead of 0. Consumers must select with the mask rather
+  than multiply by it; the JAX example and the documented pattern do.
+- Running out of memory no longer aborts the process: allocation failures
+  (GPU, and host `malloc`) throw `std::bad_alloc`, which the public entry
+  points return as the new `NL_OUT_OF_MEMORY` code and Python raises as
+  `MemoryError`. On the GPU the cache is emptied and the allocation retried
+  once first.
+
+### Examples and benchmark
+
+- The Lennard-Jones Langevin examples (NumPy/CuPy, JAX, Warp, C++ CPU and
+  CUDA) gain a second system, `--system liquid`: a bulk liquid at a chosen
+  reduced density in a fully periodic box, next to the existing droplet in
+  vacuum. The fused Warp and C++ kernels consume the cell-shift array `S` of
+  the list for the periodic case; the array and JAX kernels are unchanged
+  because the shifts are folded into the distance vectors.
+- `benchmark.py` sweeps both systems and writes one figure per system
+  (`docs/benchmark_liquid.png`, `docs/benchmark_droplet.png`; panels ordered
+  array / JAX / Warp / C++) plus a kernel-comparison figure
+  (`docs/benchmark_kernels.png`) on the matscipy-neighbours list alone; the
+  generated page leads with a note on Verlet shells versus per-step rebuilds.
+  `--systems` restricts the run, and older results files still replot.
+- The Langevin integrator in all example implementations applied the whole
+  force kick with the old forces; it now follows the Allen-Tildesley scheme
+  (half kick with the old forces, list and forces at the new positions, half
+  kick with the new forces), which reduces to velocity Verlet at zero
+  friction. The old scheme ran the droplet at 0.9 instead of 0.7 and heated
+  the periodic liquid until it exploded. The examples now write the kinetic
+  temperature to the trajectory.
+- The liquid's default density is 0.8442, the Verlet (1967) state point at
+  kT 0.7 (positive pressure, no cavitation at constant volume); the
+  benchmark driver takes `--density` and records it.
+- The NumPy/CuPy example computes the virial from the pair arrays and reports
+  the pressure of the periodic liquid.
+- The C++ examples print the potential energy, and the Warp example no longer
+  halves the energy twice.
+- `tests/test_examples.py` checks the array example's forces, energy and
+  virial against a brute-force reference for both systems, checks that the
+  integrator holds the target temperature with the liquid stable at positive
+  pressure, and, when built, compares the C++ example against the array
+  example.
+- NVIDIA ALCHEMI (`nvalchemiops`) is a fourth neighbour-list backend
+  (`--neighbours alchemi`, GPU only): through its PyTorch interface in the
+  array and Warp examples, and through its JAX interface (jit-compiled) in the
+  JAX example, which gains `--neighbours {matscipy,alchemi}`. The Warp example
+  gains `--format matrix`, which consumes the fixed-capacity neighbour matrix
+  (matscipy-neighbours' `neighbour_matrix` or ALCHEMI's native output) with one
+  thread per atom instead of the pair list. The benchmark adds the ALCHEMI
+  curves and, in the Warp panels, the matrix-format GPU curves.
+- The JAX benchmark runs no longer let JAX reserve 75% of GPU memory up front;
+  the neighbour list allocates outside that pool, so the JAX GPU curves ran
+  out of memory at a fraction of the card's capacity.
+- The CUDA example printed and logged `E_pot=0`: its `CUDA_CHECK` macro
+  declared a local `e` that shadowed the caller's `e` in
+  `CUDA_CHECK(cudaMemcpy(&e, ...))`. Forces and timings were unaffected. The
+  example test now also checks the GPU binary when it is built, and finds
+  binaries of an out-of-tree build through `$MATSCIPY_EXAMPLES_BUILD`.
+- The GPU force kernels of the Warp and CUDA examples added every pair's
+  energy to one global value with an atomic, which serialised the launch:
+  95 of the 110 ms of a Warp step at 10⁶ atoms went to the energy sum. The
+  energy is now reduced within each thread block (Warp tiles; warp shuffles
+  and shared memory in CUDA) and added with one atomic per block. The CUDA
+  kernel also sizes its grid in 64-bit arithmetic.
+- The array, JAX and C++ examples wrote a trajectory frame at step 0 even
+  with `--write-every` larger than the step count, inside the timed loop, so
+  their benchmark timings included one full XYZ frame (with only 5 steps
+  per point at large sizes, several times the actual step time).
+  `--write-every 0` now disables the trajectory, and the benchmark uses it.
+  The JAX warm-up also runs a full discarded iteration, so that no
+  compilation falls into the timed loop.
+- `benchmark.py` stops a configuration before a run predicted to exceed
+  `--max-run-seconds` (default 60 s), caps CPU sizes with `--max-atoms-cpu`,
+  runs the multi-threaded CPU curves on the cores the process may use (not
+  all cores of the machine), saves the results after every configuration and
+  continues an interrupted run with `--resume`.
 
 ### Packaging
 
@@ -83,4 +176,5 @@ Python-free C++ core, an optional GPU backend and zero-copy array interop.
   references, benchmarks) and a Lennard-Jones Langevin example in C++, NumPy,
   JAX and Warp.
 
+[1.1.0]: https://github.com/libAtoms/matscipy-neighbours/releases/tag/1.1.0
 [1.0.0]: https://github.com/libAtoms/matscipy-neighbours/releases/tag/1.0.0

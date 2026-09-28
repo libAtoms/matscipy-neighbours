@@ -104,7 +104,8 @@ count-only kernel that never materialises the pair list. `device` and
 ```python
 neighbour_matrix(atoms=None, cutoff=None, max_neighbours=None, *,
                  positions=None, cell=None, pbc=None, numbers=None,
-                 cell_origin=None, device=None, array_namespace=None)
+                 cell_origin=None, device=None, array_namespace=None,
+                 quantities="D")
 ```
 
 Dense, **fixed-capacity** neighbour list — each atom's neighbours fill a row of
@@ -113,12 +114,22 @@ on `n` and `max_neighbours`, not on the number of pairs). This is the form to us
 with frameworks that compile for fixed shapes (e.g. JAX `jit`), where forces are
 a masked sum over the neighbour axis with no scatter.
 
-Returns `(idx, dist, count)`:
+Returns `(idx, *per_slot, count)`:
 
-- `idx` — shape `(n, max_neighbours)`, neighbour indices (unused slots 0);
-- `dist` — shape `(n, max_neighbours, 3)`, distance vectors `D` (unused slots 0);
+- `idx` — shape `(n, max_neighbours)`, int64 neighbour indices;
+- the per-slot arrays selected by `quantities`, in the order given: `"D"` the
+  distance vectors `D` (float64), `"S"` the cell shifts (int64), each of shape
+  `(n, max_neighbours, 3)`. The default `"D"` returns `(idx, dist, count)`;
+  `""` returns `(idx, count)`, the cheapest form when the consumer recomputes
+  the distances from the positions (add `"S"` for a periodic cell);
 - `count` — shape `(n,)`, true neighbour count; mask with
   `arange(max_neighbours) < count[:, None]`.
+
+!!! warning "Unused slots are not cleared"
+    Only the first `count` slots of a row are defined; the rest may hold any
+    bit pattern, including NaN distances and out-of-range indices. Select with
+    the mask rather than multiplying by it (`0 * NaN` is NaN), and do not gather
+    with the indices of unused slots.
 
 `device` and `array_namespace` behave as for `neighbour_list`. Raises
 `ValueError` if any atom has more than `max_neighbours` neighbours (capacity too
@@ -130,8 +141,19 @@ idx, dist, count = neighbour_matrix(positions=r_jax, cell=cell, pbc=True,
                                     cutoff=2.5, max_neighbours=96,
                                     array_namespace=jnp)
 mask = jnp.arange(idx.shape[1])[None, :] < count[:, None]
+dist = jnp.where(mask[..., None], dist, 0.0)              # select, don't multiply
 r2 = jnp.where(mask, (dist * dist).sum(-1), 1.0)          # masked, jit-friendly
 ```
+
+## GPU memory
+
+The GPU backend allocates from its own caching memory pool: freed buffers stay
+reserved and are reused by the next call instead of being allocated afresh,
+which matters for calls made every step. The cached memory is not available to
+other libraries (CuPy, PyTorch, JAX, …); return it with `empty_gpu_cache()`
+before handing the device to them. Running out of memory — on the host or the
+GPU — raises `MemoryError`; on the GPU the cache is emptied and the
+allocation retried once first.
 
 ## Other functions
 
@@ -140,6 +162,9 @@ r2 = jnp.where(mask, (dist * dist).sum(-1), 1.0)          # masked, jit-friendly
   first-neighbour array.
 - `get_jump_indicies(sorted_array)` — jump indices of an ordered array.
 - `mic(dr, cell, pbc=None)` — minimum-image-convention wrap of distance vectors.
+- `empty_gpu_cache()` — return the GPU memory cached by the library's
+  allocator to the driver (see [GPU memory](#gpu-memory); no-op without a GPU
+  backend).
 
 ## `DLPackTensor`
 

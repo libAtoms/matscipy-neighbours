@@ -122,34 +122,42 @@ error_t neighbour_list(int quantities, const real_t cell_origin[3],
  * frameworks that compile for fixed shapes (e.g. JAX): forces are a masked sum
  * over the neighbour axis, with no scatter.
  *
- *   idx   [n * max_neighbours]      neighbour atom indices, row-major; unused
- *                                   slots are 0 (mask them with `count`)
- *   dist  [n * max_neighbours * 3]  distance vectors D == r[j] - r[i] + S @ cell;
- *                                   unused slots are 0
+ *   idx   [n * max_neighbours]      neighbour atom indices, row-major
+ *   dist  [n * max_neighbours * 3]  distance vectors D == r[j] - r[i] + S @ cell
+ *                                   (if QUANTITY_DISTVEC is requested)
+ *   shift [n * max_neighbours * 3]  cell shifts S (if QUANTITY_SHIFT is
+ *                                   requested)
  *   count [n]                       true neighbour count per atom (may exceed
  *                                   max_neighbours)
  *   overflow                        true if any count > max_neighbours, i.e. the
  *                                   capacity was too small and rows are clipped;
  *                                   the caller should retry with a larger capacity
+ *
+ * Only the first min(count, max_neighbours) slots of a row are defined; the
+ * contents of the unused slots are unspecified, so mask them with `count`.
  */
 struct NeighbourMatrix {
     index_t n = 0;
     index_t max_neighbours = 0;
     std::vector<index_t> idx;
     std::vector<real_t> dist;
+    std::vector<index_t> shift;
     std::vector<index_t> count;
     bool overflow = false;
 };
 
-/* Build the dense neighbour list (parameters as neighbour_list(); the requested
-   quantities are always the index + distance vector). */
+/* Build the dense neighbour list (parameters as neighbour_list()). The indices
+   and counts are always returned; `quantities` selects the per-slot extras,
+   any combination of QUANTITY_DISTVEC and QUANTITY_SHIFT (others are
+   ignored). */
 error_t neighbour_matrix(const real_t cell_origin[3], const real_t cell[9],
                          const real_t inv_cell[9], const bool pbc[3], index_t nat,
                          const real_t *positions, real_t cutoff,
                          const real_t *per_atom_cutoff,
                          const real_t *per_type_cutoff_sq, index_t ncutoffs,
                          const index_t *types, index_t max_neighbours,
-                         NeighbourMatrix &out, CellOrder order = CellOrder::Linear);
+                         NeighbourMatrix &out, CellOrder order = CellOrder::Linear,
+                         int quantities = QUANTITY_DISTVEC);
 
 }  // namespace matscipy
 

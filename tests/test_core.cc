@@ -429,6 +429,53 @@ TEST(NeighbourMatrix, MatchesPairList) {
     }
 }
 
+/* With both per-slot extras requested, every slot satisfies the distance
+   contract D == r[j] - r[i] + S @ cell; the shifts are non-trivial here. */
+TEST(NeighbourMatrix, ShiftsSatisfyContract) {
+    const int N = 600;
+    const double L = 6.0, cutoff = 1.4;
+    const real_t cell[9] = {(real_t)L, 0, 0, 0, (real_t)L, 0, 0, 0, (real_t)L};
+    const real_t inv[9] = {(real_t)(1 / L), 0, 0, 0, (real_t)(1 / L), 0,
+                           0, 0, (real_t)(1 / L)};
+    const bool pbc[3] = {true, true, true};
+    std::vector<real_t> r;
+    random_cubic(N, L, 6, r);
+
+    const index_t K = 64;
+    NeighbourMatrix nm;
+    ASSERT_EQ(neighbour_matrix(kOrigin, cell, inv, pbc, N, r.data(), cutoff,
+                               nullptr, nullptr, 0, nullptr, K, nm,
+                               CellOrder::Linear,
+                               QUANTITY_DISTVEC | QUANTITY_SHIFT),
+              NL_SUCCESS);
+    ASSERT_FALSE(nm.overflow);
+    ASSERT_EQ(nm.shift.size(), (size_t)N * K * 3);
+    bool any_shift = false;
+    for (int i = 0; i < N; i++) {
+        for (index_t s = 0; s < nm.count[i]; s++) {
+            const size_t slot = (size_t)i * K + s;
+            const index_t j = nm.idx[slot];
+            for (int k = 0; k < 3; k++) {
+                const index_t sk = nm.shift[3 * slot + k];
+                any_shift = any_shift || sk != 0;
+                /* cell is diagonal: (S @ cell)_k == S_k * L */
+                EXPECT_NEAR(nm.dist[3 * slot + k],
+                            r[3 * j + k] - r[3 * i + k] + sk * L, 1e-12);
+            }
+        }
+    }
+    EXPECT_TRUE(any_shift);
+
+    NeighbourMatrix bare;  /* no extras: only indices and counts */
+    ASSERT_EQ(neighbour_matrix(kOrigin, cell, inv, pbc, N, r.data(), cutoff,
+                               nullptr, nullptr, 0, nullptr, K, bare,
+                               CellOrder::Linear, 0),
+              NL_SUCCESS);
+    EXPECT_TRUE(bare.dist.empty());
+    EXPECT_TRUE(bare.shift.empty());
+    EXPECT_EQ(bare.count, nm.count);
+}
+
 TEST(NeighbourMatrix, OverflowFlag) {
     const int N = 800;
     const double L = 9.0, cutoff = 1.5;

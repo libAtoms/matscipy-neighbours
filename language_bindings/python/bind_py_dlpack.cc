@@ -402,19 +402,22 @@ PyObject *coordination_dlpack_impl(PyObject *, PyObject *args) {
 #endif
 }
 
-/* Dense fixed-capacity (n x K) neighbour list: returns (idx, dist, count) as
-   DLPack capsules plus an overflow flag. CPU backend yields host capsules;
-   GPU backend yields device capsules. */
+/* Dense fixed-capacity (n x K) neighbour list: returns (idx, dist, shift,
+   count) as DLPack capsules plus an overflow flag; `quantities` (QUANTITY_*
+   flags) selects dist and/or shift, the other is None. CPU backend yields host
+   capsules; GPU backend yields device capsules. */
 PyObject *neighbour_matrix_dlpack_impl(PyObject *, PyObject *args) {
     PyObject *py_origin, *py_cell, *py_inv, *py_pbc, *py_pos, *py_cut;
     int max_neighbours = 0;
     PyObject *py_types = NULL, *py_in = NULL;
-    int backend = 0, device_id = -1;
+    int backend = 0, device_id = -1, quantities = QUANTITY_DISTVEC;
 
-    if (!PyArg_ParseTuple(args, "OOOOOOi|OiOi", &py_origin, &py_cell, &py_inv,
+    if (!PyArg_ParseTuple(args, "OOOOOOi|OiOii", &py_origin, &py_cell, &py_inv,
                           &py_pbc, &py_pos, &py_cut, &max_neighbours, &py_types,
-                          &backend, &py_in, &device_id))
+                          &backend, &py_in, &device_id, &quantities))
         return NULL;
+    const bool wD = quantities & QUANTITY_DISTVEC;
+    const bool wS = quantities & QUANTITY_SHIFT;
 
 #if !(defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP))
     if (backend != 0) return no_gpu_backend();
@@ -427,7 +430,7 @@ PyObject *neighbour_matrix_dlpack_impl(PyObject *, PyObject *args) {
 
     const index_t K = max_neighbours;
     const int64_t n64 = in.g.nat, K64 = K;
-    PyRef cap_idx, cap_dist, cap_count;
+    PyRef cap_idx, cap_dist, cap_shift, cap_count;
     bool overflow = false;
 
     if (backend == 0) {
@@ -436,21 +439,26 @@ PyObject *neighbour_matrix_dlpack_impl(PyObject *, PyObject *args) {
                                       in.g.inv_data(), in.g.periodic, in.g.nat,
                                       in.g.pos_data(), in.cutoff, in.per_atom,
                                       in.per_type_sq, in.ncutoffs,
-                                      in.g.types_data(), K, nm);
+                                      in.g.types_data(), K, nm,
+                                      CellOrder::Linear, quantities);
         if (st != NL_SUCCESS) {
             raise_core_error(st);
             return NULL;
         }
         overflow = nm.overflow;
         cap_idx = host_capsule(std::move(nm.idx), 2, n64, K64, kDLInt, kIntBits);
-        cap_dist = host_capsule(std::move(nm.dist), 3, n64, K64, kDLFloat,
-                                kRealBits, 3);
+        if (wD)
+            cap_dist = host_capsule(std::move(nm.dist), 3, n64, K64, kDLFloat,
+                                    kRealBits, 3);
+        if (wS)
+            cap_shift = host_capsule(std::move(nm.shift), 3, n64, K64, kDLInt,
+                                     kIntBits, 3);
         cap_count = host_capsule(std::move(nm.count), 1, n64, 1, kDLInt, kIntBits);
     } else {
 #if defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP)
         NeighbourListRequest req = in.request(0, device_id);
         NeighbourMatrixDevice dev;
-        error_t st = neighbour_matrix_gpu_device(req, K, dev);
+        error_t st = neighbour_matrix_gpu_device(req, K, dev, quantities);
         in.imp.release();
         if (st != NL_SUCCESS) {
             raise_core_error(st);
@@ -461,15 +469,30 @@ PyObject *neighbour_matrix_dlpack_impl(PyObject *, PyObject *args) {
                                               : current_device_id();
         cap_idx = device_capsule(std::move(dev.idx), 2, n64, K64, kDLInt,
                                  kIntBits, dev_id);
-        cap_dist = device_capsule(std::move(dev.dist), 3, n64, K64, kDLFloat,
-                                  kRealBits, dev_id, 3);
+        if (wD)
+            cap_dist = device_capsule(std::move(dev.dist), 3, n64, K64, kDLFloat,
+                                      kRealBits, dev_id, 3);
+        if (wS)
+            cap_shift = device_capsule(std::move(dev.shift), 3, n64, K64,
+                                       kDLInt, kIntBits, dev_id, 3);
         cap_count = device_capsule(std::move(dev.count), 1, n64, 1, kDLInt,
                                    kIntBits, dev_id);
 #endif
     }
-    if (!cap_idx || !cap_dist || !cap_count) return NULL;
-    return PyTuple_Pack(4, cap_idx.get(), cap_dist.get(), cap_count.get(),
+    if (!cap_idx || !cap_count || (wD && !cap_dist) || (wS && !cap_shift))
+        return NULL;
+    return PyTuple_Pack(5, cap_idx.get(), wD ? cap_dist.get() : Py_None,
+                        wS ? cap_shift.get() : Py_None, cap_count.get(),
                         overflow ? Py_True : Py_False);
+}
+
+/* Return the GPU memory cached by the library's allocator to the driver
+   (no-op without a GPU backend). */
+PyObject *empty_gpu_cache_impl(PyObject *, PyObject *) {
+#if defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP)
+    empty_gpu_cache();
+#endif
+    Py_RETURN_NONE;
 }
 
 }  // namespace
@@ -486,4 +509,8 @@ PyObject *py_coordination_dlpack(PyObject *self, PyObject *args) {
 
 PyObject *py_neighbour_matrix_dlpack(PyObject *self, PyObject *args) {
     return guarded(neighbour_matrix_dlpack_impl, self, args);
+}
+
+PyObject *py_empty_gpu_cache(PyObject *self, PyObject *args) {
+    return guarded(empty_gpu_cache_impl, self, args);
 }

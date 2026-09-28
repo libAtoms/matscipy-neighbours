@@ -59,7 +59,8 @@ PyObject *guarded(F body, PyObject *self, PyObject *args) noexcept {
 }
 
 /* Raise the core error as a Python exception: NL_INVALID_ARGUMENT ->
-   ValueError, anything else -> RuntimeError. Always sets an exception. */
+   ValueError, NL_OUT_OF_MEMORY -> MemoryError, anything else -> RuntimeError.
+   Always sets an exception. */
 void raise_core_error(matscipy::error_t status);
 
 /* Owning reference to a Python object (Py_XDECREF on destruction). */

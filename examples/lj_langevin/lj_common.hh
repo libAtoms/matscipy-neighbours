@@ -1,7 +1,7 @@
 /*
- * Shared helpers for the Lennard-Jones Langevin droplet examples: an FCC
- * droplet generator, the Allen-Tildesley Langevin coefficients, and an XYZ
- * writer. Reduced LJ units (epsilon = sigma = mass = kB = 1).
+ * Shared helpers for the Lennard-Jones Langevin examples: FCC droplet and
+ * periodic-liquid generators, the Allen-Tildesley Langevin coefficients, and an
+ * XYZ writer. Reduced LJ units (epsilon = sigma = mass = kB = 1).
  */
 
 #ifndef LJ_COMMON_HH
@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <numeric>
 #include <string>
@@ -101,6 +103,47 @@ inline index_t fcc_droplet_n(index_t target_n, real_t lattice,
     return keep;
 }
 
+/* Exactly target_n atoms on FCC sites filling the periodic cubic box
+   [0, L)^3 at the given number density (L = cbrt(target_n / density)). The
+   smallest FCC lattice with at least target_n sites is scaled to the box and
+   target_n sites are kept at evenly spaced lattice indices
+   (floor(k * nsites / target_n)), so vacancies are spread homogeneously. This
+   is the same deterministic rule as fcc_liquid_n() in the Python examples, so
+   every backend starts from an identical configuration. Returns n; sets L. */
+inline index_t fcc_liquid_n(index_t target_n, real_t density,
+                            std::vector<real_t> &pos, real_t &L) {
+    const real_t basis[4][3] = {
+        {0, 0, 0}, {0.5, 0.5, 0}, {0.5, 0, 0.5}, {0, 0.5, 0.5}};
+    L = std::cbrt((double)target_n / density);
+    const int ncells = (int)std::ceil(std::cbrt((double)target_n / 4.0));
+    const real_t a = L / ncells;
+    std::vector<real_t> cand;
+    for (int ix = 0; ix < ncells; ix++)
+        for (int iy = 0; iy < ncells; iy++)
+            for (int iz = 0; iz < ncells; iz++)
+                for (auto &b : basis) {
+                    cand.push_back((ix + b[0]) * a);
+                    cand.push_back((iy + b[1]) * a);
+                    cand.push_back((iz + b[2]) * a);
+                }
+    const index_t nsites = (index_t)(cand.size() / 3);
+    pos.clear();
+    for (index_t k = 0; k < target_n; k++) {
+        const index_t s = (k * nsites) / target_n;
+        pos.push_back(cand[3 * s]);
+        pos.push_back(cand[3 * s + 1]);
+        pos.push_back(cand[3 * s + 2]);
+    }
+    return target_n;
+}
+
+/* The cell matrix as plain data, so a device kernel can take it by value. Rows
+   are the lattice vectors (row-major, as the neighbour list expects), and the
+   distance vector of a pair is D = r[j] - r[i] + S @ cell for shift S. */
+struct Cell {
+    real_t m[9];
+};
+
 /* Allen-Tildesley Langevin coefficients for timestep dt, friction gamma and
    temperature kT. Plain data so it can be passed to a device kernel by value. */
 struct Langevin {
@@ -162,6 +205,49 @@ inline void fixed_box_pos(const std::vector<real_t> &pos, real_t cutoff,
     }
     cell[0] = cell[4] = cell[8] = L;
     inv_cell[0] = inv_cell[4] = inv_cell[8] = 1.0 / L;
+}
+
+/* The periodic cubic box [0, L)^3 of the bulk liquid. */
+inline void periodic_box(real_t L, real_t origin[3], real_t cell[9],
+                         real_t inv_cell[9]) {
+    for (int k = 0; k < 3; k++) origin[k] = 0.0;
+    for (int k = 0; k < 9; k++) {
+        cell[k] = 0;
+        inv_cell[k] = 0;
+    }
+    cell[0] = cell[4] = cell[8] = L;
+    inv_cell[0] = inv_cell[4] = inv_cell[8] = 1.0 / L;
+}
+
+/* Initial positions plus the neighbour-list geometry for "droplet" or
+   "liquid". atoms == 0 means 4*ncells^3 atoms for the liquid and the
+   radius-ncells droplet otherwise. Returns n and sets periodic. */
+inline index_t make_system(const std::string &system, index_t atoms, int ncells,
+                           real_t lattice, real_t density, real_t cutoff,
+                           std::vector<real_t> &pos, real_t origin[3],
+                           real_t cell[9], real_t inv_cell[9], bool &periodic) {
+    if (system == "liquid") {
+        const index_t n_target = atoms > 0 ? atoms : (index_t)4 * ncells * ncells * ncells;
+        real_t L;
+        const index_t n = fcc_liquid_n(n_target, density, pos, L);
+        periodic_box(L, origin, cell, inv_cell);
+        periodic = true;
+        return n;
+    }
+    if (system != "droplet") {
+        std::fprintf(stderr, "unknown --system %s (droplet|liquid)\n",
+                     system.c_str());
+        std::exit(2);
+    }
+    periodic = false;
+    if (atoms > 0) {
+        const index_t n = fcc_droplet_n(atoms, lattice, pos);
+        fixed_box_pos(pos, cutoff, origin, cell, inv_cell);
+        return n;
+    }
+    const index_t n = fcc_droplet(ncells, lattice, pos);
+    fixed_box(ncells, lattice, cutoff, origin, cell, inv_cell);
+    return n;
 }
 
 }  // namespace lj

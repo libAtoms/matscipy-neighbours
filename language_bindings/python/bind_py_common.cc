@@ -29,7 +29,8 @@ namespace matscipy_py {
 
 void raise_core_error(matscipy::error_t status) {
     PyObject *type = status == matscipy::NL_INVALID_ARGUMENT ? PyExc_ValueError
-                                                              : PyExc_RuntimeError;
+                     : status == matscipy::NL_OUT_OF_MEMORY  ? PyExc_MemoryError
+                                                             : PyExc_RuntimeError;
     PyErr_SetString(type, matscipy::has_error ? matscipy::error_string
                                               : "Unknown core error.");
 }

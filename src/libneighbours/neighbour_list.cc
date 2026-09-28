@@ -147,14 +147,13 @@ error_t validate_neighbour_args(index_t nat, real_t cutoff,
     return NL_SUCCESS;
 }
 
-error_t neighbour_list(int quantities, const real_t cell_origin[3],
-                       const real_t cell[9], const real_t inv_cell[9],
-                       const bool pbc[3], index_t nat, const real_t *r,
-                       real_t cutoff, const real_t *per_atom_cutoff,
-                       const real_t *per_type_cutoff_sq, index_t ncutoffs,
-                       const index_t *types, NeighbourList &out,
-                       CellOrder order) {
-    clear_error();
+static error_t neighbour_list_body(int quantities, const real_t cell_origin[3],
+                                   const real_t cell[9], const real_t inv_cell[9],
+                                   const bool pbc[3], index_t nat, const real_t *r,
+                                   real_t cutoff, const real_t *per_atom_cutoff,
+                                   const real_t *per_type_cutoff_sq,
+                                   index_t ncutoffs, const index_t *types,
+                                   NeighbourList &out, CellOrder order) {
 
     out.first.clear();
     out.secnd.clear();
@@ -266,22 +265,42 @@ error_t neighbour_list(int quantities, const real_t cell_origin[3],
     return NL_SUCCESS;
 }
 
-error_t neighbour_matrix(const real_t cell_origin[3], const real_t cell[9],
-                         const real_t inv_cell[9], const bool pbc[3], index_t nat,
-                         const real_t *positions, real_t cutoff,
-                         const real_t *per_atom_cutoff,
-                         const real_t *per_type_cutoff_sq, index_t ncutoffs,
-                         const index_t *types, index_t max_neighbours,
-                         NeighbourMatrix &out, CellOrder order) {
+error_t neighbour_list(int quantities, const real_t cell_origin[3],
+                       const real_t cell[9], const real_t inv_cell[9],
+                       const bool pbc[3], index_t nat, const real_t *r,
+                       real_t cutoff, const real_t *per_atom_cutoff,
+                       const real_t *per_type_cutoff_sq, index_t ncutoffs,
+                       const index_t *types, NeighbourList &out,
+                       CellOrder order) {
+    clear_error();
+    return catch_out_of_memory("Out of memory building the neighbour list.", [&] {
+        return neighbour_list_body(quantities, cell_origin, cell, inv_cell, pbc,
+                                   nat, r, cutoff, per_atom_cutoff,
+                                   per_type_cutoff_sq, ncutoffs, types, out,
+                                   order);
+    });
+}
+
+static error_t neighbour_matrix_body(const real_t cell_origin[3],
+                                     const real_t cell[9],
+                                     const real_t inv_cell[9], const bool pbc[3],
+                                     index_t nat, const real_t *positions,
+                                     real_t cutoff, const real_t *per_atom_cutoff,
+                                     const real_t *per_type_cutoff_sq,
+                                     index_t ncutoffs, const index_t *types,
+                                     index_t max_neighbours, NeighbourMatrix &out,
+                                     CellOrder order, int quantities) {
     const index_t K = max_neighbours;
+    const bool wD = quantities & QUANTITY_DISTVEC;
+    const bool wS = quantities & QUANTITY_SHIFT;
     out.n = nat;
     out.max_neighbours = K;
     out.idx.clear();
     out.dist.clear();
+    out.shift.clear();
     out.count.clear();
     out.overflow = false;
 
-    clear_error();
     error_t status = validate_neighbour_args(nat, cutoff, per_atom_cutoff,
                                              per_type_cutoff_sq, ncutoffs, types);
     if (status != NL_SUCCESS) return status;
@@ -289,17 +308,21 @@ error_t neighbour_matrix(const real_t cell_origin[3], const real_t cell[9],
         return set_invalid_argument("max_neighbours must be non-negative.");
     }
 
-    out.idx.assign((size_t)nat * K, 0);
-    out.dist.assign((size_t)nat * K * 3, 0.0);
+    /* std::vector value-initialises, so the unused slots happen to be 0 here;
+       the contract leaves them unspecified (the GPU path does not clear). */
+    out.idx.resize((size_t)nat * K);
+    if (wD) out.dist.resize((size_t)nat * K * 3);
+    if (wS) out.shift.resize((size_t)nat * K * 3);
     out.count.assign(nat, 0);
     if (nat <= 0) return NL_SUCCESS;
 
     /* The dense matrix is a reshape of the pair list: build the pairs, then
        scatter each into its atom's row. */
     NeighbourList nl;
-    error_t e = neighbour_list(
-        QUANTITY_FIRST | QUANTITY_SECOND | QUANTITY_DISTVEC, cell_origin, cell,
-        inv_cell, pbc, nat, positions, cutoff, per_atom_cutoff,
+    error_t e = neighbour_list_body(
+        QUANTITY_FIRST | QUANTITY_SECOND | (wD ? QUANTITY_DISTVEC : 0) |
+            (wS ? QUANTITY_SHIFT : 0),
+        cell_origin, cell, inv_cell, pbc, nat, positions, cutoff, per_atom_cutoff,
         per_type_cutoff_sq, ncutoffs, types, nl, order);
     if (e != NL_SUCCESS) return e;
 
@@ -319,13 +342,32 @@ error_t neighbour_matrix(const real_t cell_origin[3], const real_t cell[9],
         const index_t m = deg < K ? deg : K;
         for (index_t s = 0; s < m; s++) {
             const index_t p = off[i] + s;
-            out.idx[(size_t)i * K + s] = nl.secnd[p];
-            for (int k = 0; k < 3; k++)
-                out.dist[((size_t)i * K + s) * 3 + k] = nl.distvec[3 * p + k];
+            const size_t slot = (size_t)i * K + s;
+            out.idx[slot] = nl.secnd[p];
+            for (int k = 0; k < 3; k++) {
+                if (wD) out.dist[slot * 3 + k] = nl.distvec[3 * p + k];
+                if (wS) out.shift[slot * 3 + k] = nl.shift[3 * p + k];
+            }
         }
     }
     out.overflow = overflow;
     return NL_SUCCESS;
+}
+
+error_t neighbour_matrix(const real_t cell_origin[3], const real_t cell[9],
+                         const real_t inv_cell[9], const bool pbc[3], index_t nat,
+                         const real_t *positions, real_t cutoff,
+                         const real_t *per_atom_cutoff,
+                         const real_t *per_type_cutoff_sq, index_t ncutoffs,
+                         const index_t *types, index_t max_neighbours,
+                         NeighbourMatrix &out, CellOrder order, int quantities) {
+    clear_error();
+    return catch_out_of_memory("Out of memory building the neighbour matrix.", [&] {
+        return neighbour_matrix_body(cell_origin, cell, inv_cell, pbc, nat,
+                                     positions, cutoff, per_atom_cutoff,
+                                     per_type_cutoff_sq, ncutoffs, types,
+                                     max_neighbours, out, order, quantities);
+    });
 }
 
 }  // namespace matscipy

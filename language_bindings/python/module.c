@@ -55,7 +55,9 @@ static PyMethodDef module_methods[] = {
     { "neighbour_matrix_dlpack", (PyCFunction) py_neighbour_matrix_dlpack,
       METH_VARARGS,
       "Dense fixed-capacity (n x K) neighbour list as DLPack capsules "
-      "(idx, dist, count) plus an overflow flag." },
+      "(idx, dist, shift, count) plus an overflow flag." },
+    { "empty_gpu_cache", (PyCFunction) py_empty_gpu_cache, METH_NOARGS,
+      "Return GPU memory cached by the library's allocator to the driver." },
     { "first_neighbours", (PyCFunction) py_first_neighbours, METH_VARARGS,
       "Compute indices of first neighbours in neighbour list array." },
     { "triplet_list", (PyCFunction) py_triplet_list, METH_VARARGS,

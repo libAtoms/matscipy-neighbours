@@ -54,6 +54,12 @@ error_t set_invalid_argumentf(const char *fmt, ...) {
     return NL_INVALID_ARGUMENT;
 }
 
+error_t set_out_of_memory(const char *msg) {
+    has_error = true;
+    copy_message(error_string, msg);
+    return NL_OUT_OF_MEMORY;
+}
+
 void clear_error() { has_error = false; }
 
 }  // namespace matscipy

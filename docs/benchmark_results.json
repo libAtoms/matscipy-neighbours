@@ -1,0 +1,1767 @@
+{
+ "meta": {
+  "cpu": "AMD EPYC 9654 96-Core Processor (23 usable cores)",
+  "gpu": "NVIDIA H200",
+  "ncores": 23,
+  "systems": [
+   "liquid",
+   "droplet"
+  ],
+  "density": 0.8442,
+  "sizes": [
+   100,
+   1000,
+   10000,
+   100000,
+   1000000,
+   3000000,
+   10000000,
+   30000000
+  ],
+  "steps": 40,
+  "timeout": 300,
+  "max_run_seconds": 60.0,
+  "max_atoms_cpu": 1000000,
+  "thrash_growth": 0.0
+ },
+ "systems": {
+  "liquid": [
+   {
+    "kernel": "array",
+    "nl": "matscipy",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      3.275
+     ],
+     [
+      1000,
+      2.406
+     ],
+     [
+      10000,
+      2.219
+     ],
+     [
+      100000,
+      4.271
+     ],
+     [
+      1000000,
+      22.106
+     ],
+     [
+      3000000,
+      58.423
+     ],
+     [
+      10000000,
+      187.794
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "array",
+    "nl": "matscipy",
+    "device": "cpu",
+    "threads": "mt",
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      8.2
+     ],
+     [
+      1000,
+      68.246
+     ],
+     [
+      10000,
+      52.192
+     ],
+     [
+      100000,
+      421.865
+     ],
+     [
+      1000000,
+      3530.317
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "array",
+    "nl": "matscipy",
+    "device": "cpu",
+    "threads": "1t",
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      1.626
+     ],
+     [
+      1000,
+      8.004
+     ],
+     [
+      10000,
+      55.45
+     ],
+     [
+      100000,
+      577.282
+     ],
+     [
+      1000000,
+      6324.547
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "array",
+    "nl": "matscipy-classic",
+    "device": "cpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      5.026
+     ],
+     [
+      1000,
+      12.431
+     ],
+     [
+      10000,
+      99.624
+     ],
+     [
+      100000,
+      1042.43
+     ],
+     [
+      1000000,
+      10349.777
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "array",
+    "nl": "vesin",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      2.434
+     ],
+     [
+      1000,
+      2.442
+     ],
+     [
+      10000,
+      4.384
+     ],
+     [
+      100000,
+      44.375
+     ],
+     [
+      1000000,
+      413.691
+     ],
+     [
+      3000000,
+      1918.011
+     ],
+     [
+      10000000,
+      6167.782
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "array",
+    "nl": "vesin",
+    "device": "cpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      1.865
+     ],
+     [
+      1000,
+      10.808
+     ],
+     [
+      10000,
+      81.673
+     ],
+     [
+      100000,
+      738.53
+     ],
+     [
+      1000000,
+      7898.533
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "array",
+    "nl": "alchemi",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      3.29
+     ],
+     [
+      1000,
+      3.318
+     ],
+     [
+      10000,
+      3.661
+     ],
+     [
+      100000,
+      6.713
+     ],
+     [
+      1000000,
+      34.725
+     ],
+     [
+      3000000,
+      93.342
+     ],
+     [
+      10000000,
+      376.821
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "jax",
+    "nl": "matscipy",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      1.663
+     ],
+     [
+      1000,
+      1.322
+     ],
+     [
+      10000,
+      1.408
+     ],
+     [
+      100000,
+      1.943
+     ],
+     [
+      1000000,
+      10.928
+     ],
+     [
+      3000000,
+      30.474
+     ],
+     [
+      10000000,
+      99.788
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "jax",
+    "nl": "matscipy",
+    "device": "cpu",
+    "threads": "mt",
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      16.218
+     ],
+     [
+      1000,
+      9.984
+     ],
+     [
+      10000,
+      34.028
+     ],
+     [
+      100000,
+      217.465
+     ],
+     [
+      1000000,
+      1502.289
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "jax",
+    "nl": "matscipy",
+    "device": "cpu",
+    "threads": "1t",
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      1.759
+     ],
+     [
+      1000,
+      6.054
+     ],
+     [
+      10000,
+      46.334
+     ],
+     [
+      100000,
+      430.362
+     ],
+     [
+      1000000,
+      4489.424
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "jax",
+    "nl": "matscipy-classic",
+    "device": "cpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": false
+   },
+   {
+    "kernel": "jax",
+    "nl": "vesin",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": false
+   },
+   {
+    "kernel": "jax",
+    "nl": "vesin",
+    "device": "cpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": false
+   },
+   {
+    "kernel": "jax",
+    "nl": "alchemi",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      0.618
+     ],
+     [
+      1000,
+      0.945
+     ],
+     [
+      10000,
+      1.199
+     ],
+     [
+      100000,
+      2.06
+     ],
+     [
+      1000000,
+      15.666
+     ],
+     [
+      3000000,
+      45.921
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "warp",
+    "nl": "matscipy",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      1.33
+     ],
+     [
+      1000,
+      0.964
+     ],
+     [
+      10000,
+      1.104
+     ],
+     [
+      100000,
+      1.906
+     ],
+     [
+      1000000,
+      13.46
+     ],
+     [
+      3000000,
+      38.397
+     ],
+     [
+      10000000,
+      126.002
+     ],
+     [
+      30000000,
+      376.853
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "warp",
+    "nl": "matscipy",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "matrix",
+    "supported": true,
+    "points": [
+     [
+      100,
+      1.119
+     ],
+     [
+      1000,
+      0.875
+     ],
+     [
+      10000,
+      0.877
+     ],
+     [
+      100000,
+      1.364
+     ],
+     [
+      1000000,
+      7.957
+     ],
+     [
+      3000000,
+      21.72
+     ],
+     [
+      10000000,
+      71.159
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "warp",
+    "nl": "matscipy",
+    "device": "cpu",
+    "threads": "mt",
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      3.622
+     ],
+     [
+      1000,
+      4.254
+     ],
+     [
+      10000,
+      29.248
+     ],
+     [
+      100000,
+      193.975
+     ],
+     [
+      1000000,
+      1593.998
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "warp",
+    "nl": "matscipy",
+    "device": "cpu",
+    "threads": "1t",
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      1.12
+     ],
+     [
+      1000,
+      4.284
+     ],
+     [
+      10000,
+      37.568
+     ],
+     [
+      100000,
+      380.121
+     ],
+     [
+      1000000,
+      4466.501
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "warp",
+    "nl": "matscipy-classic",
+    "device": "cpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      4.518
+     ],
+     [
+      1000,
+      9.018
+     ],
+     [
+      10000,
+      77.687
+     ],
+     [
+      100000,
+      822.735
+     ],
+     [
+      1000000,
+      8098.986
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "warp",
+    "nl": "vesin",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      0.908
+     ],
+     [
+      1000,
+      0.984
+     ],
+     [
+      10000,
+      2.427
+     ],
+     [
+      100000,
+      30.673
+     ],
+     [
+      1000000,
+      305.67
+     ],
+     [
+      3000000,
+      1462.171
+     ],
+     [
+      10000000,
+      5054.874
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "warp",
+    "nl": "vesin",
+    "device": "cpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      1.876
+     ],
+     [
+      1000,
+      7.862
+     ],
+     [
+      10000,
+      47.203
+     ],
+     [
+      100000,
+      419.877
+     ],
+     [
+      1000000,
+      5501.902
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "warp",
+    "nl": "alchemi",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      1.617
+     ],
+     [
+      1000,
+      1.574
+     ],
+     [
+      10000,
+      1.675
+     ],
+     [
+      100000,
+      2.548
+     ],
+     [
+      1000000,
+      14.109
+     ],
+     [
+      3000000,
+      36.409
+     ],
+     [
+      10000000,
+      194.677
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "warp",
+    "nl": "alchemi",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "matrix",
+    "supported": true,
+    "points": [
+     [
+      100,
+      1.342
+     ],
+     [
+      1000,
+      1.343
+     ],
+     [
+      10000,
+      1.443
+     ],
+     [
+      100000,
+      1.835
+     ],
+     [
+      1000000,
+      7.191
+     ],
+     [
+      3000000,
+      17.256
+     ],
+     [
+      10000000,
+      131.293
+     ],
+     [
+      30000000,
+      387.868
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "cpp",
+    "nl": "matscipy",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      0.984
+     ],
+     [
+      1000,
+      0.579
+     ],
+     [
+      10000,
+      0.641
+     ],
+     [
+      100000,
+      1.381
+     ],
+     [
+      1000000,
+      11.269
+     ],
+     [
+      3000000,
+      32.321
+     ],
+     [
+      10000000,
+      106.175
+     ],
+     [
+      30000000,
+      317.619
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "cpp",
+    "nl": "matscipy",
+    "device": "cpu",
+    "threads": "mt",
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      6.324
+     ],
+     [
+      1000,
+      3.816
+     ],
+     [
+      10000,
+      20.718
+     ],
+     [
+      100000,
+      103.592
+     ],
+     [
+      1000000,
+      580.656
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "cpp",
+    "nl": "matscipy",
+    "device": "cpu",
+    "threads": "1t",
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      0.899
+     ],
+     [
+      1000,
+      3.702
+     ],
+     [
+      10000,
+      32.695
+     ],
+     [
+      100000,
+      316.25
+     ],
+     [
+      1000000,
+      3710.509
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "cpp",
+    "nl": "matscipy-classic",
+    "device": "cpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": false
+   },
+   {
+    "kernel": "cpp",
+    "nl": "vesin",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": false
+   },
+   {
+    "kernel": "cpp",
+    "nl": "vesin",
+    "device": "cpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": false
+   },
+   {
+    "kernel": "cpp",
+    "nl": "alchemi",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": false
+   }
+  ],
+  "droplet": [
+   {
+    "kernel": "array",
+    "nl": "matscipy",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      2.02
+     ],
+     [
+      1000,
+      1.912
+     ],
+     [
+      10000,
+      2.032
+     ],
+     [
+      100000,
+      4.345
+     ],
+     [
+      1000000,
+      20.999
+     ],
+     [
+      3000000,
+      57.886
+     ],
+     [
+      10000000,
+      187.627
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "array",
+    "nl": "matscipy",
+    "device": "cpu",
+    "threads": "mt",
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      0.677
+     ],
+     [
+      1000,
+      5.205
+     ],
+     [
+      10000,
+      56.53
+     ],
+     [
+      100000,
+      428.494
+     ],
+     [
+      1000000,
+      3375.556
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "array",
+    "nl": "matscipy",
+    "device": "cpu",
+    "threads": "1t",
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      0.579
+     ],
+     [
+      1000,
+      6.278
+     ],
+     [
+      10000,
+      59.444
+     ],
+     [
+      100000,
+      606.012
+     ],
+     [
+      1000000,
+      6034.779
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "array",
+    "nl": "matscipy-classic",
+    "device": "cpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      0.752
+     ],
+     [
+      1000,
+      8.983
+     ],
+     [
+      10000,
+      104.207
+     ],
+     [
+      100000,
+      1169.493
+     ],
+     [
+      1000000,
+      12902.915
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "array",
+    "nl": "vesin",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      2.26
+     ],
+     [
+      1000,
+      2.788
+     ],
+     [
+      10000,
+      5.298
+     ],
+     [
+      100000,
+      44.968
+     ],
+     [
+      1000000,
+      428.213
+     ],
+     [
+      3000000,
+      2066.434
+     ],
+     [
+      10000000,
+      7723.485
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "array",
+    "nl": "vesin",
+    "device": "cpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      1.422
+     ],
+     [
+      1000,
+      11.491
+     ],
+     [
+      10000,
+      85.437
+     ],
+     [
+      100000,
+      879.758
+     ],
+     [
+      1000000,
+      8290.302
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "array",
+    "nl": "alchemi",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      3.395
+     ],
+     [
+      1000,
+      3.506
+     ],
+     [
+      10000,
+      3.735
+     ],
+     [
+      100000,
+      6.487
+     ],
+     [
+      1000000,
+      29.08
+     ],
+     [
+      3000000,
+      83.516
+     ],
+     [
+      10000000,
+      772.013
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "jax",
+    "nl": "matscipy",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      1.231
+     ],
+     [
+      1000,
+      1.314
+     ],
+     [
+      10000,
+      1.311
+     ],
+     [
+      100000,
+      2.308
+     ],
+     [
+      1000000,
+      10.837
+     ],
+     [
+      3000000,
+      30.853
+     ],
+     [
+      10000000,
+      100.583
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "jax",
+    "nl": "matscipy",
+    "device": "cpu",
+    "threads": "mt",
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      1.187
+     ],
+     [
+      1000,
+      12.193
+     ],
+     [
+      10000,
+      36.582
+     ],
+     [
+      100000,
+      200.301
+     ],
+     [
+      1000000,
+      1447.397
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "jax",
+    "nl": "matscipy",
+    "device": "cpu",
+    "threads": "1t",
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      1.185
+     ],
+     [
+      1000,
+      5.022
+     ],
+     [
+      10000,
+      45.138
+     ],
+     [
+      100000,
+      449.263
+     ],
+     [
+      1000000,
+      4154.614
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "jax",
+    "nl": "matscipy-classic",
+    "device": "cpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": false
+   },
+   {
+    "kernel": "jax",
+    "nl": "vesin",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": false
+   },
+   {
+    "kernel": "jax",
+    "nl": "vesin",
+    "device": "cpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": false
+   },
+   {
+    "kernel": "jax",
+    "nl": "alchemi",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      0.807
+     ],
+     [
+      1000,
+      0.881
+     ],
+     [
+      10000,
+      0.537
+     ],
+     [
+      100000,
+      2.022
+     ],
+     [
+      1000000,
+      15.525
+     ],
+     [
+      3000000,
+      46.503
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "warp",
+    "nl": "matscipy",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      0.64
+     ],
+     [
+      1000,
+      0.776
+     ],
+     [
+      10000,
+      1.118
+     ],
+     [
+      100000,
+      1.509
+     ],
+     [
+      1000000,
+      9.19
+     ],
+     [
+      3000000,
+      26.16
+     ],
+     [
+      10000000,
+      87.914
+     ],
+     [
+      30000000,
+      264.404
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "warp",
+    "nl": "matscipy",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "matrix",
+    "supported": true,
+    "points": [
+     [
+      100,
+      0.583
+     ],
+     [
+      1000,
+      0.684
+     ],
+     [
+      10000,
+      0.778
+     ],
+     [
+      100000,
+      0.998
+     ],
+     [
+      1000000,
+      5.07
+     ],
+     [
+      3000000,
+      13.908
+     ],
+     [
+      10000000,
+      46.645
+     ],
+     [
+      30000000,
+      141.561
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "warp",
+    "nl": "matscipy",
+    "device": "cpu",
+    "threads": "mt",
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      7.263
+     ],
+     [
+      1000,
+      13.454
+     ],
+     [
+      10000,
+      16.061
+     ],
+     [
+      100000,
+      179.584
+     ],
+     [
+      1000000,
+      1194.201
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "warp",
+    "nl": "matscipy",
+    "device": "cpu",
+    "threads": "1t",
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      0.221
+     ],
+     [
+      1000,
+      2.799
+     ],
+     [
+      10000,
+      33.555
+     ],
+     [
+      100000,
+      356.947
+     ],
+     [
+      1000000,
+      3612.063
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "warp",
+    "nl": "matscipy-classic",
+    "device": "cpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      0.299
+     ],
+     [
+      1000,
+      5.615
+     ],
+     [
+      10000,
+      78.073
+     ],
+     [
+      100000,
+      908.742
+     ],
+     [
+      1000000,
+      10088.356
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "warp",
+    "nl": "vesin",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      0.612
+     ],
+     [
+      1000,
+      0.857
+     ],
+     [
+      10000,
+      2.205
+     ],
+     [
+      100000,
+      18.671
+     ],
+     [
+      1000000,
+      199.75
+     ],
+     [
+      3000000,
+      1065.784
+     ],
+     [
+      10000000,
+      5299.163
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "warp",
+    "nl": "vesin",
+    "device": "cpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      1.196
+     ],
+     [
+      1000,
+      3.23
+     ],
+     [
+      10000,
+      28.945
+     ],
+     [
+      100000,
+      385.43
+     ],
+     [
+      1000000,
+      4608.934
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "warp",
+    "nl": "alchemi",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      1.421
+     ],
+     [
+      1000,
+      1.518
+     ],
+     [
+      10000,
+      1.7
+     ],
+     [
+      100000,
+      2.756
+     ],
+     [
+      1000000,
+      15.764
+     ],
+     [
+      3000000,
+      50.18
+     ],
+     [
+      10000000,
+      665.359
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "warp",
+    "nl": "alchemi",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "matrix",
+    "supported": true,
+    "points": [
+     [
+      100,
+      1.194
+     ],
+     [
+      1000,
+      1.258
+     ],
+     [
+      10000,
+      1.412
+     ],
+     [
+      100000,
+      1.963
+     ],
+     [
+      1000000,
+      8.834
+     ],
+     [
+      3000000,
+      29.56
+     ],
+     [
+      10000000,
+      597.086
+     ],
+     [
+      30000000,
+      2288.249
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "cpp",
+    "nl": "matscipy",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      0.327
+     ],
+     [
+      1000,
+      0.465
+     ],
+     [
+      10000,
+      0.569
+     ],
+     [
+      100000,
+      1.09
+     ],
+     [
+      1000000,
+      8.004
+     ],
+     [
+      3000000,
+      22.923
+     ],
+     [
+      10000000,
+      76.668
+     ],
+     [
+      30000000,
+      229.732
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "cpp",
+    "nl": "matscipy",
+    "device": "cpu",
+    "threads": "mt",
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      17.899
+     ],
+     [
+      1000,
+      4.233
+     ],
+     [
+      10000,
+      16.923
+     ],
+     [
+      100000,
+      119.451
+     ],
+     [
+      1000000,
+      413.311
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "cpp",
+    "nl": "matscipy",
+    "device": "cpu",
+    "threads": "1t",
+    "fmt": "list",
+    "supported": true,
+    "points": [
+     [
+      100,
+      0.082
+     ],
+     [
+      1000,
+      2.369
+     ],
+     [
+      10000,
+      31.271
+     ],
+     [
+      100000,
+      310.375
+     ],
+     [
+      1000000,
+      3121.076
+     ]
+    ],
+    "done": true
+   },
+   {
+    "kernel": "cpp",
+    "nl": "matscipy-classic",
+    "device": "cpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": false
+   },
+   {
+    "kernel": "cpp",
+    "nl": "vesin",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": false
+   },
+   {
+    "kernel": "cpp",
+    "nl": "vesin",
+    "device": "cpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": false
+   },
+   {
+    "kernel": "cpp",
+    "nl": "alchemi",
+    "device": "gpu",
+    "threads": null,
+    "fmt": "list",
+    "supported": false
+   }
+  ]
+ }
+}

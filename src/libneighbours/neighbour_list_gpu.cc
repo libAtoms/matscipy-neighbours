@@ -101,6 +101,33 @@ struct Filler {
     }
 };
 
+/* Writes each neighbour into the next slot of the atom's row of the dense
+   matrix; `w` keeps counting past the capacity K so the true degree is known. */
+struct MatrixFiller {
+    index_t i, K, w = 0;
+    const index_t *sorted_atom;
+    index_t *idx, *shift;
+    real_t *dist;
+    MATSCIPY_HD void operator()(index_t sj, const real_t *dr, real_t,
+                                const index_t *sh) {
+        if (w < K) {
+            const std::size_t slot = static_cast<std::size_t>(i) * K + w;
+            idx[slot] = sorted_atom[sj];
+            if (dist) {
+                dist[3 * slot + 0] = dr[0];
+                dist[3 * slot + 1] = dr[1];
+                dist[3 * slot + 2] = dr[2];
+            }
+            if (shift) {
+                shift[3 * slot + 0] = sh[0];
+                shift[3 * slot + 1] = sh[1];
+                shift[3 * slot + 2] = sh[2];
+            }
+        }
+        w++;
+    }
+};
+
 /* Atomic post-increment of a 64-bit index (histogram / cursor / row counters).
    CUDA and HIP provide 64-bit atomicAdd only for unsigned long long. */
 __device__ inline index_t atomic_inc(index_t *p) {
@@ -283,6 +310,27 @@ __global__ void k_fill(NeighbourContext c, Query q, index_t nat,
     visit_neighbours(c, q, si, f);
 }
 
+/* Dense matrix in a single pass: one thread per atom fills its own row while
+   visiting the neighbours, so there is no counting pass, no intermediate pair
+   list and no atomic slot assignment. */
+template <typename Query>
+__global__ void k_fill_matrix(NeighbourContext c, Query q, index_t nat,
+                              index_t K, index_t *idx, real_t *dist,
+                              index_t *shift, index_t *count, int *overflow) {
+    index_t si = blockIdx.x * blockDim.x + threadIdx.x;
+    if (si >= nat) return;
+    MatrixFiller f;
+    f.i = c.sorted_atom[si];
+    f.K = K;
+    f.sorted_atom = c.sorted_atom;
+    f.idx = idx;
+    f.dist = dist;
+    f.shift = shift;
+    visit_neighbours(c, q, si, f);
+    count[f.i] = f.w;
+    if (f.w > K) *overflow = 1;
+}
+
 /* Device buffer alias (RAII via Array). */
 template <typename T>
 using DBuf = Array<T, DeviceSpace>;
@@ -333,12 +381,13 @@ static error_t count_and_fill(const NeighbourContext &ctx, const Query &q, index
     return NL_SUCCESS;
 }
 
-/* Shared kernel pipeline. Runs the whole build and leaves the requested output
-   quantities in `dev` (device memory). Both public entry points wrap this. */
-static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
-                            NeighbourListDevice &dev) {
+/* Shared kernel pipeline: validates the request, builds the cell list and the
+   traversal context in device memory, then hands the context and the chosen
+   cell lookup (dense or sparse) to `run(ctx, query)` for the final pass. The
+   context's buffers live until `run` returns. */
+template <typename Run>
+static error_t with_context(const NeighbourListRequest &req, Run &&run) {
     /* Unpack the request into the local names the body uses. */
-    const int quantities = req.quantities;
     const real_t *cell_origin = req.cell_origin;
     const real_t *cell = req.cell;
     const real_t *inv_cell = req.inv_cell;
@@ -354,8 +403,6 @@ static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
     const CellOrder order = req.order;
     const int device_id = req.device_id;
 
-    clear_error();
-    dev.npairs = 0;
     error_t status = validate_neighbour_args(nat, cutoff, per_atom_cutoff,
                                              per_type_cutoff_sq, ncutoffs, types);
     if (status != NL_SUCCESS) return status;
@@ -524,105 +571,99 @@ static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
     ctx.per_atom = per_atom_cutoff ? d_per_atom_s.data() : nullptr;
     ctx.types = types ? d_types_s.data() : nullptr;
 
-    /* 4. two-pass count/fill, dispatched on the chosen cell-lookup policy. */
+    /* 4. the final pass, dispatched on the chosen cell-lookup policy. */
     if (!sparse) {
         DenseQuery q{n1, n2, d_cell_first.data(), d_cell_count.data()};
-        return count_and_fill(ctx, q, nat, quantities, want_pairs, dev);
+        return run(ctx, q);
     }
     SparseQuery q{n1,  n2,           hmask, d_hkey.data(),
                      d_hfirst.data(), d_hcount.data()};
-    return count_and_fill(ctx, q, nat, quantities, want_pairs, dev);
+    return run(ctx, q);
 }
 
-/* Scatter the pair list into a dense (n x K) matrix: each pair goes into the
-   next free slot of its atom's row; count holds the true degree (the atomic
-   counter), and overflow is flagged when a row exceeds K. */
-__global__ void k_scatter_matrix(const index_t *first, const index_t *secnd,
-                                 const real_t *distvec, index_t npairs, int K,
-                                 index_t *idx, real_t *dist, index_t *count,
-                                 int *overflow) {
-    index_t p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= npairs) return;
-    index_t i = first[p];
-    index_t s = atomic_inc(&count[i]);
-    if (s < K) {
-        std::size_t base = (static_cast<std::size_t>(i) * K + s);
-        idx[base] = secnd[p];
-        dist[base * 3 + 0] = distvec[3 * p + 0];
-        dist[base * 3 + 1] = distvec[3 * p + 1];
-        dist[base * 3 + 2] = distvec[3 * p + 2];
-    } else {
-        *overflow = 1;
-    }
+/* Pair list (or, without `want_pairs`, only the per-atom counts) in `dev`. */
+static error_t build_device(const NeighbourListRequest &req, bool want_pairs,
+                            NeighbourListDevice &dev) {
+    dev.npairs = 0;
+    return with_context(req, [&](const NeighbourContext &ctx, const auto &q) {
+        return count_and_fill(ctx, q, req.nat, req.quantities, want_pairs, dev);
+    });
 }
 
 }  // namespace
 
 error_t neighbour_list_gpu_device(const NeighbourListRequest &req,
                                   NeighbourListDevice &out) {
-    return build_device(req, /*want_pairs=*/true, out);
+    clear_error();
+    return catch_out_of_memory("GPU out of memory building the neighbour list.",
+                               [&] { return build_device(req, true, out); });
 }
 
 error_t neighbour_count_gpu_device(const NeighbourListRequest &req,
                                    NeighbourListDevice &out) {
     /* Per-atom neighbour counts without materialising the pairs. */
-    return build_device(req, /*want_pairs=*/false, out);
+    clear_error();
+    return catch_out_of_memory("GPU out of memory counting neighbours.",
+                               [&] { return build_device(req, false, out); });
 }
 
-error_t neighbour_matrix_gpu_device(const NeighbourListRequest &req, index_t K,
-                                    NeighbourMatrixDevice &out) {
-    clear_error();
+static error_t neighbour_matrix_body(const NeighbourListRequest &req, index_t K,
+                                     NeighbourMatrixDevice &out, int quantities) {
     const index_t n = req.nat;
+    const bool wD = quantities & QUANTITY_DISTVEC;
+    const bool wS = quantities & QUANTITY_SHIFT;
     if (K < 0) return set_invalid_argument("max_neighbours must be non-negative.");
     if (n >= kMaxDeviceAtoms)
         return set_error("GPU backend supports at most 2^29 atoms per call.");
-    DeviceGuard guard(req.device_id);  /* allocate + scatter on the input device */
+    DeviceGuard guard(req.device_id);  /* allocate + fill on the input device */
     out.n = n;
     out.max_neighbours = K;
     out.overflow = false;
-    out.idx.resize(0);
-    out.dist.resize(0);
-    out.count.resize(0);
+    /* No clearing: only the first min(count, K) slots of a row are defined. */
+    const std::size_t slots = static_cast<std::size_t>(n) * K;
+    out.idx.resize(slots);
+    out.dist.resize(wD ? 3 * slots : 0);
+    out.shift.resize(wS ? 3 * slots : 0);
+    out.count.resize(n);
     if (n <= 0) return NL_SUCCESS;
 
-    /* Build the pair list on the device, then scatter it into the dense rows. */
-    NeighbourListRequest r = req;
-    r.quantities = QUANTITY_FIRST | QUANTITY_SECOND | QUANTITY_DISTVEC;
-    NeighbourListDevice dev;
-    error_t e = build_device(r, /*want_pairs=*/true, dev);
-    if (e != NL_SUCCESS) return e;
-
-    out.idx.resize(static_cast<std::size_t>(n) * K);
-    out.dist.resize(static_cast<std::size_t>(n) * K * 3);
-    out.count.resize(n);
-    GPU_CHECK(gpuMemset(out.idx.data(), 0,
-                        static_cast<std::size_t>(n) * K * sizeof(index_t)));
-    GPU_CHECK(gpuMemset(out.dist.data(), 0,
-                        static_cast<std::size_t>(n) * K * 3 * sizeof(real_t)));
-    GPU_CHECK(gpuMemset(out.count.data(), 0, n * sizeof(index_t)));
     DBuf<int> d_overflow(1);
     GPU_CHECK(gpuMemset(d_overflow.data(), 0, sizeof(int)));
-
-    if (dev.npairs > 0) {
-        GPU_LAUNCH(k_scatter_matrix, grid_for(dev.npairs), BLOCK, dev.first.data(),
-                   dev.secnd.data(), dev.distvec.data(), dev.npairs,
-                   static_cast<int>(K), out.idx.data(), out.dist.data(),
-                   out.count.data(), d_overflow.data());
-    }
-    int host_overflow = 0;
+    error_t e = with_context(req, [&](const NeighbourContext &ctx, const auto &q) {
+        GPU_LAUNCH(k_fill_matrix, grid_for(n), BLOCK, ctx, q, n, K,
+                   out.idx.data(), wD ? out.dist.data() : nullptr,
+                   wS ? out.shift.data() : nullptr, out.count.data(),
+                   d_overflow.data());
+        return NL_SUCCESS;
+    });
+    if (e != NL_SUCCESS) return e;
+    int host_overflow = 0;  /* the blocking copy also waits for the fill */
     GPU_CHECK(gpuMemcpy(&host_overflow, d_overflow.data(), sizeof(int),
                         gpuMemcpyDeviceToHost));
     out.overflow = host_overflow != 0;
     return NL_SUCCESS;
 }
 
-error_t neighbour_list_gpu(int quantities, const real_t cell_origin[3],
-                           const real_t cell[9], const real_t inv_cell[9],
-                           const bool pbc[3], index_t nat, const real_t *r,
-                           real_t cutoff, const real_t *per_atom_cutoff,
-                           const real_t *per_type_cutoff_sq, index_t ncutoffs,
-                           const index_t *types, NeighbourList &out,
-                           CellOrder order) {
+error_t neighbour_matrix_gpu_device(const NeighbourListRequest &req, index_t K,
+                                    NeighbourMatrixDevice &out, int quantities) {
+    clear_error();
+    out.idx.resize(0);
+    out.dist.resize(0);
+    out.shift.resize(0);
+    out.count.resize(0);
+    return catch_out_of_memory(
+        "GPU out of memory building the neighbour matrix.",
+        [&] { return neighbour_matrix_body(req, K, out, quantities); });
+}
+
+static error_t neighbour_list_gpu_body(int quantities, const real_t cell_origin[3],
+                                       const real_t cell[9],
+                                       const real_t inv_cell[9], const bool pbc[3],
+                                       index_t nat, const real_t *r, real_t cutoff,
+                                       const real_t *per_atom_cutoff,
+                                       const real_t *per_type_cutoff_sq,
+                                       index_t ncutoffs, const index_t *types,
+                                       NeighbourList &out, CellOrder order) {
     out.first.clear();
     out.secnd.clear();
     out.distvec.clear();
@@ -672,6 +713,23 @@ error_t neighbour_list_gpu(int quantities, const real_t cell_origin[3],
     d2h_r(out.absdist, dev.absdist);
     d2h_i(out.shift, dev.shift);
     return NL_SUCCESS;
+}
+
+error_t neighbour_list_gpu(int quantities, const real_t cell_origin[3],
+                           const real_t cell[9], const real_t inv_cell[9],
+                           const bool pbc[3], index_t nat, const real_t *r,
+                           real_t cutoff, const real_t *per_atom_cutoff,
+                           const real_t *per_type_cutoff_sq, index_t ncutoffs,
+                           const index_t *types, NeighbourList &out,
+                           CellOrder order) {
+    clear_error();
+    /* Host std::vector outputs throw std::bad_alloc too. */
+    return catch_out_of_memory("Out of memory building the neighbour list.", [&] {
+        return neighbour_list_gpu_body(quantities, cell_origin, cell, inv_cell,
+                                       pbc, nat, r, cutoff, per_atom_cutoff,
+                                       per_type_cutoff_sq, ncutoffs, types, out,
+                                       order);
+    });
 }
 
 }  // namespace matscipy

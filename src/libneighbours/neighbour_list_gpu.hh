@@ -107,24 +107,33 @@ error_t neighbour_count_gpu_device(const NeighbourListRequest &req,
  * suitable for frameworks that compile for fixed shapes (e.g. JAX). The buffers
  * stay on the device for zero-copy export. `overflow` is true if any atom has
  * more than max_neighbours neighbours (rows clipped; retry with a larger
- * capacity). Unused slots are 0; mask them with `count`.
+ * capacity). Only the first min(count, max_neighbours) slots of a row are
+ * defined; the unused slots are not cleared, so mask them with `count`.
  *
- * Unlike the host neighbour_matrix(), the order of the neighbours within a row
- * is unspecified (and may differ between runs): the rows are filled by atomic
- * slot assignment from the pair list. Consumers must treat a row as a set.
+ * The matrix is filled in a single pass of the cell-list search (one thread
+ * per atom writes its own row), without an intermediate pair list. The order
+ * of the neighbours within a row is unspecified and may differ between runs
+ * (atoms within a cell are ordered by atomic insertion); consumers must treat
+ * a row as a set.
+ *
+ * `quantities` selects the per-slot extras, any combination of
+ * QUANTITY_DISTVEC (`dist`) and QUANTITY_SHIFT (`shift`); req.quantities is
+ * ignored. Unrequested buffers are empty.
  */
 struct NeighbourMatrixDevice {
     index_t n = 0;
     index_t max_neighbours = 0;
     Array<index_t, DeviceSpace> idx;     /* [n*K] */
-    Array<real_t, DeviceSpace> dist;     /* [n*K*3] */
+    Array<real_t, DeviceSpace> dist;     /* [n*K*3] if QUANTITY_DISTVEC */
+    Array<index_t, DeviceSpace> shift;   /* [n*K*3] if QUANTITY_SHIFT */
     Array<index_t, DeviceSpace> count;   /* [n] */
     bool overflow = false;
 };
 
 error_t neighbour_matrix_gpu_device(const NeighbourListRequest &req,
                                     index_t max_neighbours,
-                                    NeighbourMatrixDevice &out);
+                                    NeighbourMatrixDevice &out,
+                                    int quantities = QUANTITY_DISTVEC);
 #endif
 
 }  // namespace matscipy

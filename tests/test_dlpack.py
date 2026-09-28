@@ -123,6 +123,54 @@ def test_matrix_overflow_raises():
                             max_neighbours=2)
 
 
+def _matrix_pairs(idx, shift, count):
+    """Sorted (i, j, shift) rows of a neighbour matrix, over the valid slots."""
+    idx, count = np.asarray(idx), np.asarray(count)
+    shift = None if shift is None else np.asarray(shift)
+    rows = []
+    for a in range(len(count)):
+        for s in range(int(count[a])):
+            sh = (0, 0, 0) if shift is None else tuple(shift[a, s])
+            rows.append((a, int(idx[a, s])) + tuple(int(x) for x in sh))
+    return sorted(rows)
+
+
+@pytest.mark.parametrize("quantities", ["", "D", "S", "DS", "SD"])
+def test_matrix_quantities_host(quantities):
+    pos, cell, pbc = _random_config(N=500, L=6.0, seed=21)
+    n, K = len(pos), 48
+    out = nl.neighbour_matrix(positions=pos, cell=cell, pbc=pbc, cutoff=1.2,
+                              max_neighbours=K, quantities=quantities)
+    assert len(out) == 2 + len(quantities)
+    idx, count = np.asarray(out[0]), np.asarray(out[-1])
+    per_slot = dict(zip(quantities, (np.asarray(a) for a in out[1:-1])))
+    assert idx.shape == (n, K) and idx.dtype == np.int64
+    for a in per_slot.values():
+        assert a.shape == (n, K, 3)
+    i, j, S = nl.neighbour_list("ijS", positions=pos, cell=cell, pbc=pbc,
+                                cutoff=1.2)
+    assert np.array_equal(count, np.bincount(i, minlength=n))
+    ref = _canonical(i, j, S if "S" in per_slot else np.zeros_like(S))
+    got = np.array(_matrix_pairs(idx, per_slot.get("S"), count))
+    assert np.array_equal(got, ref)
+    if "D" in per_slot and "S" in per_slot:  # D == r[j] - r[i] + S @ cell
+        mask = np.arange(K)[None, :] < count[:, None]
+        D = pos[idx] - pos[:, None, :] + per_slot["S"] @ cell
+        assert np.allclose(per_slot["D"][mask], D[mask])
+
+
+@pytest.mark.parametrize("quantities", ["X", "DD", "d"])
+def test_matrix_quantities_invalid(quantities):
+    pos, cell, pbc = _random_config(N=50, seed=22)
+    with pytest.raises(ValueError):
+        nl.neighbour_matrix(positions=pos, cell=cell, pbc=pbc, cutoff=1.2,
+                            max_neighbours=8, quantities=quantities)
+
+
+def test_empty_gpu_cache_is_callable():
+    nl.empty_gpu_cache()   # a no-op without the GPU backend
+
+
 # --------------------------------------------------------------- device paths
 
 def _gpu_available():
@@ -234,3 +282,35 @@ def test_coordination_cupy_and_override():
     c_ovr = nl.coordination(positions=pos, cell=cell, pbc=pbc, cutoff=1.3,
                             device="cuda")
     assert np.array_equal(cupy.asnumpy(c_ovr), c_cpu)
+
+
+@requires_gpu
+@pytest.mark.parametrize("quantities", ["", "S", "DS"])
+def test_matrix_quantities_cupy_match_host(quantities):
+    pos, cell, pbc = _random_config(N=500, L=6.0, seed=23)
+    kw = dict(cell=cell, pbc=pbc, cutoff=1.2, max_neighbours=48,
+              quantities=quantities)
+    host = nl.neighbour_matrix(positions=pos, **kw)
+    dev = nl.neighbour_matrix(positions=cupy.asarray(pos), **kw)
+    assert all(isinstance(a, cupy.ndarray) for a in dev)
+    h_slot = dict(zip(quantities, host[1:-1]))
+    d_slot = dict(zip(quantities, (cupy.asnumpy(a) for a in dev[1:-1])))
+    assert np.array_equal(cupy.asnumpy(dev[-1]), np.asarray(host[-1]))
+    assert (_matrix_pairs(cupy.asnumpy(dev[0]), d_slot.get("S"),
+                          cupy.asnumpy(dev[-1]))
+            == _matrix_pairs(host[0], h_slot.get("S"), host[-1]))
+
+
+@requires_gpu
+def test_gpu_out_of_memory_raises_memoryerror():
+    """Running out of GPU memory raises MemoryError instead of aborting the
+    process, and the next sensible call works."""
+    pos, cell, pbc = _random_config(N=1000, seed=24)
+    with pytest.raises(MemoryError):
+        nl.neighbour_matrix(positions=cupy.asarray(pos), cell=cell, pbc=pbc,
+                            cutoff=1.2, max_neighbours=(1 << 31) - 1)
+    nl.empty_gpu_cache()
+    idx, dist, count = nl.neighbour_matrix(positions=cupy.asarray(pos),
+                                           cell=cell, pbc=pbc, cutoff=1.2,
+                                           max_neighbours=64)
+    assert isinstance(idx, cupy.ndarray) and int(count.max()) <= 64
