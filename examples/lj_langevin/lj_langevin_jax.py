@@ -91,6 +91,9 @@ def make_step(jnp, jrandom, lc):
     def step(positions, velocities, dist, count, key, finish):
         K = dist.shape[1]
         mask = jnp.arange(K)[None, :] < count[:, None]      # valid neighbours
+        # Unused slots are not cleared (they may hold anything, NaN included),
+        # so select, don't multiply: 0 * NaN would poison the force sum.
+        dist = jnp.where(mask[..., None], dist, 0.0)
         r2 = (dist * dist).sum(axis=-1)
         safe = jnp.where(mask, r2, 1.0)                      # avoid 1/0 in pads
         inv_r2 = 1.0 / safe

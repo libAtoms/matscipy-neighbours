@@ -455,10 +455,15 @@ def neighbour_list(quantities, atoms=None, cutoff=None, *, positions=None,
     return arrays[0] if len(quantities) == 1 else tuple(arrays)
 
 
+# Per-slot quantities of neighbour_matrix, as the core's QUANTITY_* flags.
+_MATRIX_QUANTITIES = {"D": 1 << 2, "S": 1 << 4}
+
+
 def neighbour_matrix(atoms=None, cutoff=None, max_neighbours=None, *,
                      positions=None, cell=None, pbc=None, numbers=None,
-                     cell_origin=None, device=None, array_namespace=None):
-    """Dense fixed-capacity neighbour list: ``(idx, dist, count)``.
+                     cell_origin=None, device=None, array_namespace=None,
+                     quantities="D"):
+    """Dense fixed-capacity neighbour list: ``(idx, *per_slot, count)``.
 
     Each atom's neighbours occupy a row of an ``n x max_neighbours`` matrix, so
     the output shape is static (it depends only on ``n`` and ``max_neighbours``,
@@ -466,16 +471,29 @@ def neighbour_matrix(atoms=None, cutoff=None, max_neighbours=None, *,
     shapes (e.g. JAX), where forces are a masked sum over the neighbour axis with
     no scatter.
 
-    Returns ``(idx, dist, count)``: ``idx`` has shape ``(n, max_neighbours)``
-    (neighbour indices; unused slots are 0), ``dist`` has shape
-    ``(n, max_neighbours, 3)`` (distance vectors ``D == r[j] - r[i] + S @ cell``;
-    unused slots 0), and ``count`` has shape ``(n,)`` (true neighbour count;
-    mask with ``arange(max_neighbours) < count[:, None]``). ``device`` and
+    ``quantities`` selects the per-slot arrays returned between ``idx`` and
+    ``count``, in the order given: ``"D"`` the distance vectors
+    ``D == r[j] - r[i] + S @ cell`` (float, shape ``(n, max_neighbours, 3)``),
+    ``"S"`` the cell shifts (int64, same shape). The default ``"D"`` returns
+    ``(idx, dist, count)``; ``""`` returns ``(idx, count)``, the cheapest form
+    for a consumer that recomputes the distances from the positions (with
+    ``"S"`` for the periodic images).
+
+    ``idx`` has shape ``(n, max_neighbours)`` (int64 neighbour indices) and
+    ``count`` shape ``(n,)`` (true neighbour count). Only the first ``count``
+    slots of a row are defined: the unused slots are not cleared, so mask with
+    ``arange(max_neighbours) < count[:, None]``. ``device`` and
     ``array_namespace`` behave as in :func:`neighbour_list`.
 
     Raises ``ValueError`` if any atom has more than ``max_neighbours`` neighbours
-    (the capacity is too small); retry with a larger ``max_neighbours``.
+    (the capacity is too small); retry with a larger ``max_neighbours``. Raises
+    ``MemoryError`` if the host or GPU runs out of memory.
     """
+    bad = [c for c in quantities if c not in _MATRIX_QUANTITIES]
+    if bad or len(set(quantities)) != len(quantities):
+        raise ValueError(f"quantities={quantities!r}: each of 'D' (distance "
+                         "vector) and 'S' (cell shift) may appear at most once.")
+    flags = sum(_MATRIX_QUANTITIES[c] for c in quantities)
     if cutoff is None:
         raise ValueError("Please provide a value for the cutoff radius.")
     if max_neighbours is None:
@@ -506,9 +524,11 @@ def neighbour_matrix(atoms=None, cutoff=None, max_neighbours=None, *,
         positions=None if on_device else host_pos)
     rc, nums = _resolve_cutoff(cutoff, nums)
 
-    idx_cap, dist_cap, count_cap, overflow = _ext.neighbour_matrix_dlpack(
-        co, ce, inv, pb, host_pos, rc, int(max_neighbours), nums,
-        1 if use_gpu else 0, py_in, device_id)
+    idx_cap, dist_cap, shift_cap, count_cap, overflow = \
+        _ext.neighbour_matrix_dlpack(co, ce, inv, pb, host_pos, rc,
+                                     int(max_neighbours), nums,
+                                     1 if use_gpu else 0, py_in, device_id,
+                                     flags)
     if overflow:
         raise ValueError(
             f"max_neighbours={max_neighbours} is too small: some atom has more "
@@ -520,8 +540,22 @@ def neighbour_matrix(atoms=None, cutoff=None, max_neighbours=None, *,
         out_dev = (dtype, out_id)
     else:
         out_dev = (_DLPACK_CPU, 0)
-    wrappers = [DLPackTensor(c, out_dev) for c in (idx_cap, dist_cap, count_cap)]
+    per_slot = {"D": dist_cap, "S": shift_cap}
+    caps = [idx_cap] + [per_slot[c] for c in quantities] + [count_cap]
+    wrappers = [DLPackTensor(c, out_dev) for c in caps]
     return tuple(_consume(wrappers, array_namespace, use_gpu))
+
+
+def empty_gpu_cache():
+    """Return GPU memory cached by matscipy-neighbours to the driver.
+
+    The GPU backend keeps freed buffers in its own memory pool and reuses them
+    in later calls, which avoids the cost of allocating afresh every time. The
+    cached memory is not available to other libraries (CuPy, PyTorch, JAX, ...)
+    until it is returned; call this before handing the memory to them. Buffers
+    still referenced by returned arrays are not affected. No-op without a GPU
+    backend."""
+    _ext.empty_gpu_cache()
 
 
 def triplet_list(first_neighbours, abs_dr_p=None, cutoff=None):

@@ -11,14 +11,17 @@
 #ifndef MATSCIPY_ERROR_HH
 #define MATSCIPY_ERROR_HH
 
+#include <new>
+
 #include "types.hh"
 
 namespace matscipy {
 
 /* Simple, Python-free error reporting. Core routines record a message here and
-   return NL_ERROR (an internal/runtime failure) or NL_INVALID_ARGUMENT (the
-   caller passed something unusable); the binding layer turns these into a
-   Python RuntimeError / ValueError. The state is global (protected by the GIL
+   return NL_ERROR (an internal/runtime failure), NL_INVALID_ARGUMENT (the
+   caller passed something unusable) or NL_OUT_OF_MEMORY (an allocation, host
+   or GPU, failed); the binding layer turns these into a Python RuntimeError /
+   ValueError / MemoryError. The state is global (protected by the GIL
    when called from Python) and is cleared at the start of each top-level core
    call. */
 
@@ -38,8 +41,24 @@ error_t set_invalid_argument(const char *msg);
 error_t set_errorf(const char *fmt, ...);
 error_t set_invalid_argumentf(const char *fmt, ...);
 
+/* Record an out-of-memory message. Returns NL_OUT_OF_MEMORY. */
+error_t set_out_of_memory(const char *msg);
+
 /* Reset error state. */
 void clear_error();
+
+/* Run `body` (returning error_t) and turn an allocation failure inside it,
+   which the memory layer reports as std::bad_alloc, into NL_OUT_OF_MEMORY with
+   `msg`. Wraps the public entry points, so the core API reports running out of
+   memory as an error code rather than an exception or an abort. */
+template <typename F>
+error_t catch_out_of_memory(const char *msg, F &&body) {
+    try {
+        return body();
+    } catch (const std::bad_alloc &) {
+        return set_out_of_memory(msg);
+    }
+}
 
 }  // namespace matscipy
 

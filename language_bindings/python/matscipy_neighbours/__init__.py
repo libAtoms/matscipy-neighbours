@@ -9,6 +9,7 @@ matscipy code keeps working.
 from .neighbours import (
     DLPackTensor,
     coordination,
+    empty_gpu_cache,
     first_neighbours,
     get_jump_indicies,
     mic,
@@ -25,5 +26,6 @@ __all__ = [
     "triplet_list",
     "mic",
     "coordination",
+    "empty_gpu_cache",
     "DLPackTensor",
 ]

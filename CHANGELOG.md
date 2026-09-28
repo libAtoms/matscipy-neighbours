@@ -6,6 +6,31 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Core
+
+- GPU buffers come from a per-device caching memory pool (stream-ordered
+  allocation with an unlimited release threshold) instead of a fresh
+  `cudaMalloc`/`cudaFree` per buffer and call; the device primitives' scratch
+  buffers use it too. A GPU pair list of 10⁶ atoms builds in about half the
+  time. `empty_gpu_cache()` (C++ and Python) returns the cached memory to the
+  driver.
+- The GPU `neighbour_matrix` is filled in a single pass of the cell-list
+  search, one thread per atom writing its own row, instead of building the
+  pair list and scattering it; it no longer clears the unused slots. About
+  4.7× faster at 10⁶ atoms, and faster than the pair list.
+- `neighbour_matrix` takes `quantities` (Python, default `"D"`) or a trailing
+  `quantities` flag argument (C++, default `QUANTITY_DISTVEC`) selecting the
+  per-slot extras: distance vectors `D`, cell shifts `S`, both or neither.
+  Indices stay int64.
+- **Behaviour change:** the unused slots of a neighbour matrix (beyond `count`)
+  are unspecified instead of 0. Consumers must select with the mask rather
+  than multiply by it; the JAX example and the documented pattern do.
+- Running out of memory no longer aborts the process: allocation failures
+  (GPU, and host `malloc`) throw `std::bad_alloc`, which the public entry
+  points return as the new `NL_OUT_OF_MEMORY` code and Python raises as
+  `MemoryError`. On the GPU the cache is emptied and the allocation retried
+  once first.
+
 ### Examples and benchmark
 
 - The Lennard-Jones Langevin examples (NumPy/CuPy, JAX, Warp, C++ CPU and

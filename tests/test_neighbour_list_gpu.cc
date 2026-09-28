@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "device_primitives.hh"
+#include "error.hh"
 #include "memory_space.hh"
 #include "neighbour_list.hh"
 #include "neighbour_list_gpu.hh"
@@ -189,6 +190,152 @@ TEST(NeighbourListGpu, MatrixMatchesCpu) {
                 EXPECT_NEAR(gdist[((size_t)i * K + s) * 3 + k], it->second[k],
                             1e-12);
         }
+    }
+}
+
+/* The per-slot extras are selectable: shifts only, or neither. Rows must hold
+   the same set of (j, S) as the CPU matrix built with the same quantities. */
+static void check_matrix_quantities(int quantities) {
+    const int N = 2000;
+    const double L = 9.0, cutoff = 1.6;  /* ~47 neighbours; pairs across the boundary */
+    const real_t cell[9] = {(real_t)L, 0, 0, 0, (real_t)L, 0, 0, 0, (real_t)L};
+    const real_t inv[9] = {(real_t)(1 / L), 0, 0, 0, (real_t)(1 / L), 0,
+                           0, 0, (real_t)(1 / L)};
+    const real_t origin[3] = {0, 0, 0};
+    const bool pbc[3] = {true, true, true};
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<real_t> U(0.0, L);
+    std::vector<real_t> r(3 * N);
+    for (int k = 0; k < 3 * N; k++) r[k] = U(rng);
+
+    const index_t K = 96;
+    NeighbourMatrix cpu;
+    ASSERT_EQ(neighbour_matrix(origin, cell, inv, pbc, N, r.data(), cutoff,
+                               nullptr, nullptr, 0, nullptr, K, cpu,
+                               CellOrder::Linear, quantities),
+              NL_SUCCESS);
+    ASSERT_FALSE(cpu.overflow);
+
+    NeighbourListRequest req;
+    req.cell_origin = origin;
+    req.cell = cell;
+    req.inv_cell = inv;
+    req.pbc = pbc;
+    req.nat = N;
+    req.positions = r.data();
+    req.cutoff = cutoff;
+    NeighbourMatrixDevice dev;
+    ASSERT_EQ(neighbour_matrix_gpu_device(req, K, dev, quantities), NL_SUCCESS);
+    ASSERT_FALSE(dev.overflow);
+    const bool wS = quantities & QUANTITY_SHIFT;
+    EXPECT_EQ(dev.dist.size(), 0u);
+    EXPECT_EQ(dev.shift.size(), wS ? (size_t)N * K * 3 : 0u);
+    EXPECT_EQ(cpu.shift.size(), wS ? (size_t)N * K * 3 : 0u);
+
+    std::vector<index_t> gidx((size_t)N * K), gcount(N), gshift;
+    cudaMemcpy(gidx.data(), dev.idx.data(), gidx.size() * sizeof(index_t),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(gcount.data(), dev.count.data(), N * sizeof(index_t),
+               cudaMemcpyDeviceToHost);
+    if (wS) {
+        gshift.resize((size_t)N * K * 3);
+        cudaMemcpy(gshift.data(), dev.shift.data(), gshift.size() * sizeof(index_t),
+                   cudaMemcpyDeviceToHost);
+    }
+    using Key = std::tuple<index_t, index_t, index_t, index_t>;
+    auto key = [&](const std::vector<index_t> &idx, const std::vector<index_t> &sh,
+                   int i, index_t s) {
+        const size_t slot = (size_t)i * K + s;
+        return wS ? Key{idx[slot], sh[3 * slot], sh[3 * slot + 1], sh[3 * slot + 2]}
+                  : Key{idx[slot], 0, 0, 0};
+    };
+    for (int i = 0; i < N; i++) {
+        ASSERT_EQ(gcount[i], cpu.count[i]) << "atom " << i;
+        std::vector<Key> a, b;
+        for (index_t s = 0; s < cpu.count[i]; s++) {
+            a.push_back(key(cpu.idx, cpu.shift, i, s));
+            b.push_back(key(gidx, gshift, i, s));
+        }
+        std::sort(a.begin(), a.end());
+        std::sort(b.begin(), b.end());
+        ASSERT_EQ(a, b) << "atom " << i;
+    }
+}
+
+TEST(NeighbourListGpu, MatrixShiftsOnlyMatchesCpu) {
+    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    check_matrix_quantities(QUANTITY_SHIFT);
+}
+
+TEST(NeighbourListGpu, MatrixIndicesOnlyMatchesCpu) {
+    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    check_matrix_quantities(0);
+}
+
+/* Running out of GPU memory is an error code, not an abort, and leaves the
+   allocator usable (the next, sensible request succeeds). */
+TEST(NeighbourListGpu, OutOfMemoryIsAnError) {
+    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    const int N = 1000;
+    const real_t cell[9] = {10, 0, 0, 0, 10, 0, 0, 0, 10};
+    const real_t inv[9] = {0.1, 0, 0, 0, 0.1, 0, 0, 0, 0.1};
+    const real_t origin[3] = {0, 0, 0};
+    const bool pbc[3] = {true, true, true};
+    std::mt19937 rng(8);
+    std::uniform_real_distribution<real_t> U(0.0, 10.0);
+    std::vector<real_t> r(3 * N);
+    for (int k = 0; k < 3 * N; k++) r[k] = U(rng);
+    NeighbourListRequest req;
+    req.cell_origin = origin;
+    req.cell = cell;
+    req.inv_cell = inv;
+    req.pbc = pbc;
+    req.nat = N;
+    req.positions = r.data();
+    req.cutoff = 1.5;
+
+    NeighbourMatrixDevice huge;  /* 1000 x 2^36 int64 slots: far beyond any GPU */
+    EXPECT_EQ(neighbour_matrix_gpu_device(req, index_t(1) << 36, huge),
+              NL_OUT_OF_MEMORY);
+    EXPECT_TRUE(has_error);
+
+    NeighbourMatrixDevice ok;
+    ASSERT_EQ(neighbour_matrix_gpu_device(req, 64, ok), NL_SUCCESS);
+    EXPECT_FALSE(ok.overflow);
+}
+
+/* Freed blocks are cached and reused; returning them to the driver in between
+   must not disturb later builds. */
+TEST(NeighbourListGpu, RepeatedBuildsAndEmptyCache) {
+    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    const int N = 4000;
+    const double L = 16.0;
+    const real_t cell[9] = {(real_t)L, 0, 0, 0, (real_t)L, 0, 0, 0, (real_t)L};
+    const real_t inv[9] = {(real_t)(1 / L), 0, 0, 0, (real_t)(1 / L), 0,
+                           0, 0, (real_t)(1 / L)};
+    const real_t origin[3] = {0, 0, 0};
+    const bool pbc[3] = {true, true, true};
+    std::mt19937 rng(9);
+    std::uniform_real_distribution<real_t> U(0.0, L);
+    std::vector<real_t> r(3 * N);
+    for (int k = 0; k < 3 * N; k++) r[k] = U(rng);
+    NeighbourListRequest req;
+    req.quantities = QUANTITY_FIRST | QUANTITY_SECOND;
+    req.cell_origin = origin;
+    req.cell = cell;
+    req.inv_cell = inv;
+    req.pbc = pbc;
+    req.nat = N;
+    req.positions = r.data();
+    req.cutoff = 1.5;
+
+    index_t npairs = -1;
+    for (int rep = 0; rep < 4; rep++) {
+        if (rep == 2) empty_gpu_cache();
+        NeighbourListDevice dev;
+        ASSERT_EQ(neighbour_list_gpu_device(req, dev), NL_SUCCESS);
+        if (npairs < 0) npairs = dev.npairs;
+        EXPECT_EQ(dev.npairs, npairs) << "repetition " << rep;
     }
 }
 

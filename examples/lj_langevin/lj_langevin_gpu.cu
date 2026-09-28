@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
+#include "error.hh"
 #include "lj_common.hh"
 #include "neighbour_list_gpu.hh"
 
@@ -218,7 +219,10 @@ int main(int argc, char **argv) {
     index_t npairs = 0;
     auto compute_forces = [&]() {
         NeighbourListDevice dev;
-        neighbour_list_gpu_device(req, dev);
+        if (neighbour_list_gpu_device(req, dev) != NL_SUCCESS) {
+            std::fprintf(stderr, "neighbour list failed: %s\n", error_string);
+            std::exit(1);
+        }
         npairs = dev.npairs;
         CUDA_CHECK(cudaMemset(d_f, 0, 3 * n * sizeof(double)));
         CUDA_CHECK(cudaMemset(d_e, 0, sizeof(double)));

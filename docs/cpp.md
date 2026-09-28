@@ -25,6 +25,14 @@ matscipy::error_t err = matscipy::neighbour_list(
   `per_type_cutoff_sq[ncutoffs*ncutoffs]` matrix with `types[nat]`.
 - A trailing `CellOrder order = CellOrder::Linear` selects the cell layout
   (`Linear` or `Morton`).
+- The return value is `NL_SUCCESS`, or `NL_INVALID_ARGUMENT` (unusable input),
+  `NL_OUT_OF_MEMORY` (a host or GPU allocation failed) or `NL_ERROR`, with the
+  message in `matscipy::error_string` (`error.hh`). Running out of memory is
+  never an abort; other GPU runtime failures (no device, a failed kernel
+  launch) still abort with a message.
+- GPU buffers (`Array<T, DeviceSpace>`) come from a per-device caching pool:
+  freed blocks are kept for reuse by later calls. `empty_gpu_cache()`
+  (`memory_space.hh`) returns them to the driver.
 
 ### `NeighbourList`
 
@@ -49,11 +57,17 @@ Typed `Span` views (`first_view()`, `distvec_view()`, …) and per-pair accessor
 
 `neighbour_matrix(...)` returns a `NeighbourMatrix` whose shape is static — each
 atom's neighbours fill a row of an `n x max_neighbours` matrix
-(`idx[n*K]`, `dist[n*K*3]`, `count[n]`, plus an `overflow` flag). Unused slots
-are 0; mask with `count`. This suits fixed-shape consumers (e.g. JAX). The GPU
-form `neighbour_matrix_gpu_device(req, K, out)` returns a `NeighbourMatrixDevice`
-with `Array<T, DeviceSpace>` buffers. `overflow` is set when an atom's degree
-exceeds `K` (retry with a larger capacity).
+(`idx[n*K]`, `count[n]`, plus an `overflow` flag). A trailing
+`int quantities = QUANTITY_DISTVEC` selects the per-slot extras, any
+combination of `QUANTITY_DISTVEC` (`dist[n*K*3]`) and `QUANTITY_SHIFT`
+(`shift[n*K*3]`); unrequested buffers are empty. Only the first `count` slots
+of a row are defined — the unused ones are not cleared — so mask with `count`.
+This suits fixed-shape consumers (e.g. JAX). The GPU form
+`neighbour_matrix_gpu_device(req, K, out, quantities)` returns a
+`NeighbourMatrixDevice` with `Array<T, DeviceSpace>` buffers, filled in a
+single pass of the cell-list search (one thread per atom writes its own row).
+`overflow` is set when an atom's degree exceeds `K` (retry with a larger
+capacity).
 
 ## `CellGrid`
 

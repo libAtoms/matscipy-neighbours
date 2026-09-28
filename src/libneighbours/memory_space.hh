@@ -78,6 +78,11 @@ void copy_cuda(void *dst, DeviceType dst_dev, const void *src,
 #if defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP)
 /* Id of the currently-active GPU device (for the DLPack device tuple). */
 int current_device_id();
+
+/* GPU allocations go through a per-device caching pool (memory_space_gpu.cc):
+   freed blocks stay reserved for reuse by later calls. Return them to the
+   driver, e.g. before handing the memory to another library. */
+void empty_gpu_cache();
 #endif
 
 namespace detail {
@@ -144,7 +149,8 @@ inline void space_free(void *ptr) {
  * is never silent.
  *
  * resize() that grows DISCARDS existing contents; shrinking keeps the buffer
- * and just lowers the logical size. data() on a device array is a device
+ * and just lowers the logical size. An allocation that fails for lack of
+ * memory throws std::bad_alloc. data() on a device array is a device
  * pointer, only valid in kernels or as a deep_copy argument, never dereferenced
  * on the host.
  */

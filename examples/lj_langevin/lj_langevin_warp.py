@@ -22,10 +22,10 @@ pair, and the kernel evaluates the periodic image D = r[j] - r[i] + S @ cell.
 ``--format matrix`` swaps the pair list for the fixed-capacity *neighbour
 matrix* (one row of ``--max-neighbours`` slots per atom plus a per-atom count),
 consumed by a kernel with one thread per atom that sums its own row — no
-atomics on the forces. Each library supplies the matrix in its native form:
-matscipy-neighbours (`neighbour_matrix`) with the distance vectors ``D``,
-ALCHEMI with neighbour indices (and cell shifts for a periodic box), from
-which the kernel recomputes ``D``.
+atomics on the forces. Both libraries supply the same layout, neighbour
+indices plus the cell shifts of a periodic box (matscipy-neighbours'
+`neighbour_matrix` with ``quantities="S"`` or ``""``), from which the kernel
+recomputes ``D``, so the two feed the very same kernel.
 
 Timing is broken down per phase with `muTimer` (build neighbour list / LJ
 forces / Langevin integrate), and the neighbour-list build time is reported
@@ -46,6 +46,7 @@ import warp as wp
 from muTimer import Timer
 
 vec3d = wp.vec3d
+vec3l = wp.types.vector(length=3, dtype=wp.int64)   # int64 cell shifts
 
 
 # --------------------------------------------------------------------------- #
@@ -153,7 +154,7 @@ def lj_forces_matrix(pos: wp.array(dtype=vec3d),
 def lj_forces_matrix_pbc(pos: wp.array(dtype=vec3d),
                          nbr: wp.array2d(dtype=Any),
                          count: wp.array(dtype=Any),
-                         shift: wp.array2d(dtype=wp.vec3i),
+                         shift: wp.array2d(dtype=Any),
                          n: int,
                          cell_t: wp.mat33d,
                          cutoff_sq: wp.float64,
@@ -168,31 +169,6 @@ def lj_forces_matrix_pbc(pos: wp.array(dtype=vec3d),
             s = shift[a, k]
             sd = vec3d(wp.float64(s[0]), wp.float64(s[1]), wp.float64(s[2]))
             dr = pos[int(nbr[a, k])] - pos[a] + cell_t * sd
-            r2 = wp.dot(dr, dr)
-            if r2 < cutoff_sq:
-                inv_r2 = wp.float64(1.0) / r2
-                inv_r6 = inv_r2 * inv_r2 * inv_r2
-                f += wp.float64(-24.0) * inv_r2 * inv_r6 * (wp.float64(2.0) * inv_r6 - wp.float64(1.0)) * dr
-                e += wp.float64(2.0) * inv_r6 * (inv_r6 - wp.float64(1.0))
-        forces[a] = f
-    wp.tile_atomic_add(energy, wp.tile_sum(wp.tile(e)))
-
-
-@wp.kernel
-def lj_forces_matrix_D(dist: wp.array2d(dtype=vec3d),
-                       count: wp.array(dtype=Any),
-                       n: int,
-                       cutoff_sq: wp.float64,
-                       forces: wp.array(dtype=vec3d),
-                       energy: wp.array(dtype=wp.float64)):
-    """As `lj_forces_matrix`, from precomputed distance vectors (periodic
-    images already applied), so neither positions nor indices are read."""
-    a = wp.tid()
-    e = wp.float64(0.0)
-    if a < n:
-        f = vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
-        for k in range(int(count[a])):
-            dr = dist[a, k]
             r2 = wp.dot(dr, dr)
             if r2 < cutoff_sq:
                 inv_r2 = wp.float64(1.0) / r2
@@ -388,18 +364,19 @@ def alchemi_builder(xp, cutoff, origin, cell, pbc, max_neighbours, matrix):
 
 
 def make_matrix_builder(kind, xp, cutoff, origin, cell, pbc, max_neighbours):
-    """Return ``build(positions) -> (nbr, count, extra)`` for the neighbour
-    matrix: ``extra`` is the distance vectors ``D`` (matscipy-neighbours), the
-    cell shifts of a periodic box (ALCHEMI), or ``None``. Capacity overflow is
-    checked by :func:`check_capacity`, outside the timed loop."""
+    """Return ``build(positions) -> (nbr, count, shift)`` for the neighbour
+    matrix: ``shift`` is the per-slot cell shifts of a periodic box, ``None``
+    otherwise. Capacity overflow is checked by :func:`check_capacity`, outside
+    the timed loop."""
     if kind == "matscipy":
         from matscipy_neighbours import neighbour_matrix
 
         def build(positions):
-            nbr, D, count = neighbour_matrix(
+            out = neighbour_matrix(
                 positions=positions, cell=cell, cell_origin=origin, pbc=pbc,
-                cutoff=cutoff, max_neighbours=max_neighbours)
-            return nbr, count, D
+                cutoff=cutoff, max_neighbours=max_neighbours,
+                quantities="S" if pbc else "")
+            return (out[0], out[2], out[1]) if pbc else (out[0], out[1], None)
         return build
 
     if kind == "alchemi":
@@ -521,23 +498,19 @@ def main():
     cutoff_sq = wp.float64(args.cutoff ** 2)
     cell_t = wp.mat33d(np.ascontiguousarray(cell.T))   # S @ cell == cell.T @ S
 
-    def matrix_force_pass(nbr, count, extra):
+    def matrix_force_pass(nbr, count, shift):
         energy_wp.zero_()
         count_wp = wp.from_dlpack(count)
-        if extra is None:
+        if shift is None:
             launch_forces(lj_forces_matrix, n,
                           [pos_wp, wp.from_dlpack(nbr), count_wp, n, cutoff_sq,
                            forces_wp, energy_wp],
                           wp_device)
-        elif args.neighbours == "matscipy":        # extra = distance vectors D
-            launch_forces(lj_forces_matrix_D, n,
-                          [wp.from_dlpack(extra, dtype=vec3d), count_wp, n,
-                           cutoff_sq, forces_wp, energy_wp],
-                          wp_device)
-        else:                                      # extra = cell shifts S
+        else:   # int64 shifts from matscipy-neighbours, int32 from ALCHEMI
+            svec = vec3l if shift.dtype.itemsize == 8 else wp.vec3i
             launch_forces(lj_forces_matrix_pbc, n,
                           [pos_wp, wp.from_dlpack(nbr), count_wp,
-                           wp.from_dlpack(extra, dtype=wp.vec3i), n, cell_t,
+                           wp.from_dlpack(shift, dtype=svec), n, cell_t,
                            cutoff_sq, forces_wp, energy_wp],
                           wp_device)
 

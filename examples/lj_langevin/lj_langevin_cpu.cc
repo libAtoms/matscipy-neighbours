@@ -17,6 +17,7 @@
 #include <random>
 #include <vector>
 
+#include "error.hh"
 #include "lj_common.hh"
 #include "neighbour_list.hh"
 
@@ -67,8 +68,12 @@ int main(int argc, char **argv) {
     real_t energy = 0.0;
     auto compute_forces = [&]() {
         NeighbourList nl;
-        neighbour_list(quantities, origin, cell, inv_cell, pbc, n, pos.data(),
-                       cutoff, nullptr, nullptr, 0, nullptr, nl);
+        if (neighbour_list(quantities, origin, cell, inv_cell, pbc, n, pos.data(),
+                           cutoff, nullptr, nullptr, 0, nullptr,
+                           nl) != NL_SUCCESS) {
+            std::fprintf(stderr, "neighbour list failed: %s\n", error_string);
+            std::exit(1);
+        }
         npairs = nl.npairs;
         /* Shifts are only requested (and only non-zero) for the periodic box. */
         const index_t *shift = periodic ? nl.shift.data() : nullptr;

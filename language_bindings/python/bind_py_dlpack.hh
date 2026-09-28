@@ -31,6 +31,9 @@ PyObject *py_coordination_dlpack(PyObject *self, PyObject *args);
    (idx, dist, count) plus an overflow flag, for static-shape consumers. */
 PyObject *py_neighbour_matrix_dlpack(PyObject *self, PyObject *args);
 
+/* Return GPU memory cached by the library's allocator to the driver. */
+PyObject *py_empty_gpu_cache(PyObject *self, PyObject *args);
+
 #ifdef __cplusplus
 }
 #endif
