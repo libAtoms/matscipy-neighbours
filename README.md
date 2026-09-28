@@ -16,6 +16,30 @@ optional CUDA/HIP GPU backend, and zero-copy NumPy/CuPy interop via DLPack.
 This interface is compatible with
 [`matscipy.neighbours`](https://github.com/libAtoms/matscipy).
 
+## Installation
+
+```bash
+pip install matscipy-neighbours
+```
+
+> **Note:** The binary wheels on PyPI are **CPU-only** and have **no GPU
+> support**. For the CUDA or HIP backend, build from source against your GPU
+> toolkit:
+>
+> ```bash
+> # NVIDIA (needs nvcc on PATH; set the compute capability of your GPU)
+> pip install --no-binary matscipy-neighbours matscipy-neighbours \
+>     -C cmake.define.ENABLE_CUDA=ON -C cmake.define.CMAKE_CUDA_ARCHITECTURES=80
+> # AMD (needs hipcc/ROCm; set the architecture of your GPU)
+> pip install --no-binary matscipy-neighbours matscipy-neighbours \
+>     -C cmake.define.ENABLE_HIP=ON -C cmake.define.CMAKE_HIP_ARCHITECTURES=gfx90a
+> ```
+>
+> Check with `python -c "import matscipy_neighbours._matscipy_neighbours as m; print(m._has_gpu)"`
+> (prints `1` for a GPU build). See the
+> [installation docs](https://libatoms.github.io/matscipy-neighbours/installation/)
+> for details.
+
 ## Quick start (Python)
 
 ```python
@@ -37,7 +61,7 @@ i, j, D = neighbour_list("ijD", positions=cp.asarray(positions), cell=cell,
                          pbc=True, cutoff=2.5)
 ```
 
-## Build
+## Build from a checkout (C++ core and tests)
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

@@ -1,10 +1,11 @@
 [build-system]
-requires = ["scikit-build-core>=0.10", "numpy"]
+requires = ["scikit-build-core>=0.10", "setuptools-scm>=8", "numpy"]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "matscipy-neighbours"
-version = "0.1.0"
+# The version is taken from the git tag (see [tool.setuptools_scm] below).
+dynamic = ["version"]
 description = "Neighbour list for particle simulations"
 readme = "README.md"
 license = { file = "LICENSE.md" }
@@ -23,16 +24,22 @@ repository = "https://github.com/libAtoms/matscipy-neighbours"
 matscipy_neighbours = "matscipy_neighbours._ase_plugin"
 
 [tool.scikit-build]
+# Version from the git tag via setuptools-scm; an sdist carries it in PKG-INFO.
+metadata.version.provider = "scikit_build_core.metadata.setuptools_scm"
 # Pure-Python package lives under language_bindings/python; the compiled
 # extension is installed into it by the CMake install() rule (see
 # language_bindings/python/CMakeLists.txt) so the package's relative import
 # `from . import _matscipy_neighbours` resolves.
 wheel.packages = ["language_bindings/python/matscipy_neighbours"]
 # CPU-only wheel: skip the C++ test/benchmark/example targets (the tests fetch
-# GoogleTest from the network). GPU is a separate, documented build
-# (-Dcmake.define.ENABLE_CUDA=ON).
+# GoogleTest from the network). GPU support needs a source build with
+# `-C cmake.define.ENABLE_CUDA=ON` (see docs/installation.md).
 cmake.args = [
     "-DBUILD_TESTING=OFF",
     "-DBUILD_BENCHMARKS=OFF",
     "-DBUILD_EXAMPLES=OFF",
 ]
+
+[tool.setuptools_scm]
+# Tags are plain versions (e.g. `1.0.0`); between tags this yields
+# `1.0.1.devN+g<hash>`.
