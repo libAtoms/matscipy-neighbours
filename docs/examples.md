@@ -123,11 +123,12 @@ system). The broad picture:
   matscipy 1.2.0 is a single-threaded CPU reference, while vesin's GPU path falls
   behind for the large, low-density droplets.
 - On the GPU, NVIDIA **ALCHEMI** is the closest competitor. On the periodic
-  liquid its native neighbour-matrix format is the fastest list from 10⁵
-  atoms on; its pair list is faster than matscipy-neighbours' up to a few
-  million atoms, slower at 10⁷, and runs out of GPU memory earlier. On the
-  sparse droplet its list build grows super-linearly above 3×10⁶ atoms, where
-  matscipy-neighbours pulls far ahead.
+  liquid its neighbour matrix is 10–25% faster than matscipy-neighbours' from
+  10⁶ to 3×10⁶ atoms; below and above that range matscipy-neighbours is
+  ahead, and only its pair list reaches 3×10⁷ atoms. On the sparse droplet
+  ALCHEMI's list build grows super-linearly above 3×10⁶ atoms, and
+  matscipy-neighbours' pair list and matrix are faster than ALCHEMI's at every
+  size.
 - The **kernel** choice mostly shifts the curve — the fused C++/CUDA and Warp
   kernels avoid materialising per-pair arrays; the array (NumPy/CuPy) path is the
   simplest; JAX `jit`-compiles a dense masked sum.

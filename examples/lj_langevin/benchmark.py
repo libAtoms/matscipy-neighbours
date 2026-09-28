@@ -366,12 +366,14 @@ list without periodic images.
 
 How to read it (on the test machine):
 
-- matscipy-neighbours' list scales linearly on the GPU up to the largest size
-  and, on the pair list, is the fastest GPU list from about 10⁶ atoms on.
-- ALCHEMI is fast up to a few million atoms, fastest of all in its native
-  matrix format, but its list build grows super-linearly beyond that on this
-  sparse geometry: from 3×10⁶ to 10⁷ atoms its build time rises about twentyfold
-  for 3.3× the atoms, and its curves end well above matscipy-neighbours'.
+- matscipy-neighbours scales linearly on the GPU up to the largest size. Its
+  neighbour matrix (indices only, as the non-periodic droplet needs no
+  shifts) is the fastest GPU list at every size, and its pair list is faster
+  than ALCHEMI's pair list at every size.
+- ALCHEMI's list build grows super-linearly beyond a few million atoms on this
+  sparse geometry: from 3×10⁶ to 10⁷ atoms its build time rises about
+  twentyfold for 3.3× the atoms, and its curves end well above
+  matscipy-neighbours'.
 - vesin's GPU path grows super-linearly and falls far behind for these large,
   low-density droplets.
 - On the CPU, single-threaded matscipy-neighbours `(1t)` is faster than the
@@ -395,17 +397,23 @@ comparison between the list implementations.
 How to read it (on the test machine):
 
 - On the GPU the list build dominates the step for the Warp and C++ kernels,
-  which avoid per-pair arrays; the array and JAX kernels add a roughly constant
-  factor on top. The **list** choice therefore drives the scaling.
-- On the pair list, ALCHEMI is ahead of matscipy-neighbours up to a few million
-  atoms (by 20–40%), matscipy-neighbours is ahead at 10⁷ atoms (by about 20%),
-  and only matscipy-neighbours reaches the largest size. ALCHEMI's native
-  **matrix** format is the fastest GPU list here at every size from 10⁵ atoms
-  on; matscipy-neighbours' `neighbour_matrix` is slower than its own pair
-  list, because it also writes the distance vectors (and int64 indices).
-- In the **JAX** panel ALCHEMI's jit-compiled cell list is faster than
-  matscipy-neighbours' `neighbour_matrix` but runs out of GPU memory above
-  3×10⁶ atoms, where matscipy-neighbours reaches 10⁷.
+  which avoid per-pair arrays, and the array kernel adds a roughly constant
+  factor on top. The **list** choice therefore drives the scaling. JAX, which
+  consumes the neighbour matrix (the faster list to build), is on par with
+  the fused kernels.
+- In the **matrix** format (the Warp `(matrix)` curves, where both libraries
+  supply indices and cell shifts to the same kernel) ALCHEMI is ahead from 10⁶
+  to 3×10⁶ atoms (by 10–25%), matscipy-neighbours below 10⁶ atoms and at 10⁷
+  atoms (there by almost a factor of two). At 3×10⁷ atoms
+  matscipy-neighbours' matrix runs out of GPU memory: its int64 indices and
+  shifts take twice the space of ALCHEMI's int32 ones.
+- On the **pair list** matscipy-neighbours is ahead below 10⁶ atoms, the two
+  are within about 5% from 10⁶ to 3×10⁶, matscipy-neighbours is ahead at 10⁷
+  atoms, and only matscipy-neighbours reaches 3×10⁷ atoms, where its pair
+  list is also slightly faster than ALCHEMI's matrix.
+- In the **JAX** panel matscipy-neighbours' `neighbour_matrix` is faster than
+  ALCHEMI's jit-compiled cell list from 10⁵ atoms on and reaches 10⁷ atoms,
+  while ALCHEMI runs out of GPU memory above 3×10⁶.
 - vesin's GPU path is more than an order of magnitude slower than both at 10⁶
   atoms and grows super-linearly.
 - On the CPU, single-threaded matscipy-neighbours `(1t)` is faster than both
@@ -465,9 +473,11 @@ JAX / C++). Lower is better. The neighbour-list backends are:
     (here 96 slots) plus a neighbour count; its shapes are static, so the JAX
     kernel uses it, and it is ALCHEMI's native layout (its pair list is
     compacted from the matrix). The Warp panels therefore show the GPU curves
-    of matscipy-neighbours (`neighbour_matrix`) and ALCHEMI twice: on the pair
-    list, and on the matrix (`(matrix)`, one thread per atom summing its own
-    row).
+    of matscipy-neighbours and ALCHEMI twice: on the pair list, and on the
+    matrix (`(matrix)`, one thread per atom summing its own row). In the matrix
+    form both libraries supply the same data — neighbour indices, plus the
+    cell shifts in the periodic box (`neighbour_matrix(...,
+    quantities="S")`, or `""` for the droplet) — to the same kernel.
 
 !!! note "Missing curves"
     vesin and matscipy 1.2.0 only feed the Warp and array kernels, and ALCHEMI
@@ -500,8 +510,9 @@ the GPU, and on the CPU **single-threaded** — and varies only the kernels that
 consume it: array (NumPy/CuPy), JAX, Warp and C++/CUDA. Within one device the
 array, Warp and C++ curves share the same pair-list build, so the vertical
 spread between them is the cost of the potential, not of the list; JAX
-consumes `neighbour_matrix` instead, whose build is slower on the GPU (see the
-matrix curves in the Warp panels). This section therefore does
+consumes `neighbour_matrix` instead, which on the GPU builds faster than the
+pair list (see the matrix curves in the Warp panels), so part of JAX's lead
+there is the list. This section therefore does
 **not** primarily benchmark the neighbour list but the implementation of the
 Lennard-Jones potential on top of it:
 
