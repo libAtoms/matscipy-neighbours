@@ -88,15 +88,64 @@ def fcc_liquid_n(xp, target_n, density):
     return xp.asarray(r), L
 
 
-def mabincount(xp, idx, weights, n):
-    """Sum ``weights`` (shape (npairs, d)) over pairs grouped by ``idx``,
-    giving (n, d). ``bincount`` weights are 1-D, so accumulate per component —
-    the operation matscipy performs with its ``mabincount`` helper."""
-    idx = idx.astype(xp.int64)
-    out = xp.empty((n, weights.shape[1]), dtype=weights.dtype)
-    for k in range(weights.shape[1]):
-        out[:, k] = xp.bincount(idx, weights=weights[:, k], minlength=n)
-    return out
+# Per-atom segment sum on the GPU: one thread per atom sums the rows of its
+# segment of the pair array. No atomics, no temporaries, deterministic.
+_SEGMENT_SUM_SOURCE = r"""
+extern "C" __global__ void segment_sum(const long long *seed,
+                                       const double *weights, double *out,
+                                       long long n, int d) {
+    const long long a = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (a >= n) return;
+    /* -1 marks atoms before the first pair: an empty segment. */
+    const long long begin = seed[a] < 0 ? 0 : seed[a];
+    const long long end = seed[a + 1] < 0 ? 0 : seed[a + 1];
+    for (int k = 0; k < d; k++) {
+        double acc = 0.0;
+        for (long long p = begin; p < end; p++) acc += weights[p * d + k];
+        out[a * d + k] = acc;
+    }
+}
+"""
+_segment_sum_kernel = None
+
+
+def pair_sum(xp, i, weights, n):
+    """Sum ``weights`` (shape (npairs, d)) over the pairs of each atom, giving
+    (n, d). The pairs are sorted by ``i``, so the pairs of an atom are one
+    contiguous segment, and ``first_neighbours`` gives the segment starts (on
+    the device for device input). Unlike a weighted ``bincount`` (matscipy's
+    ``mabincount``) this needs no atomic scatter, which for float64 is very
+    slow on some GPUs (e.g. on ROCm). On the GPU a small kernel sums each
+    segment; on the CPU ``add.reduceat`` does."""
+    from matscipy_neighbours import first_neighbours
+
+    seed = first_neighbours(n, i.astype(xp.int64, copy=False))
+    if xp is not np:
+        global _segment_sum_kernel
+        if _segment_sum_kernel is None:
+            _segment_sum_kernel = xp.RawKernel(_SEGMENT_SUM_SOURCE,
+                                               "segment_sum")
+        weights = xp.ascontiguousarray(weights, dtype=xp.float64)
+        out = xp.empty((n, weights.shape[1]), dtype=xp.float64)
+        block = 256
+        _segment_sum_kernel(((n + block - 1) // block,), (block,),
+                            (seed, weights, out, xp.int64(n),
+                             xp.int32(weights.shape[1])))
+        return out
+    # -1 marks atoms before the first pair; clamped, every atom without pairs
+    # has an empty segment.
+    seed = np.maximum(seed, 0)
+    starts = seed[:-1]
+    # reduceat wants every start inside the array and ends each segment where
+    # the next one starts (the last at the end of the array). The atoms after
+    # the atom of the last pair start at npairs: sum up to them, and leave
+    # them zero.
+    m = int(i[-1]) + 1 if i.shape[0] else 0
+    out = np.zeros((n, weights.shape[1]), dtype=weights.dtype)
+    if m > 0:
+        out[:m] = np.add.reduceat(weights, starts[:m], axis=0)
+    # reduceat returns the element at the start for an empty segment.
+    return np.where((seed[1:] > starts)[:, None], out, 0.0)
 
 
 def fixed_box(ncells, lattice, cutoff):
@@ -217,7 +266,7 @@ def lj_forces_energy(xp, build_ijD, positions):
     energy = 0.5 * float((4.0 * inv_r6 * (inv_r6 - 1.0)).sum())
     coef = -24.0 * inv_r2 * inv_r6 * (2.0 * inv_r6 - 1.0)   # force prefactor
     fpair = coef[:, None] * D                                # force on i
-    forces = mabincount(xp, i, fpair, n)
+    forces = pair_sum(xp, i, fpair, n)
     virial = -0.5 * float((coef * r2).sum())                 # directed pairs: 1/2
     return forces, energy, virial, int(i.shape[0])
 
