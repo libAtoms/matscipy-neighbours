@@ -184,20 +184,16 @@ the matscipy-neighbours GPU list (pair list for the array kernels,
 How to read it:
 
 - The legend says how each run's array kernel sums the pair forces per atom:
-  a weighted `bincount` per component (an atomic scatter; the H200 curves) or
-  a segment sum over the pairs of each atom (`first_neighbours`, then a small
-  CuPy kernel with one thread per atom, no atomics; the MI300A curves). On the
-  MI300A the scatter took about 440 ms at 10⁶ atoms and the segment sum takes
-  about 1.5 ms.
+  a weighted `bincount` per component plus full reductions for the energy and
+  virial (the H200 curves, measured before `segment_sum` existed), or
+  `segment_sum`, which sums forces, energies and virials per atom without
+  atomics and returns the totals with them (the MI300A curves). On the MI300A
+  the old scheme took 700 ms per step at 10⁶ atoms, the new one 28 ms.
 - On the **AMD Instinct MI300A** (ROCm 6.4, JAX 0.4.35 from AMD's ROCm wheels,
-  CuPy 13.6 built from source) the JAX kernel is on par with the H200 up to
-  10⁴ atoms, where both are dominated by launch latency, and about 2.5× slower
-  from 10⁶ atoms on (26 ms against 11 ms per step at 10⁶ atoms).
-- The array kernel on the MI300A is about 9× slower than on the H200 at 10⁶
-  atoms (185–190 ms against 22 ms). Most of the step goes into the two full reductions
-  (`.sum()` for the energy and the virial), about 80 ms each: CuPy accelerates
-  reductions with CUB by default on CUDA but not on ROCm, and its generic
-  reduction is slow there. The neighbour list takes about 30 ms of the step.
+  CuPy 13.6 built from source) both kernels are on par with the H200 up to
+  10⁴ atoms, where launch latency dominates. At 10⁶ atoms the array kernel
+  takes 28 ms per step (H200: 22 ms with the old scheme) and JAX 26 ms (H200:
+  11 ms); at 10⁷ atoms the array kernel takes 250 ms (H200: 190 ms).
 - On the MI300A, JAX runs out of memory at 10⁷ atoms and the array kernel at
   3×10⁷: plain device allocations reach only the ~63 GiB coarse-grained window
   of the 128 GB of HBM the APU shares with its CPUs, and the neighbour matrix
@@ -229,20 +225,47 @@ threads hit the same atom, as they do for pairs sorted by atom: the weighted
 `bincount` took about 440 ms (three components), JAX's `segment_sum` (even with
 `indices_are_sorted=True`) 1.8 s. The list is a *full* list, so no scatter is
 needed: the pairs of an atom are one contiguous segment, `first_neighbours`
-gives the segment starts (on the GPU for device input), and one thread per
-atom sums its segment in about 1.5 ms, deterministically. The neighbour-matrix
-format avoids the scatter by construction, since each atom sums its own row;
-this is how the JAX kernel works.
+gives the segment starts (on the GPU for device input), and the library's
+`segment_sum` sums each segment without atomics, in a fixed order (so results
+are reproducible bit for bit): 0.55 ms for the (5.4×10⁷, 3) forces, about
+2.4 TB/s. `mabincount` offers the same with matscipy's signature, for sorted
+indices. The best kernel shape is itself hardware dependent: a group of lanes
+per atom and value, reading about 8–12 consecutive values together, was 3×
+faster than one thread per atom on the MI300A; the group size is chosen from
+that rule and the mean segment length, tuned on the MI300A (wave64) and still
+to be checked on NVIDIA (warp32). The neighbour-matrix format avoids the
+scatter by construction, since each atom sums its own row; this is how the
+JAX kernel works.
 
 **Library defaults differ between backends.** CuPy accelerates reductions with
 CUB by default on CUDA, but not on ROCm (`CUPY_ACCELERATORS` defaults to
 `cub` and to empty, respectively). Without it a full reduction such as
-`x.sum()` over 5.4×10⁷ elements takes about 80 ms on the MI300A, and these two
-reductions (energy and virial) are now most of the array kernel's step.
-Enabling CUB on ROCm is not a fix: in the CuPy 13.6 build used here,
-`sum(axis=1)` then returned wrong results for large arrays. CuPy's
-`add.reduceat` is built from a cumulative sum over all elements, which costs a
-temporary of the input's size (13 GB at 10⁷ atoms) and some accuracy.
+`x.sum()` over 5.4×10⁷ elements takes about 80 ms on the MI300A instead of
+0.2 ms; the energy and the virial made up most of the array kernel's step
+(190 ms of it) until `segment_sum(..., total=True)` returned them together
+with the per-atom sums (28 ms per step). Enabling CUB on ROCm is not a fix: in
+the CuPy 13.6 build used here, `sum(axis=1)` then returned wrong results for
+large arrays (with or without `ROCM_HOME` set for CuPy to find the hipCUB
+headers). CuPy's `add.reduceat` is built from a cumulative sum over all
+elements, which costs a temporary of the input's size (13 GB at 10⁷ atoms) and
+some accuracy.
+
+**Status in CuPy's issue tracker** (as of October 2026). The ROCm default was
+introduced with CUB-by-default in
+[cupy#6549](https://github.com/cupy/cupy/pull/6549), without a stated reason
+for leaving HIP out; no issue reports the slow generic reductions on ROCm, and
+[cupy#9657](https://github.com/cupy/cupy/pull/9657) (open) would add
+hipTensor as a reduction accelerator on HIP. No issue reports the wrong CUB
+axis reductions on HIP; the closest are CUDA bugs in the CUB path for large
+arrays ([cupy#9186](https://github.com/cupy/cupy/issues/9186),
+[cupy#9780](https://github.com/cupy/cupy/issues/9780), fixed by
+[cupy#9867](https://github.com/cupy/cupy/pull/9867)), and
+[cupy#9940](https://github.com/cupy/cupy/pull/9940) (open) notes that hipCUB
+errors were silently discarded. Nothing is reported on the slow float64
+`bincount` on ROCm or on `add.reduceat`'s temporary. ROCm 6.x wheels were
+planned in [cupy#8606](https://github.com/cupy/cupy/issues/8606), which was
+superseded by the ROCm 7 issue
+[cupy#9529](https://github.com/cupy/cupy/issues/9529).
 
 **Unified memory on an APU has its own limits.** The MI300A's CPUs and GPU
 share 128 GB of HBM, but plain device allocations (`hipMalloc`, and the pools

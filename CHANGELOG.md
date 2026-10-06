@@ -39,6 +39,18 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - `tests/test_neighbour_list_gpu.cc` builds and runs with the HIP backend, and
   the device tests of `tests/test_memory_space.cc` run on HIP too, plus a test
   that the HIP block cache reuses freed blocks.
+- `segment_sum(values, seed, total=False)` sums per-pair values per atom over
+  the segments of an `i`-sorted pair list (row starts from `first_neighbours`),
+  without atomics and in a fixed order, on the host (OpenMP) or the GPU
+  (CuPy, JAX, PyTorch via DLPack); float32, float64, int32 and int64, any
+  trailing shape, optionally with the total over all atoms. On the GPU a group
+  of lanes per atom and value sums with warp shuffles, the group size chosen
+  from the values per row and the mean segment length (tuned on an MI300A:
+  0.55 ms for 5.4×10⁷ force vectors, against 440 ms for a weighted CuPy
+  `bincount`). `mabincount(x, weights, minlength, axis=0)` has matscipy's
+  signature and requires sorted `x`. The C++ core gains `segment_sum` and
+  `segment_sum_gpu_device`, and `benchmarks/bench_segment_sum` times the
+  kernel variants on a GPU.
 - `first_neighbours` accepts a device index array (CuPy, JAX, PyTorch via
   DLPack) and computes the row-start array on its GPU, returning it there in
   the input's framework (`array_namespace` overrides); host input is
@@ -52,14 +64,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
   vacuum. The fused Warp and C++ kernels consume the cell-shift array `S` of
   the list for the periodic case; the array and JAX kernels are unchanged
   because the shifts are folded into the distance vectors.
-- The array example sums the pair forces per atom with a segment sum over the
-  `i`-sorted pairs instead of a weighted `bincount` per component, whose
-  float64 atomic scatter is very slow on ROCm (about 440 ms against 1.5 ms at
-  10⁶ atoms on an MI300A): `first_neighbours` gives the segment starts, and a
-  small CuPy kernel (one thread per atom) sums each segment on the GPU,
-  `add.reduceat` on the CPU. CuPy's `add.reduceat` was not used on the GPU: it
-  computes a cumulative sum of all pairs, a temporary the size of the pair
-  forces, and loses accuracy to it. Results files record
+- The array example sums the pair forces, energies and virials per atom with
+  `segment_sum(..., total=True)` instead of a weighted `bincount` per force
+  component and two full reductions. On an MI300A at 10⁶ atoms the step went
+  from 700 ms to 28 ms (and reaches 10⁷ atoms, at 250 ms): the float64 atomic scatter of `bincount` took about
+  440 ms and CuPy's full reductions about 80 ms each, as CuPy does not enable
+  CUB on ROCm. Results files record
   the method (`array_force_sum`); the GPU comparison labels the array curves
   with it.
 - The benchmark page gains a section on performance portability between
