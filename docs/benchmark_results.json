@@ -1956,6 +1956,206 @@
      }
     ]
    }
+  },
+  "NVIDIA RTX PRO 6000 Blackwell Server Edition": {
+   "meta": {
+    "cpu": "AMD EPYC 9655 96-Core Processor (23 usable cores)",
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "ncores": 23,
+    "systems": [
+     "liquid",
+     "droplet"
+    ],
+    "density": 0.8442,
+    "sizes": [
+     100,
+     1000,
+     10000,
+     100000,
+     1000000,
+     3000000,
+     10000000,
+     30000000
+    ],
+    "steps": 40,
+    "timeout": 300,
+    "max_run_seconds": 60,
+    "max_atoms_cpu": null,
+    "thrash_growth": 6.0,
+    "kernels": [
+     "array",
+     "jax"
+    ],
+    "lists": [
+     "matscipy"
+    ],
+    "devices": [
+     "gpu"
+    ],
+    "array_force_sum": "segment_sum"
+   },
+   "systems": {
+    "liquid": [
+     {
+      "kernel": "array",
+      "nl": "matscipy",
+      "device": "gpu",
+      "threads": null,
+      "fmt": "list",
+      "supported": true,
+      "points": [
+       [
+        100,
+        3.471
+       ],
+       [
+        1000,
+        2.073
+       ],
+       [
+        10000,
+        2.099
+       ],
+       [
+        100000,
+        7.151
+       ],
+       [
+        1000000,
+        42.585
+       ],
+       [
+        3000000,
+        112.156
+       ],
+       [
+        10000000,
+        364.08
+       ]
+      ],
+      "done": true
+     },
+     {
+      "kernel": "jax",
+      "nl": "matscipy",
+      "device": "gpu",
+      "threads": null,
+      "fmt": "list",
+      "supported": true,
+      "points": [
+       [
+        100,
+        1.565
+       ],
+       [
+        1000,
+        1.014
+       ],
+       [
+        10000,
+        1.053
+       ],
+       [
+        100000,
+        2.78
+       ],
+       [
+        1000000,
+        16.396
+       ],
+       [
+        3000000,
+        44.909
+       ],
+       [
+        10000000,
+        150.509
+       ]
+      ],
+      "done": true
+     }
+    ],
+    "droplet": [
+     {
+      "kernel": "array",
+      "nl": "matscipy",
+      "device": "gpu",
+      "threads": null,
+      "fmt": "list",
+      "supported": true,
+      "points": [
+       [
+        100,
+        1.422
+       ],
+       [
+        1000,
+        2.185
+       ],
+       [
+        10000,
+        2.085
+       ],
+       [
+        100000,
+        8.135
+       ],
+       [
+        1000000,
+        42.206
+       ],
+       [
+        3000000,
+        115.004
+       ],
+       [
+        10000000,
+        378.658
+       ]
+      ],
+      "done": true
+     },
+     {
+      "kernel": "jax",
+      "nl": "matscipy",
+      "device": "gpu",
+      "threads": null,
+      "fmt": "list",
+      "supported": true,
+      "points": [
+       [
+        100,
+        0.645
+       ],
+       [
+        1000,
+        0.854
+       ],
+       [
+        10000,
+        1.063
+       ],
+       [
+        100000,
+        2.673
+       ],
+       [
+        1000000,
+        16.575
+       ],
+       [
+        3000000,
+        47.573
+       ],
+       [
+        10000000,
+        160.826
+       ]
+      ],
+      "done": true
+     }
+    ]
+   }
   }
  }
 }

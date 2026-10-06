@@ -178,6 +178,7 @@ the matscipy-neighbours GPU list (pair list for the array kernels,
 
 - **NVIDIA H200** (host CPU: AMD EPYC 9654 96-Core Processor (23 usable cores))
 - **AMD Instinct MI300A** (host CPU: AMD Instinct MI300A Accelerator (23 usable cores))
+- **NVIDIA RTX PRO 6000 Blackwell Server Edition** (host CPU: AMD EPYC 9655 96-Core Processor (23 usable cores))
 
 ![GPU comparison](benchmark_gpus.png)
 
