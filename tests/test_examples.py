@@ -89,16 +89,17 @@ def test_example_forces_match_brute_force(lj, system):
     ([], 4),                            # no pairs at all
 ])
 @pytest.mark.parametrize("device", ["cpu", "gpu"])
-def test_pair_sum_matches_bincount(lj, i, n, device):
-    """The segment sum that accumulates the pair forces (add.reduceat on the
-    CPU, a kernel on the GPU) equals a weighted bincount, also for atoms
-    without pairs anywhere in the list."""
+def test_pair_sums_match_bincount(lj, i, n, device):
+    """The per-atom sums that accumulate the pair forces equal a weighted
+    bincount, also for atoms without pairs anywhere in the list, and the
+    totals of the pair scalars equal their sums over all pairs."""
     i = np.array(i, dtype=np.int64)
-    w = np.random.default_rng(3).standard_normal((len(i), 3))
+    rng = np.random.default_rng(3)
+    w, scalars = rng.standard_normal((len(i), 3)), rng.standard_normal((len(i), 2))
     want = np.stack([np.bincount(i, weights=w[:, k], minlength=n)
                      for k in range(3)], axis=1)
     if device == "cpu":
-        got = lj.pair_sum(np, i, w, n)
+        got, total = lj.pair_sums(np, i, w, scalars, n)
     else:
         cupy = pytest.importorskip("cupy")
         try:
@@ -109,8 +110,11 @@ def test_pair_sum_matches_bincount(lj, i, n, device):
         import _matscipy_neighbours
         if not getattr(_matscipy_neighbours, "_has_gpu", 0):
             pytest.skip("extension built without a GPU backend")
-        got = cupy.asnumpy(lj.pair_sum(cupy, cupy.asarray(i), cupy.asarray(w), n))
+        got, total = (cupy.asnumpy(a) for a in
+                      lj.pair_sums(cupy, cupy.asarray(i), cupy.asarray(w),
+                                   cupy.asarray(scalars), n))
     assert np.allclose(got, want, rtol=0, atol=1e-14)
+    assert np.allclose(total, scalars.sum(axis=0), rtol=0, atol=1e-13)
 
 
 def test_liquid_lattice_is_homogeneous_and_inside_box(lj):

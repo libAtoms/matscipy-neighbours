@@ -88,64 +88,21 @@ def fcc_liquid_n(xp, target_n, density):
     return xp.asarray(r), L
 
 
-# Per-atom segment sum on the GPU: one thread per atom sums the rows of its
-# segment of the pair array. No atomics, no temporaries, deterministic.
-_SEGMENT_SUM_SOURCE = r"""
-extern "C" __global__ void segment_sum(const long long *seed,
-                                       const double *weights, double *out,
-                                       long long n, int d) {
-    const long long a = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-    if (a >= n) return;
-    /* -1 marks atoms before the first pair: an empty segment. */
-    const long long begin = seed[a] < 0 ? 0 : seed[a];
-    const long long end = seed[a + 1] < 0 ? 0 : seed[a + 1];
-    for (int k = 0; k < d; k++) {
-        double acc = 0.0;
-        for (long long p = begin; p < end; p++) acc += weights[p * d + k];
-        out[a * d + k] = acc;
-    }
-}
-"""
-_segment_sum_kernel = None
-
-
-def pair_sum(xp, i, weights, n):
-    """Sum ``weights`` (shape (npairs, d)) over the pairs of each atom, giving
-    (n, d). The pairs are sorted by ``i``, so the pairs of an atom are one
-    contiguous segment, and ``first_neighbours`` gives the segment starts (on
-    the device for device input). Unlike a weighted ``bincount`` (matscipy's
+def pair_sums(xp, i, forces, scalars, n):
+    """Per-atom sums of the pair ``forces`` (npairs, 3) and the totals over
+    all pairs of the pair ``scalars`` (npairs, k). The pairs are sorted by
+    ``i``, so the pairs of an atom are one contiguous segment:
+    ``first_neighbours`` gives the segment starts and ``segment_sum`` sums
+    each segment, on the device for device input, in a fixed order and
+    without atomics. Unlike a weighted ``bincount`` per component (matscipy's
     ``mabincount``) this needs no atomic scatter, which for float64 is very
-    slow on some GPUs (e.g. on ROCm). On the GPU a small kernel sums each
-    segment; on the CPU ``add.reduceat`` does."""
-    from matscipy_neighbours import first_neighbours
+    slow on some GPUs (e.g. on ROCm), and the totals come with it instead of
+    from separate full reductions, which can be slow too (CuPy on ROCm)."""
+    from matscipy_neighbours import first_neighbours, segment_sum
 
     seed = first_neighbours(n, i.astype(xp.int64, copy=False))
-    if xp is not np:
-        global _segment_sum_kernel
-        if _segment_sum_kernel is None:
-            _segment_sum_kernel = xp.RawKernel(_SEGMENT_SUM_SOURCE,
-                                               "segment_sum")
-        weights = xp.ascontiguousarray(weights, dtype=xp.float64)
-        out = xp.empty((n, weights.shape[1]), dtype=xp.float64)
-        block = 256
-        _segment_sum_kernel(((n + block - 1) // block,), (block,),
-                            (seed, weights, out, xp.int64(n),
-                             xp.int32(weights.shape[1])))
-        return out
-    # -1 marks atoms before the first pair; clamped, every atom without pairs
-    # has an empty segment.
-    seed = np.maximum(seed, 0)
-    starts = seed[:-1]
-    # reduceat wants every start inside the array and ends each segment where
-    # the next one starts (the last at the end of the array). The atoms after
-    # the atom of the last pair start at npairs: sum up to them, and leave
-    # them zero.
-    m = int(i[-1]) + 1 if i.shape[0] else 0
-    out = np.zeros((n, weights.shape[1]), dtype=weights.dtype)
-    if m > 0:
-        out[:m] = np.add.reduceat(weights, starts[:m], axis=0)
-    # reduceat returns the element at the start for an empty segment.
-    return np.where((seed[1:] > starts)[:, None], out, 0.0)
+    _, total = segment_sum(scalars, seed, total=True)
+    return segment_sum(forces, seed), total
 
 
 def fixed_box(ncells, lattice, cutoff):
@@ -263,11 +220,19 @@ def lj_forces_energy(xp, build_ijD, positions):
     r2 = (D * D).sum(axis=1)
     inv_r2 = 1.0 / r2
     inv_r6 = inv_r2 * inv_r2 * inv_r2
-    energy = 0.5 * float((4.0 * inv_r6 * (inv_r6 - 1.0)).sum())
     coef = -24.0 * inv_r2 * inv_r6 * (2.0 * inv_r6 - 1.0)   # force prefactor
-    fpair = coef[:, None] * D                                # force on i
-    forces = pair_sum(xp, i, fpair, n)
-    virial = -0.5 * float((coef * r2).sum())                 # directed pairs: 1/2
+    # Per pair: the pair energy and the virial term ...
+    scalars = xp.empty((D.shape[0], 2), dtype=D.dtype)
+    scalars[:, 0] = 4.0 * inv_r6 * (inv_r6 - 1.0)
+    scalars[:, 1] = coef * r2
+    del r2, inv_r2, inv_r6
+    # ... and the force on i, in place of D (keeps the largest systems within
+    # GPU memory).
+    D *= coef[:, None]
+    del coef
+    forces, total = pair_sums(xp, i, D, scalars, n)
+    energy = 0.5 * float(total[0])                          # directed pairs: 1/2
+    virial = -0.5 * float(total[1])
     return forces, energy, virial, int(i.shape[0])
 
 
