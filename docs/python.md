@@ -2,8 +2,8 @@
 
 ```python
 from matscipy_neighbours import (
-    neighbour_list, coordination, first_neighbours, triplet_list,
-    get_jump_indicies, mic, DLPackTensor,
+    neighbour_list, coordination, first_neighbours, segment_sum, mabincount,
+    triplet_list, get_jump_indicies, mic, DLPackTensor,
 )
 ```
 
@@ -157,7 +157,12 @@ allocation retried once first.
 
 ## Other functions
 
-- `first_neighbours(n, i)` — row-start (CSR) offsets for an `i`-sorted list.
+- `first_neighbours(n, i)` — row-start (CSR) offsets for an `i`-sorted list:
+  the pairs of atom `k` are `seed[k]:seed[k+1]`. Atoms before the first pair get
+  `-1` (as in matscipy), so `maximum(seed, 0)` gives offsets with an empty
+  segment for every atom without neighbours. A device `i` (CuPy, JAX, PyTorch;
+  int64) is processed on its GPU and the result stays there, by default in the
+  framework of `i`.
 - `triplet_list(first_neighbours, abs_dr_p=None, cutoff=None)` — triplets from a
   first-neighbour array.
 - `get_jump_indicies(sorted_array)` — jump indices of an ordered array.
@@ -165,6 +170,60 @@ allocation retried once first.
 - `empty_gpu_cache()` — return the GPU memory cached by the library's
   allocator to the driver (see [GPU memory](#gpu-memory); no-op without a GPU
   backend).
+
+## Per-atom sums: `segment_sum` and `mabincount`
+
+```python
+segment_sum(values, seed, *, total=False, array_namespace=None)
+mabincount(x, weights, minlength, axis=0)
+```
+
+Summing per-pair quantities per atom (forces, per-atom energies or virials)
+is a bincount over the pairs' first index, usually written as a scatter: a
+weighted `bincount`, `cupyx.scatter_add` or `jax.ops.segment_sum`. The pair
+list is sorted by its first index, so the pairs of an atom form one
+contiguous segment, and `segment_sum` sums each segment without atomics. On
+an AMD MI300A this takes 0.55 ms for 5.4×10⁷ force vectors, against 4.6 ms for
+`cupyx.scatter_add` and about 440 ms for CuPy's weighted `bincount`, which is
+dominated by its input validation (two full reductions, slow with CuPy on
+ROCm). The summation order is fixed, so results are reproducible bit for
+bit, unlike with atomics.
+
+- `segment_sum(values, seed)` sums the rows of `values` (shape
+  `(npairs, ...)`, float32, float64, int32 or int64, C-contiguous) over the
+  segments given by `seed` from `first_neighbours`, and returns an array of
+  shape `(n, ...)`. It runs on the host (OpenMP) for NumPy input and on the
+  GPU for device input (CuPy, JAX, PyTorch via DLPack; `seed` on the same
+  device), returning the result in the framework of `values`.
+- `total=True` also returns the sum over all atoms, of shape
+  `values.shape[1:]`, computed in the same call. On the GPU this saves a
+  separate full reduction, which can be slow too (CuPy on ROCm, see the
+  [benchmark notes on performance portability](benchmark.md#performance-portability-nvidia-and-amd)).
+- `mabincount(x, weights, minlength, axis=0)` has the signature of
+  `matscipy.numpy_tricks.mabincount`, but requires `x` to be **sorted**, with
+  every entry in `[0, minlength)` (`ValueError` otherwise). It builds the
+  segments with `first_neighbours` and sums them with `segment_sum`.
+
+Forces, energy and virial of a pair potential in one call, as in the array
+example:
+
+```python
+i, D = neighbour_list("iD", positions=positions, cell=cell, pbc=True,
+                      cutoff=cutoff)
+r2 = (D * D).sum(axis=1)
+... # per-pair force prefactor `coef` and energy `e_pair`
+pair = xp.empty((len(i), 5))
+pair[:, :3] = coef[:, None] * D       # force on i
+pair[:, 3] = e_pair
+pair[:, 4] = coef * r2                # virial term
+per_atom, total = segment_sum(pair, first_neighbours(n, i), total=True)
+forces = per_atom[:, :3]
+energy, virial = 0.5 * float(total[3]), -0.5 * float(total[4])
+```
+
+Inside `jax.jit` these functions cannot be called (they exchange data with
+DLPack eagerly); there, use the neighbour matrix, where each atom sums its own
+row.
 
 ## `DLPackTensor`
 

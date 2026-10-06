@@ -7,7 +7,7 @@
  * Validation that the GPU neighbour list agrees with the CPU result
  * pair-for-pair. Within-row order differs (GPU scatter is unordered), so pairs
  * are compared as sorted (i, j, shift) multisets plus the distance multiset.
- * Built only with the CUDA backend; skips if no device is present.
+ * Built only with a GPU backend (CUDA or HIP); skips if no device is present.
  */
 
 #include <gtest/gtest.h>
@@ -22,25 +22,39 @@
 
 #include "device_primitives.hh"
 #include "error.hh"
+#include "first_neighbours.hh"
 #include "memory_space.hh"
 #include "neighbour_list.hh"
 #include "neighbour_list_gpu.hh"
+#include "segment_sum.hh"
 
-#ifdef MATSCIPY_ENABLE_CUDA
+#if defined(MATSCIPY_ENABLE_CUDA)
 #include <cuda_runtime.h>
+#elif defined(MATSCIPY_ENABLE_HIP)
+#include <hip/hip_runtime.h>
 #endif
 
 using namespace matscipy;
 
 namespace {
 
-bool cuda_device_present() {
-#ifdef MATSCIPY_ENABLE_CUDA
+bool gpu_device_present() {
     int n = 0;
+#if defined(MATSCIPY_ENABLE_CUDA)
     return cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
+#elif defined(MATSCIPY_ENABLE_HIP)
+    return hipGetDeviceCount(&n) == hipSuccess && n > 0;
 #else
     return false;
 #endif
+}
+
+/* Copy a device buffer to a host vector of the same size. */
+template <typename T>
+std::vector<T> to_host(const Array<T, DeviceSpace> &d) {
+    Array<T> h(d.size());
+    deep_copy(h, d);
+    return std::vector<T>(h.data(), h.data() + h.size());
 }
 
 /* Canonicalise a result into a sorted list of (i, j, sx, sy, sz) tuples so two
@@ -94,24 +108,24 @@ void compare(int N, double L, double cutoff, unsigned seed,
 }  // namespace
 
 TEST(NeighbourListGpu, MatchesCpuDense) {
-    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
     compare(/*N=*/2000, /*L=*/12.0, /*cutoff=*/1.0, /*seed=*/1);
 }
 
 TEST(NeighbourListGpu, MatchesCpuFewLargeCells) {
-    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
     /* Small box: only a few cells per side, so the periodic wrap and multiple
        images per neighbour cell are exercised. */
     compare(/*N=*/500, /*L=*/3.5, /*cutoff=*/1.0, /*seed=*/2);
 }
 
 TEST(NeighbourListGpu, MatchesCpuLargerCutoff) {
-    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
     compare(/*N=*/3000, /*L=*/15.0, /*cutoff=*/2.0, /*seed=*/3);
 }
 
 TEST(NeighbourListGpu, MatchesCpuMortonOrder) {
-    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
     compare(/*N=*/2000, /*L=*/12.0, /*cutoff=*/1.0, /*seed=*/1,
             CellOrder::Morton);
     compare(/*N=*/3000, /*L=*/15.0, /*cutoff=*/2.0, /*seed=*/3,
@@ -119,7 +133,7 @@ TEST(NeighbourListGpu, MatchesCpuMortonOrder) {
 }
 
 TEST(NeighbourListGpu, MatchesCpuSparseVacuum) {
-    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
     /* A cluster of atoms in a box 40x larger per side: the grid has ~6e7 cells
        (>> 2^20 and >> 8*nat), so the GPU takes the hashed compact backend. */
     const double Lc = std::cbrt(4000 / 12.0);
@@ -130,7 +144,7 @@ TEST(NeighbourListGpu, MatchesCpuSparseVacuum) {
 /* --- dense fixed-capacity matrix -------------------------------------------- */
 
 TEST(NeighbourListGpu, MatrixMatchesCpu) {
-    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
     const int N = 3000;
     const double L = 14.0, cutoff = 1.4;
     const real_t cell[9] = {(real_t)L, 0, 0, 0, (real_t)L, 0, 0, 0, (real_t)L};
@@ -163,14 +177,11 @@ TEST(NeighbourListGpu, MatrixMatchesCpu) {
     ASSERT_FALSE(dev.overflow);
     ASSERT_EQ(dev.max_neighbours, K);
 
-    std::vector<index_t> gidx((size_t)N * K), gcount(N);
-    std::vector<real_t> gdist((size_t)N * K * 3);
-    cudaMemcpy(gidx.data(), dev.idx.data(), gidx.size() * sizeof(index_t),
-               cudaMemcpyDeviceToHost);
-    cudaMemcpy(gcount.data(), dev.count.data(), N * sizeof(index_t),
-               cudaMemcpyDeviceToHost);
-    cudaMemcpy(gdist.data(), dev.dist.data(), gdist.size() * sizeof(real_t),
-               cudaMemcpyDeviceToHost);
+    ASSERT_EQ(dev.idx.size(), (size_t)N * K);
+    ASSERT_EQ(dev.count.size(), (size_t)N);
+    ASSERT_EQ(dev.dist.size(), (size_t)N * K * 3);
+    const std::vector<index_t> gidx = to_host(dev.idx), gcount = to_host(dev.count);
+    const std::vector<real_t> gdist = to_host(dev.dist);
 
     /* Per-atom: same count, and the same set of (j -> distance vector). */
     for (int i = 0; i < N; i++) {
@@ -232,16 +243,10 @@ static void check_matrix_quantities(int quantities) {
     EXPECT_EQ(dev.shift.size(), wS ? (size_t)N * K * 3 : 0u);
     EXPECT_EQ(cpu.shift.size(), wS ? (size_t)N * K * 3 : 0u);
 
-    std::vector<index_t> gidx((size_t)N * K), gcount(N), gshift;
-    cudaMemcpy(gidx.data(), dev.idx.data(), gidx.size() * sizeof(index_t),
-               cudaMemcpyDeviceToHost);
-    cudaMemcpy(gcount.data(), dev.count.data(), N * sizeof(index_t),
-               cudaMemcpyDeviceToHost);
-    if (wS) {
-        gshift.resize((size_t)N * K * 3);
-        cudaMemcpy(gshift.data(), dev.shift.data(), gshift.size() * sizeof(index_t),
-                   cudaMemcpyDeviceToHost);
-    }
+    ASSERT_EQ(dev.idx.size(), (size_t)N * K);
+    ASSERT_EQ(dev.count.size(), (size_t)N);
+    const std::vector<index_t> gidx = to_host(dev.idx), gcount = to_host(dev.count),
+                               gshift = to_host(dev.shift);
     using Key = std::tuple<index_t, index_t, index_t, index_t>;
     auto key = [&](const std::vector<index_t> &idx, const std::vector<index_t> &sh,
                    int i, index_t s) {
@@ -263,19 +268,19 @@ static void check_matrix_quantities(int quantities) {
 }
 
 TEST(NeighbourListGpu, MatrixShiftsOnlyMatchesCpu) {
-    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
     check_matrix_quantities(QUANTITY_SHIFT);
 }
 
 TEST(NeighbourListGpu, MatrixIndicesOnlyMatchesCpu) {
-    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
     check_matrix_quantities(0);
 }
 
 /* Running out of GPU memory is an error code, not an abort, and leaves the
    allocator usable (the next, sensible request succeeds). */
 TEST(NeighbourListGpu, OutOfMemoryIsAnError) {
-    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
     const int N = 1000;
     const real_t cell[9] = {10, 0, 0, 0, 10, 0, 0, 0, 10};
     const real_t inv[9] = {0.1, 0, 0, 0, 0.1, 0, 0, 0, 0.1};
@@ -307,7 +312,7 @@ TEST(NeighbourListGpu, OutOfMemoryIsAnError) {
 /* Freed blocks are cached and reused; returning them to the driver in between
    must not disturb later builds. */
 TEST(NeighbourListGpu, RepeatedBuildsAndEmptyCache) {
-    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
     const int N = 4000;
     const double L = 16.0;
     const real_t cell[9] = {(real_t)L, 0, 0, 0, (real_t)L, 0, 0, 0, (real_t)L};
@@ -342,7 +347,7 @@ TEST(NeighbourListGpu, RepeatedBuildsAndEmptyCache) {
 /* --- coordination (count without materialising pairs) --------------------- */
 
 TEST(NeighbourListGpu, CoordinationMatchesCpu) {
-    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
     const int N = 3000;
     const double L = 14.0, cutoff = 1.2;
     const real_t cell[9] = {(real_t)L, 0, 0, 0, (real_t)L, 0, 0, 0, (real_t)L};
@@ -375,20 +380,146 @@ TEST(NeighbourListGpu, CoordinationMatchesCpu) {
     NeighbourListDevice dev;
     ASSERT_EQ(neighbour_count_gpu_device(req, dev), NL_SUCCESS);
     ASSERT_EQ(dev.counts.size(), (size_t)N);
-    std::vector<index_t> got(N);
-    cudaMemcpy(got.data(), dev.counts.data(), N * sizeof(index_t),
-               cudaMemcpyDeviceToHost);
+    const std::vector<index_t> got = to_host(dev.counts);
     EXPECT_EQ(got, want);
+}
+
+/* --- first_neighbours ------------------------------------------------------ */
+
+TEST(FirstNeighboursGpu, MatchesHost) {
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
+    /* Leading, inner and trailing atoms without pairs; long runs and gaps. */
+    std::mt19937 rng(7);
+    std::vector<index_t> i_n;
+    const index_t n = 5000;
+    for (index_t a = 3; a < n - 10; a++) {
+        if (rng() % 5 == 0) continue;
+        const index_t deg = rng() % 40;
+        i_n.insert(i_n.end(), deg, a);
+    }
+    const index_t nn = static_cast<index_t>(i_n.size());
+    std::vector<index_t> want(n + 1);
+    ASSERT_EQ(first_neighbours(n, nn, i_n.data(), want.data()), NL_SUCCESS);
+
+    Array<index_t> h_i(nn);
+    std::copy(i_n.begin(), i_n.end(), h_i.data());
+    Array<index_t, DeviceSpace> d_i(nn), d_seed;
+    deep_copy(d_i, h_i);
+    ASSERT_EQ(first_neighbours_gpu_device(n, nn, d_i.data(), d_seed), NL_SUCCESS);
+    EXPECT_EQ(to_host(d_seed), want);
+
+    /* Empty list: every row starts at 0. */
+    ASSERT_EQ(first_neighbours_gpu_device(4, 0, nullptr, d_seed), NL_SUCCESS);
+    EXPECT_EQ(to_host(d_seed), std::vector<index_t>(5, 0));
+}
+
+TEST(FirstNeighboursGpu, RejectsUnsortedAndOutOfRange) {
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
+    for (const std::vector<index_t> &bad : {std::vector<index_t>{0, 2, 1},
+                                            std::vector<index_t>{0, 3}}) {
+        Array<index_t> h_i(bad.size());
+        std::copy(bad.begin(), bad.end(), h_i.data());
+        Array<index_t, DeviceSpace> d_i(bad.size()), d_seed;
+        deep_copy(d_i, h_i);
+        EXPECT_EQ(first_neighbours_gpu_device(3, static_cast<index_t>(bad.size()),
+                                              d_i.data(), d_seed),
+                  NL_INVALID_ARGUMENT);
+        EXPECT_EQ(d_seed.size(), 0u);  /* untouched */
+    }
+}
+
+/* --- segment_sum ----------------------------------------------------------- */
+
+namespace {
+
+/* Random sorted first indices over n atoms with empty atoms at both ends and
+   inside, as a seed array, plus values; the device result of every kernel
+   variant must equal the host result. */
+template <typename T>
+void check_segment_sum_device(index_t d, T scale) {
+    std::mt19937 rng(11);
+    const index_t n = 3000;
+    std::vector<index_t> i_n;
+    for (index_t a = 5; a < n - 7; a++) {
+        if (rng() % 6 == 0) continue;
+        i_n.insert(i_n.end(), rng() % 90, a);
+    }
+    const index_t nn = static_cast<index_t>(i_n.size());
+    std::vector<index_t> seed(n + 1);
+    ASSERT_EQ(first_neighbours(n, nn, i_n.data(), seed.data()), NL_SUCCESS);
+    std::vector<T> v(nn * d);
+    for (auto &x : v) x = static_cast<T>(static_cast<int>(rng() % 2001) - 1000) * scale;
+    std::vector<T> want(n * d), want_total(d);
+    ASSERT_EQ(segment_sum(n, seed.data(), nn, d, v.data(), want.data(),
+                          want_total.data()),
+              NL_SUCCESS);
+
+    Array<index_t> h_seed(n + 1);
+    std::copy(seed.begin(), seed.end(), h_seed.data());
+    Array<T> h_v(nn * d);
+    std::copy(v.begin(), v.end(), h_v.data());
+    Array<index_t, DeviceSpace> d_seed(n + 1);
+    Array<T, DeviceSpace> d_v(nn * d), d_out, d_total;
+    deep_copy(d_seed, h_seed);
+    deep_copy(d_v, h_v);
+    struct Variant { SegmentSumKernel k; int g; };
+    for (Variant var : {Variant{SegmentSumKernel::Auto, 0},
+                        Variant{SegmentSumKernel::ThreadPerRow, 0},
+                        Variant{SegmentSumKernel::Group, 2},
+                        Variant{SegmentSumKernel::Group, 8},
+                        Variant{SegmentSumKernel::Group, 32}}) {
+        ASSERT_EQ(segment_sum_gpu_device(n, d_seed.data(), nn, d, d_v.data(),
+                                         d_out, &d_total, -1, var.k, var.g),
+                  NL_SUCCESS);
+        const std::vector<T> got = to_host(d_out), got_total = to_host(d_total);
+        ASSERT_EQ(got.size(), want.size());
+        for (std::size_t k = 0; k < got.size(); k++)
+            ASSERT_NEAR(static_cast<double>(got[k]), static_cast<double>(want[k]),
+                        1e-9 * (1 + std::abs(static_cast<double>(want[k]))))
+                << "kernel " << static_cast<int>(var.k) << " group " << var.g
+                << " at " << k;
+        for (index_t c = 0; c < d; c++)
+            ASSERT_NEAR(static_cast<double>(got_total[c]),
+                        static_cast<double>(want_total[c]),
+                        1e-9 * (1 + std::abs(static_cast<double>(want_total[c]))));
+    }
+}
+
+}  // namespace
+
+TEST(SegmentSumGpu, MatchesHostDouble) {
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
+    check_segment_sum_device<double>(3, 0.001);
+    check_segment_sum_device<double>(1, 0.001);
+    check_segment_sum_device<double>(9, 0.001);
+}
+
+TEST(SegmentSumGpu, MatchesHostIntegerExactly) {
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
+    check_segment_sum_device<std::int64_t>(3, 1);
+    check_segment_sum_device<std::int32_t>(2, 1);
+}
+
+TEST(SegmentSumGpu, RejectsBadRowStarts) {
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
+    const std::vector<index_t> bad = {0, 3, 2};
+    Array<index_t> h(bad.size());
+    std::copy(bad.begin(), bad.end(), h.data());
+    Array<index_t, DeviceSpace> d_seed(bad.size());
+    deep_copy(d_seed, h);
+    Array<double, DeviceSpace> d_v(4), d_out;
+    EXPECT_EQ(segment_sum_gpu_device(2, d_seed.data(), 4, 1, d_v.data(), d_out),
+              NL_INVALID_ARGUMENT);
 }
 
 /* --- device primitives ----------------------------------------------------- */
 
 TEST(DevicePrimitives, ExclusiveScan) {
-    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
     const index_t n = 1000;
     Array<index_t> h_in(n), h_out(n);
     for (index_t i = 0; i < n; i++) h_in.data()[i] = i % 7;
-    Array<index_t, CudaSpace> d_in(n), d_out(n);
+    Array<index_t, DeviceSpace> d_in(n), d_out(n);
     deep_copy(d_in, h_in);
 
     index_t total = device_exclusive_scan(d_in.data(), d_out.data(), n);
@@ -403,7 +534,7 @@ TEST(DevicePrimitives, ExclusiveScan) {
 }
 
 TEST(DevicePrimitives, RadixSortPairs) {
-    if (!cuda_device_present()) GTEST_SKIP() << "no CUDA device";
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
     const index_t n = 4096;
     Array<std::uint64_t> h_keys(n);
     Array<index_t> h_vals(n);
@@ -412,8 +543,8 @@ TEST(DevicePrimitives, RadixSortPairs) {
         h_keys.data()[i] = static_cast<std::uint64_t>(n - 1 - i) * 2654435761u;
         h_vals.data()[i] = i;
     }
-    Array<std::uint64_t, CudaSpace> d_keys(n);
-    Array<index_t, CudaSpace> d_vals(n);
+    Array<std::uint64_t, DeviceSpace> d_keys(n);
+    Array<index_t, DeviceSpace> d_vals(n);
     deep_copy(d_keys, h_keys);
     deep_copy(d_vals, h_vals);
 

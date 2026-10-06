@@ -154,7 +154,7 @@ there is the list. This section therefore does
 Lennard-Jones potential on top of it:
 
 - the **array** path materialises the per-pair distance vectors returned by the
-  list and scatters the forces with a `bincount` per component;
+  list and scatters the forces with a weighted `bincount` per component (an atomic scatter);
 - **JAX** `jit`-compiles a dense masked sum over the fixed-capacity
   `neighbour_matrix` (no scatter, but padded rows);
 - **Warp** and **C++/CUDA** run one fused pass over the `ij` pairs (plus the
@@ -168,6 +168,130 @@ The C++ force loop is OpenMP-parallel and honours the single-thread setting;
 the NumPy, Warp-CPU and JAX-CPU kernels use their own threading and are not
 pinned to one core, so on the CPU the comparison is indicative rather than
 strict.
+
+## GPU comparison: array and JAX kernels across GPUs
+
+The array (CuPy) and JAX kernels run unchanged on NVIDIA (CUDA) and AMD (ROCm)
+GPUs, so they can compare GPUs directly. The figure below shows both kernels on
+the matscipy-neighbours GPU list (pair list for the array kernels,
+`neighbour_matrix` for JAX) on each GPU measured so far:
+
+- **NVIDIA H200** (host CPU: AMD EPYC 9654 96-Core Processor (23 usable cores))
+- **AMD Instinct MI300A** (host CPU: AMD Instinct MI300A Accelerator (23 usable cores))
+- **NVIDIA RTX PRO 6000 Blackwell Server Edition** (host CPU: AMD EPYC 9655 96-Core Processor (23 usable cores))
+
+![GPU comparison](benchmark_gpus.png)
+
+How to read it:
+
+- The legend says how each run's array kernel sums the pair forces per atom:
+  a weighted `bincount` per component plus full reductions for the energy and
+  virial (the H200 curves, measured before `segment_sum` existed), or
+  `segment_sum`, which sums forces, energies and virials per atom without
+  atomics and returns the totals with them (the MI300A curves). On the MI300A
+  the old scheme took 700 ms per step at 10⁶ atoms, the new one 28 ms.
+- On the **AMD Instinct MI300A** (ROCm 6.4, JAX 0.4.35 from AMD's ROCm wheels,
+  CuPy 13.6 built from source) both kernels are on par with the H200 up to
+  10⁴ atoms, where launch latency dominates. At 10⁶ atoms the array kernel
+  takes 28 ms per step (H200: 22 ms with the old scheme) and JAX 26 ms (H200:
+  11 ms); at 10⁷ atoms the array kernel takes 250 ms (H200: 190 ms).
+- On the MI300A, JAX runs out of memory at 10⁷ atoms and the array kernel at
+  3×10⁷: plain device allocations reach only the ~63 GiB coarse-grained window
+  of the 128 GB of HBM the APU shares with its CPUs, and the neighbour matrix
+  alone needs 31 GB at 10⁷ atoms. The H200 (141 GB) runs JAX at 10⁷ atoms.
+
+## Performance portability: NVIDIA and AMD
+
+The same source runs on NVIDIA (CUDA) and AMD (ROCm) GPUs, but code that is
+fast on one is not automatically fast on the other. Bringing the MI300A runs
+in line with the H200 ones surfaced the following, roughly in order of impact;
+the numbers are for the periodic liquid at 10⁶ atoms (5.4×10⁷ pairs) on the
+MI300A.
+
+**Caching allocators behave differently.** The library allocates its outputs
+afresh on every call, so it relies on a caching allocator. On CUDA the
+stream-ordered memory pool (`cudaMallocFromPoolAsync` with an unlimited
+release threshold) splits and reuses freed blocks as intended. ROCm 6.4's pool
+did not reliably hand freed blocks back: small requests took the large cached
+blocks, and whether a block was reused varied from run to run. Every miss maps
+fresh memory, at 40–150 ms for the gigabyte-sized outputs, and the pair list
+took 160 ms to build instead of 20 ms. On HIP the library therefore keeps its
+own cache of `hipMalloc` blocks, in free lists by size, with requests rounded
+up to one of eight sizes per power of two.
+
+**A scatter is not the best per-atom sum, and some are pathological.** A
+per-atom sum over pairs is usually written as a scatter: a weighted
+`bincount`, `cupyx.scatter_add` or `jax.ops.segment_sum`. On the MI300A
+CuPy's weighted `bincount` took about 145 ms per component (440 ms for the
+forces). The float64 atomics are not to blame: `cupyx.scatter_add` of the same
+forces takes 4.6 ms, and a raw `atomicAdd(double)` kernel is as fast. The time
+goes into the input validation that `bincount` runs first, `(x < 0).any()`
+and `max(x)`, two of CuPy's slow full reductions on ROCm (see the next
+paragraph). JAX's `segment_sum` took 1.8 s, even with
+`indices_are_sorted=True`. The list is a *full* list, so no scatter is
+needed: the pairs of an atom are one contiguous segment, `first_neighbours`
+gives the segment starts (on the GPU for device input), and the library's
+`segment_sum` sums each segment without atomics, in a fixed order (so results
+are reproducible bit for bit): 0.55 ms for the (5.4×10⁷, 3) forces, about
+2.4 TB/s and 8× faster than the atomic scatter. `mabincount` offers the same
+with matscipy's signature, for sorted indices. The best kernel shape is itself hardware dependent: a group of lanes
+per atom and value, reading about 8–12 consecutive values together, was 3×
+faster than one thread per atom on the MI300A; the group size is chosen from
+that rule and the mean segment length, tuned on the MI300A (wave64) and still
+to be checked on NVIDIA (warp32). The neighbour-matrix format avoids the
+scatter by construction, since each atom sums its own row; this is how the
+JAX kernel works.
+
+**Library defaults differ between backends.** CuPy accelerates reductions with
+CUB by default on CUDA, but not on ROCm (`CUPY_ACCELERATORS` defaults to
+`cub` and to empty, respectively). Without it a full reduction such as
+`x.sum()` over 5.4×10⁷ elements takes about 80 ms on the MI300A instead of
+0.2 ms. Such reductions made up nearly all of the array kernel's step: 700 ms
+with three `bincount` calls (two reductions each) plus the energy and the
+virial, still 190 ms with the energy and the virial alone, and 28 ms once
+`segment_sum(..., total=True)` returned the totals with the per-atom sums.
+Enabling CUB on ROCm is not a fix: in the CuPy 13.6 build used here,
+`sum(axis=1)` then returned wrong results for 2²⁴ rows and more, and
+`bincount` failed to compile (CuPy's JIT CUB kernels include its bundled CUDA
+headers). CuPy's `add.reduceat` is built from a cumulative sum over all
+elements, which costs a temporary of the input's size (13 GB at 10⁷ atoms) and
+some accuracy.
+
+**Status in CuPy's issue tracker** (as of October 2026). The ROCm default was
+introduced with CUB-by-default in
+[cupy#6549](https://github.com/cupy/cupy/pull/6549), without a stated reason
+for leaving HIP out; no issue reports the slow generic reductions on ROCm, and
+[cupy#9657](https://github.com/cupy/cupy/pull/9657) (open) would add
+hipTensor as a reduction accelerator on HIP. No issue reports the wrong CUB
+axis reductions on HIP; the closest are CUDA bugs in the CUB path for large
+arrays ([cupy#9186](https://github.com/cupy/cupy/issues/9186),
+[cupy#9780](https://github.com/cupy/cupy/issues/9780), fixed by
+[cupy#9867](https://github.com/cupy/cupy/pull/9867)), and
+[cupy#9940](https://github.com/cupy/cupy/pull/9940) (open) notes that hipCUB
+errors were silently discarded. Nothing is reported on the slow
+`bincount` on ROCm (a consequence of the slow reductions) or on
+`add.reduceat`'s temporary. ROCm 6.x wheels were
+planned in [cupy#8606](https://github.com/cupy/cupy/issues/8606), which was
+superseded by the ROCm 7 issue
+[cupy#9529](https://github.com/cupy/cupy/issues/9529).
+
+**Unified memory on an APU has its own limits.** The MI300A's CPUs and GPU
+share 128 GB of HBM, but plain device allocations (`hipMalloc`, and the pools
+built on it by the library, CuPy and JAX) reach only a coarse-grained window
+of about 63 GiB. Runs that fit easily on the 141 GB H200 run out of memory
+there. Managed memory (`hipMallocManaged`) reaches the whole HBM, but the HIP
+runtime then performs device-to-device `hipMemcpy` on the host CPU, so copies
+should be done with kernels instead. The CPU and the GPU also share the
+memory bandwidth, so load from other processes on the node can show up in the
+timings.
+
+**Getting the software stack right takes care.** The JAX ROCm plugins on PyPI
+are built for other ROCm versions (`libamd_comgr.so.2` versus ROCm 6.4's
+`.so.3`); AMD's wheels from `repo.radeon.com` for the installed ROCm release
+work. There are no CuPy wheels for ROCm 6.x, so CuPy is built from source
+(`CUPY_INSTALL_USE_HIP=1`, `HCC_AMDGPU_TARGET=gfx942`). CuPy compiles each
+kernel on first use and caches it on disk, which on ROCm took long enough to
+inflate a first run several-fold, so the cache should be warmed before timing.
 
 This page is generated by `examples/lj_langevin/benchmark.py`. Regenerate it on
 your own hardware with:
@@ -184,3 +308,17 @@ the C++ curves, build with `-DBUILD_EXAMPLES=ON` (and `-DENABLE_CUDA=ON` for
 the GPU binary); the others need `pip install jax warp-lang vesin muTimer
 matscipy==1.2.0 matplotlib nvalchemi-toolkit-ops` and a CUDA build of PyTorch
 (for ALCHEMI) in the interpreter that runs this driver.
+
+To add another GPU to the GPU comparison, run only the array and JAX kernels on
+it and store them in the existing results file (its main results stay as they
+are; the plots and this page are redrawn from the merged file):
+
+```bash
+python examples/lj_langevin/benchmark.py --build build \
+    --devices gpu --lists matscipy --kernels array jax \
+    --sizes 100 1000 10000 100000 1000000 3000000 10000000 30000000 \
+    --add-machine docs/benchmark_results.json --doc-out docs/benchmark.md
+```
+
+On an AMD GPU this needs a HIP build (`-DENABLE_HIP=ON`) and the ROCm builds of
+CuPy and JAX.

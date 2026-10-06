@@ -31,6 +31,14 @@ PyObject *py_coordination_dlpack(PyObject *self, PyObject *args);
    (idx, dist, count) plus an overflow flag, for static-shape consumers. */
 PyObject *py_neighbour_matrix_dlpack(PyObject *self, PyObject *args);
 
+/* Row-start array of a sorted device index array (first_neighbours), computed
+   on its GPU and returned as a DLPack capsule. */
+PyObject *py_first_neighbours_dlpack(PyObject *self, PyObject *args);
+
+/* Per-segment sums (and optionally the total) of a host or device array over
+   row starts from first_neighbours, as DLPack capsules. */
+PyObject *py_segment_sum_dlpack(PyObject *self, PyObject *args);
+
 /* Return GPU memory cached by the library's allocator to the driver. */
 PyObject *py_empty_gpu_cache(PyObject *self, PyObject *args);
 

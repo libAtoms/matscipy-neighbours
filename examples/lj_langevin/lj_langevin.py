@@ -88,15 +88,22 @@ def fcc_liquid_n(xp, target_n, density):
     return xp.asarray(r), L
 
 
-def mabincount(xp, idx, weights, n):
-    """Sum ``weights`` (shape (npairs, d)) over pairs grouped by ``idx``,
-    giving (n, d). ``bincount`` weights are 1-D, so accumulate per component —
-    the operation matscipy performs with its ``mabincount`` helper."""
-    idx = idx.astype(xp.int64)
-    out = xp.empty((n, weights.shape[1]), dtype=weights.dtype)
-    for k in range(weights.shape[1]):
-        out[:, k] = xp.bincount(idx, weights=weights[:, k], minlength=n)
-    return out
+def pair_sums(xp, i, forces, scalars, n):
+    """Per-atom sums of the pair ``forces`` (npairs, 3) and the totals over
+    all pairs of the pair ``scalars`` (npairs, k). The pairs are sorted by
+    ``i``, so the pairs of an atom are one contiguous segment:
+    ``first_neighbours`` gives the segment starts and ``segment_sum`` sums
+    each segment, on the device for device input, in a fixed order and
+    without atomics; the totals come with it instead of from separate full
+    reductions. A weighted ``bincount`` per component (matscipy's
+    ``mabincount``) is several times slower even where its scatter is fast,
+    and on ROCm CuPy's ``bincount`` and full reductions are very slow (no CUB
+    by default)."""
+    from matscipy_neighbours import first_neighbours, segment_sum
+
+    seed = first_neighbours(n, i.astype(xp.int64, copy=False))
+    _, total = segment_sum(scalars, seed, total=True)
+    return segment_sum(forces, seed), total
 
 
 def fixed_box(ncells, lattice, cutoff):
@@ -214,11 +221,19 @@ def lj_forces_energy(xp, build_ijD, positions):
     r2 = (D * D).sum(axis=1)
     inv_r2 = 1.0 / r2
     inv_r6 = inv_r2 * inv_r2 * inv_r2
-    energy = 0.5 * float((4.0 * inv_r6 * (inv_r6 - 1.0)).sum())
     coef = -24.0 * inv_r2 * inv_r6 * (2.0 * inv_r6 - 1.0)   # force prefactor
-    fpair = coef[:, None] * D                                # force on i
-    forces = mabincount(xp, i, fpair, n)
-    virial = -0.5 * float((coef * r2).sum())                 # directed pairs: 1/2
+    # Per pair: the pair energy and the virial term ...
+    scalars = xp.empty((D.shape[0], 2), dtype=D.dtype)
+    scalars[:, 0] = 4.0 * inv_r6 * (inv_r6 - 1.0)
+    scalars[:, 1] = coef * r2
+    del r2, inv_r2, inv_r6
+    # ... and the force on i, in place of D (keeps the largest systems within
+    # GPU memory).
+    D *= coef[:, None]
+    del coef
+    forces, total = pair_sums(xp, i, D, scalars, n)
+    energy = 0.5 * float(total[0])                          # directed pairs: 1/2
+    virial = -0.5 * float(total[1])
     return forces, energy, virial, int(i.shape[0])
 
 

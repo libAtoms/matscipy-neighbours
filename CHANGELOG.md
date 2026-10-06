@@ -4,7 +4,7 @@ All notable changes to matscipy-neighbours are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.1.0] - Unreleased
+## [1.1.0] - 2026-10-06
 
 ### Core
 
@@ -30,6 +30,31 @@ project adheres to [Semantic Versioning](https://semver.org/).
   points return as the new `NL_OUT_OF_MEMORY` code and Python raises as
   `MemoryError`. On the GPU the cache is emptied and the allocation retried
   once first.
+- On HIP the GPU buffers come from a per-device cache of `hipMalloc` blocks
+  (free lists by size, requests rounded up to one of eight sizes per power of
+  two) instead of the stream-ordered pool: ROCm 6.4's pools did not reliably
+  reuse freed blocks, so every call mapped its outputs afresh. A GPU pair list
+  of 10⁶ atoms on an MI300A builds in about 20 ms instead of 160 ms. CUDA is
+  unchanged.
+- `tests/test_neighbour_list_gpu.cc` builds and runs with the HIP backend, and
+  the device tests of `tests/test_memory_space.cc` run on HIP too, plus a test
+  that the HIP block cache reuses freed blocks.
+- `segment_sum(values, seed, total=False)` sums per-pair values per atom over
+  the segments of an `i`-sorted pair list (row starts from `first_neighbours`),
+  without atomics and in a fixed order, on the host (OpenMP) or the GPU
+  (CuPy, JAX, PyTorch via DLPack); float32, float64, int32 and int64, any
+  trailing shape, optionally with the total over all atoms. On the GPU a group
+  of lanes per atom and value sums with warp shuffles, the group size chosen
+  from the values per row and the mean segment length (tuned on an MI300A:
+  0.55 ms for 5.4×10⁷ force vectors, against 4.6 ms for `cupyx.scatter_add`
+  and 440 ms for a weighted CuPy `bincount`). `mabincount(x, weights, minlength, axis=0)` has matscipy's
+  signature and requires sorted `x`. The C++ core gains `segment_sum` and
+  `segment_sum_gpu_device`, and `benchmarks/bench_segment_sum` times the
+  kernel variants on a GPU.
+- `first_neighbours` accepts a device index array (CuPy, JAX, PyTorch via
+  DLPack) and computes the row-start array on its GPU, returning it there in
+  the input's framework (`array_namespace` overrides); host input is
+  unchanged. The C++ core gains `first_neighbours_gpu_device`.
 
 ### Examples and benchmark
 
@@ -39,6 +64,24 @@ project adheres to [Semantic Versioning](https://semver.org/).
   vacuum. The fused Warp and C++ kernels consume the cell-shift array `S` of
   the list for the periodic case; the array and JAX kernels are unchanged
   because the shifts are folded into the distance vectors.
+- The array example sums the pair forces, energies and virials per atom with
+  `segment_sum(..., total=True)` instead of a weighted `bincount` per force
+  component and two full reductions. On an MI300A at 10⁶ atoms the step went
+  from 700 ms to 28 ms, and it reaches 10⁷ atoms (250 ms). Nearly all of the
+  old step were CuPy's full reductions, about 80 ms each because CuPy does not
+  enable CUB on ROCm: two inside each `bincount` (its input validation), plus
+  the energy and the virial. Results files record the method
+  (`array_force_sum`); the GPU comparison labels the array curves with it.
+- The benchmark page gains a section on performance portability between
+  NVIDIA and AMD GPUs: caching allocators, scatters versus segment sums,
+  CuPy's backend defaults, the MI300A's unified memory, and installing the ROCm stack.
+- `benchmark.py` compares GPUs: `--add-machine RESULTS.json` stores a run as
+  an additional machine in an existing results file (keyed by `--machine`,
+  default the detected GPU) without touching its main results, and
+  `--kernels`, `--lists` and `--devices` restrict a run to a subset. A new
+  figure (`docs/benchmark_gpus.png`) shows the array and JAX kernels on the
+  matscipy-neighbours GPU list for every machine in the file. AMD GPUs are
+  detected through `rocm-smi`.
 - `benchmark.py` sweeps both systems and writes one figure per system
   (`docs/benchmark_liquid.png`, `docs/benchmark_droplet.png`; panels ordered
   array / JAX / Warp / C++) plus a kernel-comparison figure

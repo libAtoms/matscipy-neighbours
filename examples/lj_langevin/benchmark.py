@@ -115,16 +115,27 @@ def detect_cpu():
     return f"{model} ({usable_cores()} usable cores)"
 
 
-def detect_gpu():
+def _gpu_names(cmd, parse):
     try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=30)
-        names = [n.strip() for n in out.stdout.splitlines() if n.strip()]
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
-        names = []
+        return []
+    if out.returncode != 0:   # e.g. nvidia-smi installed but no NVIDIA driver
+        return []
+    return [n for n in (parse(line) for line in out.stdout.splitlines()) if n]
+
+
+def detect_gpu():
+    """GPU model(s): NVIDIA through nvidia-smi, else AMD through rocm-smi."""
+    names = _gpu_names(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                       lambda line: line.strip())
+    if not names:   # rocm-smi: "GPU[0]  : Card Series:  AMD Instinct MI300A"
+        names = _gpu_names(
+            ["rocm-smi", "--showproductname"],
+            lambda line: (line.split("Card Series:", 1)[1].strip()
+                          if "Card Series:" in line else None))
     if not names:
-        return "no NVIDIA GPU detected"
+        return "no GPU detected"
     uniq = sorted(set(names))
     if len(names) > 1 and len(uniq) == 1:
         return f"{len(names)}x {uniq[0]}"
@@ -145,16 +156,17 @@ def formats(kernel, nl, device):
     return ["list"]
 
 
-def make_configs():
-    """The full matrix. A backend only feeds the kernels in `NL_KERNELS`; the
-    other (kernel, list) cells are kept but marked unsupported -> empty in the
+def make_configs(kernels=KERNEL_ORDER, lists=NL_ORDER, devices=("gpu", "cpu")):
+    """The full matrix, optionally restricted to a subset of kernels, lists and
+    devices. A backend only feeds the kernels in `NL_KERNELS`; the other
+    (kernel, list) cells are kept but marked unsupported -> empty in the
     table. Only the matscipy (this library) CPU list is split into single/multi-
     thread."""
     cfgs = []
-    for kernel in KERNEL_ORDER:
-        for nl in NL_ORDER:
+    for kernel in [k for k in KERNEL_ORDER if k in kernels]:
+        for nl in [n for n in NL_ORDER if n in lists]:
             supported = kernel in NL_KERNELS[nl]
-            for device in nl_devices(nl):
+            for device in [d for d in nl_devices(nl) if d in devices]:
                 if device == "cpu" and nl == "matscipy":
                     threads_list = ["mt", "1t"]
                 else:
@@ -335,6 +347,58 @@ def make_kernel_plot(results, sizes, path):
     print(f"wrote {path}", file=sys.stderr)
 
 
+GPU_COMPARE_KERNELS = ["array", "jax"]
+GPU_COMPARE_STYLE = {"array": dict(ls="-", m="o"), "jax": dict(ls="--", m="s")}
+MACHINE_COLOURS = ["tab:blue", "tab:red", "tab:purple", "tab:brown", "tab:olive"]
+# How the array kernel sums the pair forces per atom (meta["array_force_sum"]);
+# results files from before the key existed used the weighted bincount.
+ARRAY_FORCE_SUM = "segment_sum"
+ARRAY_FORCE_SUM_OLD = "bincount"
+
+
+def make_gpu_plot(machines, path):
+    """One panel per system: the array and JAX kernels on the matscipy-neighbours
+    GPU list, one colour per GPU. ``machines`` is a list of (name, meta,
+    systems) with meta and systems as in a results file; the array curves are
+    labelled with how the run summed the pair forces."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    systems = [sy for sy in SYSTEM_ORDER
+               if any(sy in m_systems for _, _, m_systems in machines)]
+    fig, axes = plt.subplots(1, len(systems), figsize=(5.5 * len(systems), 4.8),
+                             sharex=True, sharey=True, squeeze=False)
+    for ax, system in zip(axes.flat, systems):
+        for (name, m_meta, m_systems), colour in zip(machines, MACHINE_COLOURS):
+            for cfg in m_systems.get(system, []):
+                pts = cfg.get("points")
+                if (not pts or cfg["nl"] != "matscipy" or cfg["device"] != "gpu"
+                        or cfg.get("fmt", "list") != "list"
+                        or cfg["kernel"] not in GPU_COMPARE_KERNELS):
+                    continue
+                st = GPU_COMPARE_STYLE[cfg["kernel"]]
+                lbl = f"{name} · {KERNEL_NAME[cfg['kernel']]}"
+                if cfg["kernel"] == "array":
+                    lbl += " · " + m_meta.get("array_force_sum",
+                                              ARRAY_FORCE_SUM_OLD)
+                ax.plot([a for a, _ in pts], [t for _, t in pts], color=colour,
+                        ls=st["ls"], marker=st["m"], ms=5, label=lbl)
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_title(SYSTEM_NAME[system])
+        ax.grid(True, which="both", ls=":", alpha=0.4)
+        ax.set_xlabel("number of atoms")
+        ax.set_ylabel("time per step (ms)")
+        if ax.has_data():
+            ax.legend(fontsize=8)
+    fig.suptitle("GPU comparison: array (CuPy) and JAX kernels on the "
+                 "matscipy-neighbours list", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    print(f"wrote {path}", file=sys.stderr)
+
+
 def table_markdown(cfgs, sizes):
     cols = sizes
     head = "| Configuration | " + " | ".join(f"{c} atoms" for c in cols) + " |"
@@ -347,10 +411,23 @@ def table_markdown(cfgs, sizes):
     return "\n".join(lines)
 
 
-def write_doc_page(path, plot_names, meta, kernel_plot_name):
+def write_doc_page(path, plot_names, meta, kernel_plot_name, gpu_plot_name,
+                   machines):
     """Write the documentation page. ``plot_names`` maps system -> image file
     name (relative to the page); ``kernel_plot_name`` is the kernel-comparison
-    figure."""
+    figure and ``gpu_plot_name`` the GPU comparison across ``machines`` (name ->
+    {meta, systems}) and the main test machine."""
+    if meta.get("array_force_sum", ARRAY_FORCE_SUM_OLD) == ARRAY_FORCE_SUM_OLD:
+        array_sum_text = ("scatters the forces with a weighted `bincount` per "
+                          "component (an atomic scatter)")
+    else:
+        array_sum_text = ("sums the forces, energies and virials of each atom's "
+                          "contiguous segment of pairs with `segment_sum` "
+                          "(segments from `first_neighbours`; no atomics), "
+                          "which also returns the totals")
+    gpu_list = "\n".join(
+        f"- **{name}** (host CPU: {m['meta']['cpu']})"
+        for name, m in [(meta["gpu"], dict(meta=meta))] + list(machines.items()))
     sizes = meta["sizes"]
     cpu_cap = meta.get("max_atoms_cpu")
     cpu_range = (f"\nCPU runs stop at {cpu_cap:,} atoms; the GPU runs cover the "
@@ -517,7 +594,7 @@ there is the list. This section therefore does
 Lennard-Jones potential on top of it:
 
 - the **array** path materialises the per-pair distance vectors returned by the
-  list and scatters the forces with a `bincount` per component;
+  list and {array_sum_text};
 - **JAX** `jit`-compiles a dense masked sum over the fixed-capacity
   `neighbour_matrix` (no scatter, but padded rows);
 - **Warp** and **C++/CUDA** run one fused pass over the `ij` pairs (plus the
@@ -531,6 +608,128 @@ The C++ force loop is OpenMP-parallel and honours the single-thread setting;
 the NumPy, Warp-CPU and JAX-CPU kernels use their own threading and are not
 pinned to one core, so on the CPU the comparison is indicative rather than
 strict.
+
+## GPU comparison: array and JAX kernels across GPUs
+
+The array (CuPy) and JAX kernels run unchanged on NVIDIA (CUDA) and AMD (ROCm)
+GPUs, so they can compare GPUs directly. The figure below shows both kernels on
+the matscipy-neighbours GPU list (pair list for the array kernels,
+`neighbour_matrix` for JAX) on each GPU measured so far:
+
+{gpu_list}
+
+![GPU comparison]({gpu_plot_name})
+
+How to read it:
+
+- The legend says how each run's array kernel sums the pair forces per atom:
+  a weighted `bincount` per component plus full reductions for the energy and
+  virial (the H200 curves, measured before `segment_sum` existed), or
+  `segment_sum`, which sums forces, energies and virials per atom without
+  atomics and returns the totals with them (the MI300A curves). On the MI300A
+  the old scheme took 700 ms per step at 10⁶ atoms, the new one 28 ms.
+- On the **AMD Instinct MI300A** (ROCm 6.4, JAX 0.4.35 from AMD's ROCm wheels,
+  CuPy 13.6 built from source) both kernels are on par with the H200 up to
+  10⁴ atoms, where launch latency dominates. At 10⁶ atoms the array kernel
+  takes 28 ms per step (H200: 22 ms with the old scheme) and JAX 26 ms (H200:
+  11 ms); at 10⁷ atoms the array kernel takes 250 ms (H200: 190 ms).
+- On the MI300A, JAX runs out of memory at 10⁷ atoms and the array kernel at
+  3×10⁷: plain device allocations reach only the ~63 GiB coarse-grained window
+  of the 128 GB of HBM the APU shares with its CPUs, and the neighbour matrix
+  alone needs 31 GB at 10⁷ atoms. The H200 (141 GB) runs JAX at 10⁷ atoms.
+
+## Performance portability: NVIDIA and AMD
+
+The same source runs on NVIDIA (CUDA) and AMD (ROCm) GPUs, but code that is
+fast on one is not automatically fast on the other. Bringing the MI300A runs
+in line with the H200 ones surfaced the following, roughly in order of impact;
+the numbers are for the periodic liquid at 10⁶ atoms (5.4×10⁷ pairs) on the
+MI300A.
+
+**Caching allocators behave differently.** The library allocates its outputs
+afresh on every call, so it relies on a caching allocator. On CUDA the
+stream-ordered memory pool (`cudaMallocFromPoolAsync` with an unlimited
+release threshold) splits and reuses freed blocks as intended. ROCm 6.4's pool
+did not reliably hand freed blocks back: small requests took the large cached
+blocks, and whether a block was reused varied from run to run. Every miss maps
+fresh memory, at 40–150 ms for the gigabyte-sized outputs, and the pair list
+took 160 ms to build instead of 20 ms. On HIP the library therefore keeps its
+own cache of `hipMalloc` blocks, in free lists by size, with requests rounded
+up to one of eight sizes per power of two.
+
+**A scatter is not the best per-atom sum, and some are pathological.** A
+per-atom sum over pairs is usually written as a scatter: a weighted
+`bincount`, `cupyx.scatter_add` or `jax.ops.segment_sum`. On the MI300A
+CuPy's weighted `bincount` took about 145 ms per component (440 ms for the
+forces). The float64 atomics are not to blame: `cupyx.scatter_add` of the same
+forces takes 4.6 ms, and a raw `atomicAdd(double)` kernel is as fast. The time
+goes into the input validation that `bincount` runs first, `(x < 0).any()`
+and `max(x)`, two of CuPy's slow full reductions on ROCm (see the next
+paragraph). JAX's `segment_sum` took 1.8 s, even with
+`indices_are_sorted=True`. The list is a *full* list, so no scatter is
+needed: the pairs of an atom are one contiguous segment, `first_neighbours`
+gives the segment starts (on the GPU for device input), and the library's
+`segment_sum` sums each segment without atomics, in a fixed order (so results
+are reproducible bit for bit): 0.55 ms for the (5.4×10⁷, 3) forces, about
+2.4 TB/s and 8× faster than the atomic scatter. `mabincount` offers the same
+with matscipy's signature, for sorted indices. The best kernel shape is itself hardware dependent: a group of lanes
+per atom and value, reading about 8–12 consecutive values together, was 3×
+faster than one thread per atom on the MI300A; the group size is chosen from
+that rule and the mean segment length, tuned on the MI300A (wave64) and still
+to be checked on NVIDIA (warp32). The neighbour-matrix format avoids the
+scatter by construction, since each atom sums its own row; this is how the
+JAX kernel works.
+
+**Library defaults differ between backends.** CuPy accelerates reductions with
+CUB by default on CUDA, but not on ROCm (`CUPY_ACCELERATORS` defaults to
+`cub` and to empty, respectively). Without it a full reduction such as
+`x.sum()` over 5.4×10⁷ elements takes about 80 ms on the MI300A instead of
+0.2 ms. Such reductions made up nearly all of the array kernel's step: 700 ms
+with three `bincount` calls (two reductions each) plus the energy and the
+virial, still 190 ms with the energy and the virial alone, and 28 ms once
+`segment_sum(..., total=True)` returned the totals with the per-atom sums.
+Enabling CUB on ROCm is not a fix: in the CuPy 13.6 build used here,
+`sum(axis=1)` then returned wrong results for 2²⁴ rows and more, and
+`bincount` failed to compile (CuPy's JIT CUB kernels include its bundled CUDA
+headers). CuPy's `add.reduceat` is built from a cumulative sum over all
+elements, which costs a temporary of the input's size (13 GB at 10⁷ atoms) and
+some accuracy.
+
+**Status in CuPy's issue tracker** (as of October 2026). The ROCm default was
+introduced with CUB-by-default in
+[cupy#6549](https://github.com/cupy/cupy/pull/6549), without a stated reason
+for leaving HIP out; no issue reports the slow generic reductions on ROCm, and
+[cupy#9657](https://github.com/cupy/cupy/pull/9657) (open) would add
+hipTensor as a reduction accelerator on HIP. No issue reports the wrong CUB
+axis reductions on HIP; the closest are CUDA bugs in the CUB path for large
+arrays ([cupy#9186](https://github.com/cupy/cupy/issues/9186),
+[cupy#9780](https://github.com/cupy/cupy/issues/9780), fixed by
+[cupy#9867](https://github.com/cupy/cupy/pull/9867)), and
+[cupy#9940](https://github.com/cupy/cupy/pull/9940) (open) notes that hipCUB
+errors were silently discarded. Nothing is reported on the slow
+`bincount` on ROCm (a consequence of the slow reductions) or on
+`add.reduceat`'s temporary. ROCm 6.x wheels were
+planned in [cupy#8606](https://github.com/cupy/cupy/issues/8606), which was
+superseded by the ROCm 7 issue
+[cupy#9529](https://github.com/cupy/cupy/issues/9529).
+
+**Unified memory on an APU has its own limits.** The MI300A's CPUs and GPU
+share 128 GB of HBM, but plain device allocations (`hipMalloc`, and the pools
+built on it by the library, CuPy and JAX) reach only a coarse-grained window
+of about 63 GiB. Runs that fit easily on the 141 GB H200 run out of memory
+there. Managed memory (`hipMallocManaged`) reaches the whole HBM, but the HIP
+runtime then performs device-to-device `hipMemcpy` on the host CPU, so copies
+should be done with kernels instead. The CPU and the GPU also share the
+memory bandwidth, so load from other processes on the node can show up in the
+timings.
+
+**Getting the software stack right takes care.** The JAX ROCm plugins on PyPI
+are built for other ROCm versions (`libamd_comgr.so.2` versus ROCm 6.4's
+`.so.3`); AMD's wheels from `repo.radeon.com` for the installed ROCm release
+work. There are no CuPy wheels for ROCm 6.x, so CuPy is built from source
+(`CUPY_INSTALL_USE_HIP=1`, `HCC_AMDGPU_TARGET=gfx942`). CuPy compiles each
+kernel on first use and caches it on disk, which on ROCm took long enough to
+inflate a first run several-fold, so the cache should be warmed before timing.
 
 This page is generated by `examples/lj_langevin/benchmark.py`. Regenerate it on
 your own hardware with:
@@ -547,6 +746,20 @@ the C++ curves, build with `-DBUILD_EXAMPLES=ON` (and `-DENABLE_CUDA=ON` for
 the GPU binary); the others need `pip install jax warp-lang vesin muTimer
 matscipy==1.2.0 matplotlib nvalchemi-toolkit-ops` and a CUDA build of PyTorch
 (for ALCHEMI) in the interpreter that runs this driver.
+
+To add another GPU to the GPU comparison, run only the array and JAX kernels on
+it and store them in the existing results file (its main results stay as they
+are; the plots and this page are redrawn from the merged file):
+
+```bash
+python examples/lj_langevin/benchmark.py --build build \\
+    --devices gpu --lists matscipy --kernels array jax \\
+    --sizes 100 1000 10000 100000 1000000 3000000 10000000 30000000 \\
+    --add-machine docs/benchmark_results.json --doc-out docs/benchmark.md
+```
+
+On an AMD GPU this needs a HIP build (`-DENABLE_HIP=ON`) and the ROCm builds of
+CuPy and JAX.
 """
     with open(path, "w") as fh:
         fh.write(body)
@@ -598,6 +811,26 @@ def main():
                          "--results-out file records as finished are taken "
                          "from it instead of being re-run (use the same "
                          "--sizes and settings)")
+    ap.add_argument("--kernels", choices=KERNEL_ORDER, nargs="+",
+                    default=list(KERNEL_ORDER),
+                    help="run only these kernels (default: all)")
+    ap.add_argument("--lists", choices=NL_ORDER, nargs="+",
+                    default=list(NL_ORDER),
+                    help="run only these neighbour-list backends (default: all)")
+    ap.add_argument("--devices", choices=["gpu", "cpu"], nargs="+",
+                    default=["gpu", "cpu"],
+                    help="run only on these devices (default: both)")
+    ap.add_argument("--add-machine", default=None, metavar="JSON",
+                    help="store this run as an additional machine in an "
+                         "existing --results-out file (under 'machines', keyed "
+                         "by --machine) instead of writing a results file of "
+                         "its own; the file's main results are kept, and the "
+                         "plots and page are redrawn from the merged file. "
+                         "Typically combined with --devices gpu --lists "
+                         "matscipy --kernels array jax for the GPU comparison")
+    ap.add_argument("--machine", default=None,
+                    help="name of this machine for --add-machine (default: the "
+                         "detected GPU model)")
     args = ap.parse_args()
 
     if args.replot:
@@ -608,7 +841,7 @@ def main():
         else:   # results file from before the liquid system was added
             results = {"droplet": saved["configs"]}
         saved["meta"].setdefault("systems", list(results))
-        finish(results, saved["meta"], args)
+        finish(results, saved["meta"], args, saved.get("machines", {}))
         return
 
     build = os.path.abspath(args.build)
@@ -622,24 +855,39 @@ def main():
                 sizes=args.sizes, steps=args.steps,
                 timeout=args.timeout, max_run_seconds=args.max_run_seconds,
                 max_atoms_cpu=args.max_atoms_cpu,
-                thrash_growth=args.thrash_growth)
+                thrash_growth=args.thrash_growth,
+                kernels=args.kernels, lists=args.lists, devices=args.devices,
+                array_force_sum=ARRAY_FORCE_SUM)
+    machine = args.machine or meta["gpu"]
+    merged = None
+    if args.add_machine:
+        with open(args.add_machine) as fh:
+            merged = json.load(fh)
     finished = {}
     if args.resume:
         with open(args.resume) as fh:
-            for system, cfgs in json.load(fh)["systems"].items():
-                finished[system] = {label(c): c for c in cfgs if c.get("done")}
+            saved = json.load(fh)
+        if args.add_machine and machine in saved.get("machines", {}):
+            saved = saved["machines"][machine]
+        for system, cfgs in saved["systems"].items():
+            finished[system] = {label(c): c for c in cfgs if c.get("done")}
 
     def save(results):
         """Write the results so far; runs are long, and an interrupted one can
         be continued with --resume."""
-        if args.results_out:
+        if merged is not None:
+            merged.setdefault("machines", {})[machine] = dict(meta=meta,
+                                                             systems=results)
+            with open(args.add_machine, "w") as fh:
+                json.dump(merged, fh, indent=1)
+        elif args.results_out:
             with open(args.results_out, "w") as fh:
                 json.dump(dict(meta=meta, systems=results), fh, indent=1)
 
     results = {}
     for system in args.systems:
         print(f"=== {SYSTEM_NAME[system]}", file=sys.stderr)
-        cfgs = make_configs()
+        cfgs = make_configs(args.kernels, args.lists, args.devices)
         results[system] = cfgs
         for cfg in cfgs:
             if not cfg["supported"]:
@@ -682,14 +930,24 @@ def main():
             save(results)
 
     save(results)
+    if merged is not None:
+        print(f"wrote {args.add_machine} (machine '{machine}')", file=sys.stderr)
+        for system in args.systems:
+            print(f"\n### {machine}: {SYSTEM_NAME[system]}\n\n"
+                  + table_markdown(results[system], meta["sizes"])
+                  + "\n\n(values are ms/step)")
+        finish(merged["systems"], merged["meta"], args, merged["machines"])
+        return
     if args.results_out:
         print(f"wrote {args.results_out}", file=sys.stderr)
     finish(results, meta, args)
 
 
-def finish(results, meta, args):
+def finish(results, meta, args, machines=None):
     """Plot and print the console table per system, and optionally write the
-    doc page."""
+    doc page. ``machines`` maps the name of each additional machine to its
+    {meta, systems}; they only enter the GPU-comparison plot."""
+    machines = machines or {}
     plot_dir = os.path.abspath(args.plot_dir)
     os.makedirs(plot_dir, exist_ok=True)
     plot_names = {}
@@ -703,9 +961,14 @@ def finish(results, meta, args):
     kernel_plot_name = "benchmark_kernels.png"
     make_kernel_plot(results, meta["sizes"],
                      os.path.join(plot_dir, kernel_plot_name))
+    gpu_plot_name = "benchmark_gpus.png"
+    make_gpu_plot([(meta["gpu"], meta, results)]
+                  + [(name, m["meta"], m["systems"])
+                     for name, m in machines.items()],
+                  os.path.join(plot_dir, gpu_plot_name))
     if args.doc_out:
         write_doc_page(os.path.abspath(args.doc_out), plot_names, meta,
-                       kernel_plot_name)
+                       kernel_plot_name, gpu_plot_name, machines)
         print(f"\nwrote {args.doc_out}", file=sys.stderr)
 
 

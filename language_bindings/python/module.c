@@ -56,6 +56,13 @@ static PyMethodDef module_methods[] = {
       METH_VARARGS,
       "Dense fixed-capacity (n x K) neighbour list as DLPack capsules "
       "(idx, dist, shift, count) plus an overflow flag." },
+    { "first_neighbours_dlpack", (PyCFunction) py_first_neighbours_dlpack,
+      METH_VARARGS,
+      "Row-start array of a sorted device index array, computed on its GPU and "
+      "returned as a DLPack capsule." },
+    { "segment_sum_dlpack", (PyCFunction) py_segment_sum_dlpack, METH_VARARGS,
+      "Per-segment sums (and optionally the total) over row starts, host or "
+      "device, as DLPack capsules." },
     { "empty_gpu_cache", (PyCFunction) py_empty_gpu_cache, METH_NOARGS,
       "Return GPU memory cached by the library's allocator to the driver." },
     { "first_neighbours", (PyCFunction) py_first_neighbours, METH_VARARGS,

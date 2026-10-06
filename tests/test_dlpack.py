@@ -314,3 +314,66 @@ def test_gpu_out_of_memory_raises_memoryerror():
                                            cell=cell, pbc=pbc, cutoff=1.2,
                                            max_neighbours=64)
     assert isinstance(idx, cupy.ndarray) and int(count.max()) <= 64
+
+
+# The host reference cases of test_first_neighbours_reference_values, plus
+# leading, inner and trailing atoms without pairs and the empty list.
+_FIRST_NEIGHBOURS_CASES = [
+    (5, [1, 1, 1, 1, 3, 3, 3]),
+    (6, [0, 1, 2, 3, 4, 5]),
+    (8, [0, 1, 2, 3, 4, 5, 6]),
+    (8, [0, 1, 2, 3, 3, 5, 6]),
+    (10, [3, 3, 7, 7, 7]),
+    (4, []),
+]
+
+
+@requires_gpu
+@pytest.mark.parametrize("n, i", _FIRST_NEIGHBOURS_CASES)
+def test_first_neighbours_cupy_matches_host(n, i):
+    host = nl.first_neighbours(n, np.array(i, dtype=np.int64))
+    dev = nl.first_neighbours(n, cupy.asarray(i, dtype=cupy.int64))
+    assert isinstance(dev, cupy.ndarray)
+    assert np.array_equal(cupy.asnumpy(dev), host)
+
+
+@requires_gpu
+def test_first_neighbours_cupy_on_neighbour_list():
+    """Device seeds of a GPU pair list equal the host seeds of the same list,
+    and give each atom's pairs."""
+    pos, cell, pbc = _random_config(N=3000, seed=25)
+    i = nl.neighbour_list("i", positions=cupy.asarray(pos), cell=cell, pbc=pbc,
+                          cutoff=1.5)
+    seed = nl.first_neighbours(len(pos), i)
+    assert np.array_equal(cupy.asnumpy(seed),
+                          nl.first_neighbours(len(pos), cupy.asnumpy(i)))
+    counts = cupy.diff(cupy.maximum(seed, 0))
+    assert cupy.array_equal(counts, cupy.bincount(i, minlength=len(pos)))
+
+
+@requires_gpu
+@pytest.mark.parametrize("n, i", [(3, [0, 2, 1]), (3, [0, 3]), (3, [-1, 0]),
+                                  (-1, [0])])
+def test_first_neighbours_cupy_rejects_bad_input(n, i):
+    with pytest.raises(ValueError):
+        nl.first_neighbours(n, cupy.asarray(i, dtype=cupy.int64))
+
+
+@requires_gpu
+def test_first_neighbours_cupy_wrong_dtype_raises():
+    with pytest.raises(TypeError):
+        nl.first_neighbours(3, cupy.asarray([0, 1, 2], dtype=cupy.int32))
+
+
+@requires_gpu
+def test_first_neighbours_jax_device_in_jax_out():
+    jax = pytest.importorskip("jax")
+    jax.config.update("jax_enable_x64", True)
+    try:
+        gpu = jax.devices("gpu")[0]
+    except RuntimeError:
+        pytest.skip("no JAX GPU device")
+    i = jax.device_put(jax.numpy.asarray([1, 1, 3, 3, 3], dtype="int64"), gpu)
+    seed = nl.first_neighbours(5, i)
+    assert type(seed).__module__.split(".")[0] in ("jax", "jaxlib")
+    assert np.array_equal(np.asarray(seed), [-1, 0, 2, 2, 5, 5])
