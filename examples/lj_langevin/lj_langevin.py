@@ -94,10 +94,11 @@ def pair_sums(xp, i, forces, scalars, n):
     ``i``, so the pairs of an atom are one contiguous segment:
     ``first_neighbours`` gives the segment starts and ``segment_sum`` sums
     each segment, on the device for device input, in a fixed order and
-    without atomics. Unlike a weighted ``bincount`` per component (matscipy's
-    ``mabincount``) this needs no atomic scatter, which for float64 is very
-    slow on some GPUs (e.g. on ROCm), and the totals come with it instead of
-    from separate full reductions, which can be slow too (CuPy on ROCm)."""
+    without atomics; the totals come with it instead of from separate full
+    reductions. A weighted ``bincount`` per component (matscipy's
+    ``mabincount``) is several times slower even where its scatter is fast,
+    and on ROCm CuPy's ``bincount`` and full reductions are very slow (no CUB
+    by default)."""
     from matscipy_neighbours import first_neighbours, segment_sum
 
     seed = first_neighbours(n, i.astype(xp.int64, copy=False))

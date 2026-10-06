@@ -46,8 +46,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
   trailing shape, optionally with the total over all atoms. On the GPU a group
   of lanes per atom and value sums with warp shuffles, the group size chosen
   from the values per row and the mean segment length (tuned on an MI300A:
-  0.55 ms for 5.4×10⁷ force vectors, against 440 ms for a weighted CuPy
-  `bincount`). `mabincount(x, weights, minlength, axis=0)` has matscipy's
+  0.55 ms for 5.4×10⁷ force vectors, against 4.6 ms for `cupyx.scatter_add`
+  and 440 ms for a weighted CuPy `bincount`). `mabincount(x, weights, minlength, axis=0)` has matscipy's
   signature and requires sorted `x`. The C++ core gains `segment_sum` and
   `segment_sum_gpu_device`, and `benchmarks/bench_segment_sum` times the
   kernel variants on a GPU.
@@ -67,14 +67,14 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - The array example sums the pair forces, energies and virials per atom with
   `segment_sum(..., total=True)` instead of a weighted `bincount` per force
   component and two full reductions. On an MI300A at 10⁶ atoms the step went
-  from 700 ms to 28 ms (and reaches 10⁷ atoms, at 250 ms): the float64 atomic scatter of `bincount` took about
-  440 ms and CuPy's full reductions about 80 ms each, as CuPy does not enable
-  CUB on ROCm. Results files record
-  the method (`array_force_sum`); the GPU comparison labels the array curves
-  with it.
+  from 700 ms to 28 ms, and it reaches 10⁷ atoms (250 ms). Nearly all of the
+  old step were CuPy's full reductions, about 80 ms each because CuPy does not
+  enable CUB on ROCm: two inside each `bincount` (its input validation), plus
+  the energy and the virial. Results files record the method
+  (`array_force_sum`); the GPU comparison labels the array curves with it.
 - The benchmark page gains a section on performance portability between
-  NVIDIA and AMD GPUs: caching allocators, float64 atomics, CuPy's backend
-  defaults, the MI300A's unified memory, and installing the ROCm stack.
+  NVIDIA and AMD GPUs: caching allocators, scatters versus segment sums,
+  CuPy's backend defaults, the MI300A's unified memory, and installing the ROCm stack.
 - `benchmark.py` compares GPUs: `--add-machine RESULTS.json` stores a run as
   an additional machine in an existing results file (keyed by `--machine`,
   default the detected GPU) without touching its main results, and

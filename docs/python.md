@@ -179,14 +179,15 @@ mabincount(x, weights, minlength, axis=0)
 ```
 
 Summing per-pair quantities per atom (forces, per-atom energies or virials)
-is a bincount over the pairs' first index. Written as a scatter (a weighted
-`bincount`, `cupyx.scatter_add`, `jax.ops.segment_sum`) it becomes an atomic
-add per pair, which for float64 is slow on some GPUs: on an AMD MI300A the
-weighted `bincount` of 5.4×10⁷ force vectors took about 440 ms. The pair list
-is sorted by its first index, so the pairs of an atom form one contiguous
-segment, and `segment_sum` sums each segment without atomics: 0.55 ms for the
-same forces. The summation order is fixed, so results are reproducible bit
-for bit.
+is a bincount over the pairs' first index, usually written as a scatter: a
+weighted `bincount`, `cupyx.scatter_add` or `jax.ops.segment_sum`. The pair
+list is sorted by its first index, so the pairs of an atom form one
+contiguous segment, and `segment_sum` sums each segment without atomics. On
+an AMD MI300A this takes 0.55 ms for 5.4×10⁷ force vectors, against 4.6 ms for
+`cupyx.scatter_add` and about 440 ms for CuPy's weighted `bincount`, which is
+dominated by its input validation (two full reductions, slow with CuPy on
+ROCm). The summation order is fixed, so results are reproducible bit for
+bit, unlike with atomics.
 
 - `segment_sum(values, seed)` sums the rows of `values` (shape
   `(npairs, ...)`, float32, float64, int32 or int64, C-contiguous) over the

@@ -657,18 +657,22 @@ took 160 ms to build instead of 20 ms. On HIP the library therefore keeps its
 own cache of `hipMalloc` blocks, in free lists by size, with requests rounded
 up to one of eight sizes per power of two.
 
-**Floating-point atomics are not free.** A per-atom sum over pairs written as
-a scatter — a weighted `bincount`, or `jax.ops.segment_sum` — lowers to
-float64 atomic adds. Those are fast on NVIDIA but slow on the MI300A when many
-threads hit the same atom, as they do for pairs sorted by atom: the weighted
-`bincount` took about 440 ms (three components), JAX's `segment_sum` (even with
-`indices_are_sorted=True`) 1.8 s. The list is a *full* list, so no scatter is
+**A scatter is not the best per-atom sum, and some are pathological.** A
+per-atom sum over pairs is usually written as a scatter: a weighted
+`bincount`, `cupyx.scatter_add` or `jax.ops.segment_sum`. On the MI300A
+CuPy's weighted `bincount` took about 145 ms per component (440 ms for the
+forces). The float64 atomics are not to blame: `cupyx.scatter_add` of the same
+forces takes 4.6 ms, and a raw `atomicAdd(double)` kernel is as fast. The time
+goes into the input validation that `bincount` runs first, `(x < 0).any()`
+and `max(x)`, two of CuPy's slow full reductions on ROCm (see the next
+paragraph). JAX's `segment_sum` took 1.8 s, even with
+`indices_are_sorted=True`. The list is a *full* list, so no scatter is
 needed: the pairs of an atom are one contiguous segment, `first_neighbours`
 gives the segment starts (on the GPU for device input), and the library's
 `segment_sum` sums each segment without atomics, in a fixed order (so results
 are reproducible bit for bit): 0.55 ms for the (5.4×10⁷, 3) forces, about
-2.4 TB/s. `mabincount` offers the same with matscipy's signature, for sorted
-indices. The best kernel shape is itself hardware dependent: a group of lanes
+2.4 TB/s and 8× faster than the atomic scatter. `mabincount` offers the same
+with matscipy's signature, for sorted indices. The best kernel shape is itself hardware dependent: a group of lanes
 per atom and value, reading about 8–12 consecutive values together, was 3×
 faster than one thread per atom on the MI300A; the group size is chosen from
 that rule and the mean segment length, tuned on the MI300A (wave64) and still
@@ -680,11 +684,13 @@ JAX kernel works.
 CUB by default on CUDA, but not on ROCm (`CUPY_ACCELERATORS` defaults to
 `cub` and to empty, respectively). Without it a full reduction such as
 `x.sum()` over 5.4×10⁷ elements takes about 80 ms on the MI300A instead of
-0.2 ms; the energy and the virial made up most of the array kernel's step
-(190 ms of it) until `segment_sum(..., total=True)` returned them together
-with the per-atom sums (28 ms per step). Enabling CUB on ROCm is not a fix: in
-the CuPy 13.6 build used here, `sum(axis=1)` then returned wrong results for
-large arrays (with or without `ROCM_HOME` set for CuPy to find the hipCUB
+0.2 ms. Such reductions made up nearly all of the array kernel's step: 700 ms
+with three `bincount` calls (two reductions each) plus the energy and the
+virial, still 190 ms with the energy and the virial alone, and 28 ms once
+`segment_sum(..., total=True)` returned the totals with the per-atom sums.
+Enabling CUB on ROCm is not a fix: in the CuPy 13.6 build used here,
+`sum(axis=1)` then returned wrong results for 2²⁴ rows and more, and
+`bincount` failed to compile (CuPy's JIT CUB kernels include its bundled CUDA
 headers). CuPy's `add.reduceat` is built from a cumulative sum over all
 elements, which costs a temporary of the input's size (13 GB at 10⁷ atoms) and
 some accuracy.
@@ -700,8 +706,9 @@ arrays ([cupy#9186](https://github.com/cupy/cupy/issues/9186),
 [cupy#9780](https://github.com/cupy/cupy/issues/9780), fixed by
 [cupy#9867](https://github.com/cupy/cupy/pull/9867)), and
 [cupy#9940](https://github.com/cupy/cupy/pull/9940) (open) notes that hipCUB
-errors were silently discarded. Nothing is reported on the slow float64
-`bincount` on ROCm or on `add.reduceat`'s temporary. ROCm 6.x wheels were
+errors were silently discarded. Nothing is reported on the slow
+`bincount` on ROCm (a consequence of the slow reductions) or on
+`add.reduceat`'s temporary. ROCm 6.x wheels were
 planned in [cupy#8606](https://github.com/cupy/cupy/issues/8606), which was
 superseded by the ROCm 7 issue
 [cupy#9529](https://github.com/cupy/cupy/issues/9529).
