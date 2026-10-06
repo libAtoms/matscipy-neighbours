@@ -732,4 +732,84 @@ error_t neighbour_list_gpu(int quantities, const real_t cell_origin[3],
     });
 }
 
+/* --- first_neighbours on the device --------------------------------------- */
+
+namespace {
+
+/* Flags an index outside [0, n) or a decrease. Threads only ever write 1, so
+   their race is benign. */
+__global__ void k_check_sorted(const index_t *i_n, index_t nn, index_t n,
+                               int *bad) {
+    const index_t p = blockIdx.x * static_cast<index_t>(blockDim.x) + threadIdx.x;
+    if (p >= nn) return;
+    const index_t a = i_n[p];
+    if (a < 0 || a >= n || (p > 0 && a < i_n[p - 1])) *bad = 1;
+}
+
+/* The rows outside (i_n[0], i_n[nn-1]]: -1 before the first pair (matscipy's
+   convention), 0 for the first row, nn after the last pair. */
+__global__ void k_seed_ends(const index_t *i_n, index_t nn, index_t n,
+                            index_t *seed) {
+    const index_t k = blockIdx.x * static_cast<index_t>(blockDim.x) + threadIdx.x;
+    if (k > n) return;
+    const index_t first = i_n[0], last = i_n[nn - 1];
+    if (k < first) seed[k] = -1;
+    else if (k == first) seed[k] = 0;
+    else if (k > last) seed[k] = nn;
+}
+
+/* Every row in (i_n[p-1], i_n[p]] starts at pair p: the thread of a pair where
+   the index jumps writes the rows the jump covers (empty rows start where the
+   next row does). */
+__global__ void k_seed_jumps(const index_t *i_n, index_t nn, index_t *seed) {
+    const index_t p = blockIdx.x * static_cast<index_t>(blockDim.x) + threadIdx.x;
+    if (p < 1 || p >= nn) return;
+    for (index_t l = i_n[p - 1] + 1; l <= i_n[p]; l++) seed[l] = p;
+}
+
+}  // namespace
+
+error_t first_neighbours_gpu_device(index_t n, index_t nn, const index_t *i_n,
+                                    Array<index_t, DeviceSpace> &seed,
+                                    int device_id) {
+    clear_error();
+    if (n < 0) {
+        return set_invalid_argument(
+            "first_neighbours: number of atoms must be non-negative.");
+    }
+    if (nn < 0 || (nn > 0 && !i_n)) {
+        return set_invalid_argument(
+            "first_neighbours: invalid neighbour index array.");
+    }
+    return catch_out_of_memory("GPU out of memory in first_neighbours.", [&] {
+        DeviceGuard guard(device_id);
+        /* Validate before writing anything; the fill indexes seed by i_n. */
+        if (nn > 0) {
+            DBuf<int> d_bad(1);
+            GPU_CHECK(gpuMemset(d_bad.data(), 0, sizeof(int)));
+            GPU_LAUNCH(k_check_sorted, grid_for(nn), BLOCK, i_n, nn, n,
+                       d_bad.data());
+            int bad = 0;
+            GPU_CHECK(gpuMemcpy(&bad, d_bad.data(), sizeof(int),
+                                gpuMemcpyDeviceToHost));
+            if (bad) {
+                return set_invalid_argument(
+                    "first_neighbours: index array must be sorted, with every "
+                    "index in [0, n).");
+            }
+        }
+        seed.resize(static_cast<std::size_t>(n) + 1);
+        if (nn == 0) {  /* empty list: every row starts (and ends) at 0 */
+            GPU_CHECK(gpuMemset(seed.data(), 0, seed.size() * sizeof(index_t)));
+        } else {
+            GPU_LAUNCH(k_seed_ends, grid_for(n + 1), BLOCK, i_n, nn, n,
+                       seed.data());
+            GPU_LAUNCH(k_seed_jumps, grid_for(nn), BLOCK, i_n, nn, seed.data());
+        }
+        /* The result is handed to consumers on their own streams. */
+        GPU_CHECK(gpuDeviceSynchronize());
+        return NL_SUCCESS;
+    });
+}
+
 }  // namespace matscipy

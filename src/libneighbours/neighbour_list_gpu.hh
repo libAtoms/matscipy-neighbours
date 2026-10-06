@@ -134,6 +134,18 @@ error_t neighbour_matrix_gpu_device(const NeighbourListRequest &req,
                                     index_t max_neighbours,
                                     NeighbourMatrixDevice &out,
                                     int quantities = QUANTITY_DISTVEC);
+
+/*
+ * Device version of first_neighbours (first_neighbours.hh): the row-start
+ * array of a pair list whose sorted first-index array `i_n` [nn] is on the
+ * device. `seed` is resized to n + 1 and filled on the device, with the same
+ * values as the host function (-1 for the rows before the first pair).
+ * device_id selects the GPU (-1 = current). Returns NL_INVALID_ARGUMENT for
+ * n < 0, an index outside [0, n) or an unsorted i_n; seed is untouched then.
+ */
+error_t first_neighbours_gpu_device(index_t n, index_t nn, const index_t *i_n,
+                                    Array<index_t, DeviceSpace> &seed,
+                                    int device_id = -1);
 #endif
 
 }  // namespace matscipy

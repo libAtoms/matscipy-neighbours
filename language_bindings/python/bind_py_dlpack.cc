@@ -139,6 +139,30 @@ struct ImportedDLPack {
     }
 };
 
+/* Whether this build's runtime can address memory on DLPack device type
+   `dev_type`: CUDA or CUDA-managed for the CUDA build, ROCm for the HIP build.
+   Anything else would be an illegal access. Sets a TypeError naming `what` if
+   not. */
+bool check_device_access(int dev_type, const char *what) {
+#if defined(MATSCIPY_ENABLE_CUDA)
+    const bool ok_device = dev_type == kDLCUDA || dev_type == kDLCUDAManaged;
+    const char *backend = "CUDA";
+#elif defined(MATSCIPY_ENABLE_HIP)
+    const bool ok_device = dev_type == kDLROCM;
+    const char *backend = "HIP";
+#else
+    const bool ok_device = false;
+    const char *backend = "no GPU";
+#endif
+    if (!ok_device) {
+        PyErr_Format(PyExc_TypeError,
+                     "%s live on DLPack device type %d, which the %s backend of "
+                     "this build cannot access",
+                     what, dev_type, backend);
+    }
+    return ok_device;
+}
+
 /* Import an (n, 3) float64 device array via its __dlpack__. Returns 0 and fills
    `imp` (owning the tensor) on success; -1 with a Python error set otherwise. */
 int import_positions_dlpack(PyObject *arr, ImportedDLPack *imp) {
@@ -167,27 +191,10 @@ int import_positions_dlpack(PyObject *arr, ImportedDLPack *imp) {
            destructor frees the managed tensor. */
         return -1;
     }
-    /* The pointer is handed to this build's runtime: only memory that runtime
-       can address is acceptable (CUDA or CUDA-managed for the CUDA build, ROCm
-       for the HIP build). Anything else would be an illegal access. */
-    const int dev_type = static_cast<int>(t.device.device_type);
-#if defined(MATSCIPY_ENABLE_CUDA)
-    const bool ok_device = dev_type == kDLCUDA || dev_type == kDLCUDAManaged;
-    const char *backend = "CUDA";
-#elif defined(MATSCIPY_ENABLE_HIP)
-    const bool ok_device = dev_type == kDLROCM;
-    const char *backend = "HIP";
-#else
-    const bool ok_device = false;
-    const char *backend = "no GPU";
-#endif
-    if (!ok_device) {
-        PyErr_Format(PyExc_TypeError,
-                     "device positions live on DLPack device type %d, which the "
-                     "%s backend of this build cannot access",
-                     dev_type, backend);
+    /* The pointer is handed to this build's runtime. */
+    if (!check_device_access(static_cast<int>(t.device.device_type),
+                             "device positions"))
         return -1;
-    }
     imp->mt = mt;
     imp->data = reinterpret_cast<const real_t *>(
         static_cast<char *>(t.data) + t.byte_offset);
@@ -195,6 +202,45 @@ int import_positions_dlpack(PyObject *arr, ImportedDLPack *imp) {
     imp->device_id = t.device.device_id;
     imp->nat = t.shape[0];
     /* Consume: the producer's capsule destructor must not also free it. */
+    PyCapsule_SetName(cap.get(), "used_dltensor");
+    return 0;
+}
+
+/* Import a 1-D int64 device array (an index array such as a pair list's i)
+   via its __dlpack__. Returns 0 and fills `imp` (owning the tensor, nat = its
+   length) and `*data` on success; -1 with a Python error set otherwise. */
+int import_index_dlpack(PyObject *arr, ImportedDLPack *imp,
+                        const index_t **data) {
+    PyRef cap(PyObject_CallMethod(arr, "__dlpack__", NULL));
+    if (!cap) return -1;
+    if (!PyCapsule_IsValid(cap.get(), "dltensor")) {
+        PyErr_SetString(PyExc_TypeError,
+                        "device index array did not yield an unversioned "
+                        "DLPack capsule");
+        return -1;
+    }
+    auto *mt = static_cast<DLManagedTensor *>(
+        PyCapsule_GetPointer(cap.get(), "dltensor"));
+    if (!mt) return -1;
+    const DLTensor &t = mt->dl_tensor;
+    const bool ok = t.dtype.code == kDLInt && t.dtype.bits == kIntBits &&
+                    t.dtype.lanes == 1 && t.ndim == 1 &&
+                    (t.strides == nullptr || t.strides[0] == 1 || t.shape[0] <= 1);
+    if (!ok) {
+        PyErr_SetString(PyExc_TypeError,
+                        "device index array must be a contiguous 1-D int64 "
+                        "array");
+        return -1;
+    }
+    if (!check_device_access(static_cast<int>(t.device.device_type),
+                             "device index array"))
+        return -1;
+    imp->mt = mt;
+    *data = reinterpret_cast<const index_t *>(static_cast<char *>(t.data) +
+                                              t.byte_offset);
+    imp->device_type = static_cast<int>(t.device.device_type);
+    imp->device_id = t.device.device_id;
+    imp->nat = t.shape[0];
     PyCapsule_SetName(cap.get(), "used_dltensor");
     return 0;
 }
@@ -486,6 +532,34 @@ PyObject *neighbour_matrix_dlpack_impl(PyObject *, PyObject *args) {
                         overflow ? Py_True : Py_False);
 }
 
+/* Row-start array of a device pair list's sorted first-index array, computed
+   on the array's GPU and returned there as a DLPack capsule. */
+PyObject *first_neighbours_dlpack_impl(PyObject *, PyObject *args) {
+#if !(defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP))
+    (void)args;
+    return no_gpu_backend();
+#else
+    Py_ssize_t n_arg;
+    PyObject *py_i;
+    if (!PyArg_ParseTuple(args, "nO", &n_arg, &py_i)) return NULL;
+    ImportedDLPack imp;
+    const index_t *i_n = nullptr;
+    if (import_index_dlpack(py_i, &imp, &i_n) != 0) return NULL;
+    Array<index_t, DeviceSpace> seed;
+    error_t st = first_neighbours_gpu_device(static_cast<index_t>(n_arg),
+                                             static_cast<index_t>(imp.nat), i_n,
+                                             seed, imp.device_id);
+    imp.release();
+    if (st != NL_SUCCESS) {
+        raise_core_error(st);
+        return NULL;
+    }
+    const int64_t len = static_cast<int64_t>(seed.size());
+    return device_capsule(std::move(seed), 1, len, 1, kDLInt, kIntBits,
+                          imp.device_id);
+#endif
+}
+
 /* Return the GPU memory cached by the library's allocator to the driver
    (no-op without a GPU backend). */
 PyObject *empty_gpu_cache_impl(PyObject *, PyObject *) {
@@ -509,6 +583,10 @@ PyObject *py_coordination_dlpack(PyObject *self, PyObject *args) {
 
 PyObject *py_neighbour_matrix_dlpack(PyObject *self, PyObject *args) {
     return guarded(neighbour_matrix_dlpack_impl, self, args);
+}
+
+PyObject *py_first_neighbours_dlpack(PyObject *self, PyObject *args) {
+    return guarded(first_neighbours_dlpack_impl, self, args);
 }
 
 PyObject *py_empty_gpu_cache(PyObject *self, PyObject *args) {

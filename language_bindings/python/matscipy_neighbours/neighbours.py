@@ -31,8 +31,7 @@ __all__ = [
     "DLPackTensor",
 ]
 
-# These are pure C-extension functions; re-export them unchanged.
-first_neighbours = _ext.first_neighbours
+# A pure C-extension function; re-exported unchanged.
 get_jump_indicies = _ext.get_jump_indicies
 
 
@@ -214,6 +213,58 @@ def _consume(wrappers, array_namespace, use_gpu):
         else:
             array_namespace = np
     return [array_namespace.from_dlpack(w) for w in wrappers]
+
+
+def _namespace_of(x):
+    """The array module ``x`` belongs to (cupy, jax.numpy or torch), for
+    returning results in the caller's framework; cupy if unrecognised."""
+    root = type(x).__module__.split(".")[0]
+    if root in ("jax", "jaxlib"):
+        import jax.numpy as xp
+    elif root == "torch":
+        import torch as xp
+    else:
+        import cupy as xp
+    return xp
+
+
+def first_neighbours(n, i, *, array_namespace=None):
+    """Row-start ("seed") array of a pair list sorted by its first index.
+
+    Pairs ``seed[k]:seed[k+1]`` belong to atom ``k``; ``seed[n]`` is the number
+    of pairs. Atoms before the first pair get ``-1`` (as in matscipy), and an
+    atom without neighbours further on starts where the next one does, so
+    ``maximum(seed, 0)`` gives offsets with an empty segment for every atom
+    that has no neighbours.
+
+    Parameters
+    ----------
+    n : int
+        Number of atoms.
+    i : array_like
+        Sorted first-atom indices of the pairs, e.g. ``neighbour_list("i",
+        ...)``. A device array (cupy, jax, torch; int64) is processed on its
+        GPU and the result stays there.
+    array_namespace : module or "dlpack", optional
+        For device input: framework of the result (default: that of ``i``),
+        or ``"dlpack"`` for a :class:`DLPackTensor`.
+
+    Returns
+    -------
+    array
+        ``seed`` of length ``n + 1``: numpy for host input, a device array
+        for device input.
+    """
+    if not _is_on_device(i):
+        return _ext.first_neighbours(n, i)
+    if not getattr(_ext, "_has_gpu", 0):
+        raise RuntimeError("Device input requires a GPU build (-DENABLE_CUDA=ON "
+                           "or -DENABLE_HIP=ON).")
+    capsule = _ext.first_neighbours_dlpack(n, i)
+    tensor = DLPackTensor(capsule, _dlpack_device(i))
+    if array_namespace is None:
+        array_namespace = _namespace_of(i)
+    return _consume([tensor], array_namespace, True)[0]
 
 
 def _shrink_wrapped_cell(positions):

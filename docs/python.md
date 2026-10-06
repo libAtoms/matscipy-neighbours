@@ -157,7 +157,25 @@ allocation retried once first.
 
 ## Other functions
 
-- `first_neighbours(n, i)` — row-start (CSR) offsets for an `i`-sorted list.
+- `first_neighbours(n, i)` — row-start (CSR) offsets for an `i`-sorted list:
+  the pairs of atom `k` are `seed[k]:seed[k+1]`. Atoms before the first pair get
+  `-1` (as in matscipy), so `maximum(seed, 0)` gives offsets with an empty
+  segment for every atom without neighbours. A device `i` (CuPy, JAX, PyTorch;
+  int64) is processed on its GPU and the result stays there, by default in the
+  framework of `i`. With the offsets, per-atom sums over the pairs need no
+  atomic scatter, e.g. the array example's forces:
+
+    ```python
+    seed = xp.maximum(first_neighbours(n, i), 0)
+    m = int(i[-1]) + 1            # atoms after the last pair stay zero
+    f = xp.zeros((n, 3))
+    f[:m] = xp.add.reduceat(fpair, seed[:m], axis=0)
+    f = xp.where((seed[1:] > seed[:-1])[:, None], f, 0.0)  # empty segments
+    ```
+
+    CuPy builds `add.reduceat` from a cumulative sum over all pairs, so on the
+    GPU it needs a temporary the size of `fpair`; the array example instead
+    sums each segment with a small kernel, one thread per atom.
 - `triplet_list(first_neighbours, abs_dr_p=None, cutoff=None)` — triplets from a
   first-neighbour array.
 - `get_jump_indicies(sorted_array)` — jump indices of an ordered array.
