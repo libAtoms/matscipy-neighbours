@@ -20,6 +20,7 @@
 #include "error.hh"
 #include "first_neighbours.hh"
 #include "neighbour_list.hh"
+#include "segment_sum.hh"
 #include "triplet_list.hh"
 
 using namespace matscipy;
@@ -491,4 +492,58 @@ TEST(NeighbourMatrix, OverflowFlag) {
                                nullptr, nullptr, 0, nullptr, /*K=*/2, nm),
               NL_SUCCESS);
     EXPECT_TRUE(nm.overflow);  // 2 slots is far too few for this density
+}
+
+/* --- segment_sum ----------------------------------------------------------- */
+
+TEST(SegmentSum, MatchesSerialBincountWithEmptySegments) {
+    /* Atoms 0-1 before the first pair, 4 and 6 without pairs, 8-9 after. */
+    const std::vector<index_t> i_n = {2, 2, 2, 3, 5, 5, 7, 7, 7, 7};
+    const index_t n = 10, nn = static_cast<index_t>(i_n.size()), d = 3;
+    std::vector<index_t> seed(n + 1);
+    ASSERT_EQ(first_neighbours(n, nn, i_n.data(), seed.data()), NL_SUCCESS);
+    ASSERT_EQ(seed[0], -1);
+    std::vector<double> v(nn * d), out(n * d), total(d);
+    for (index_t k = 0; k < nn * d; k++) v[k] = 0.5 * k - 3.0;
+    ASSERT_EQ(segment_sum(n, seed.data(), nn, d, v.data(), out.data(),
+                          total.data()),
+              NL_SUCCESS);
+    std::vector<double> want(n * d, 0.0), want_total(d, 0.0);
+    for (index_t p = 0; p < nn; p++)
+        for (index_t c = 0; c < d; c++) {
+            want[i_n[p] * d + c] += v[p * d + c];
+            want_total[c] += v[p * d + c];
+        }
+    EXPECT_EQ(out, want);
+    EXPECT_EQ(total, want_total);
+}
+
+TEST(SegmentSum, IntegerAndEmpty) {
+    const std::vector<index_t> seed = {0, 2, 2, 5};
+    const std::vector<std::int64_t> v = {1, 2, 3, 4, 5};
+    std::vector<std::int64_t> out(3), total(1);
+    ASSERT_EQ(segment_sum<std::int64_t>(3, seed.data(), 5, 1, v.data(),
+                                        out.data(), total.data()),
+              NL_SUCCESS);
+    EXPECT_EQ(out, (std::vector<std::int64_t>{3, 0, 12}));
+    EXPECT_EQ(total[0], 15);
+    /* No rows at all. */
+    const std::vector<index_t> zero = {0, 0};
+    std::vector<float> fout(2, 7.f), ftotal(2, 7.f);
+    ASSERT_EQ(segment_sum<float>(1, zero.data(), 0, 2, nullptr, fout.data(),
+                                 ftotal.data()),
+              NL_SUCCESS);
+    EXPECT_EQ(fout, (std::vector<float>{0.f, 0.f}));
+    EXPECT_EQ(ftotal, (std::vector<float>{0.f, 0.f}));
+}
+
+TEST(SegmentSum, RejectsBadRowStarts) {
+    const std::vector<double> v(4, 1.0);
+    std::vector<double> out(2);
+    const std::vector<index_t> decreasing = {0, 3, 2};
+    EXPECT_EQ(segment_sum(2, decreasing.data(), 4, 1, v.data(), out.data()),
+              NL_INVALID_ARGUMENT);
+    const std::vector<index_t> beyond = {0, 2, 5};
+    EXPECT_EQ(segment_sum(2, beyond.data(), 4, 1, v.data(), out.data()),
+              NL_INVALID_ARGUMENT);
 }

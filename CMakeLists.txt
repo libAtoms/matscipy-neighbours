@@ -79,6 +79,11 @@ option(BUILD_BENCHMARKS "Build the core benchmark executable" ON)
 if(BUILD_BENCHMARKS)
     add_executable(bench_core benchmarks/bench_core.cc)
     target_link_libraries(bench_core PRIVATE neighbours)
+    # segment_sum kernel variants on the GPU (checks the group-size rule).
+    if(ENABLE_CUDA OR ENABLE_HIP)
+        add_executable(bench_segment_sum benchmarks/bench_segment_sum.cc)
+        target_link_libraries(bench_segment_sum PRIVATE neighbours)
+    endif()
 endif()
 
 # ----------------------------------------------------------------------

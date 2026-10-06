@@ -24,6 +24,8 @@ except ImportError:  # pragma: no cover - ase is optional
 __all__ = [
     "neighbour_list",
     "first_neighbours",
+    "segment_sum",
+    "mabincount",
     "get_jump_indicies",
     "triplet_list",
     "mic",
@@ -265,6 +267,123 @@ def first_neighbours(n, i, *, array_namespace=None):
     if array_namespace is None:
         array_namespace = _namespace_of(i)
     return _consume([tensor], array_namespace, True)[0]
+
+
+def _is_torch(x):
+    return type(x).__module__.split(".")[0] == "torch"
+
+
+def segment_sum(values, seed, *, total=False, array_namespace=None):
+    """Per-atom sums over a pair list sorted by its first index.
+
+    Sums the rows of ``values`` that belong to each atom, given the row starts
+    ``seed`` from :func:`first_neighbours`: atom ``k`` gets the sum of rows
+    ``seed[k]:seed[k+1]`` (``-1`` entries count as 0, so atoms without pairs
+    get 0). This is a bincount over the pairs without atomics: each atom's sum
+    is computed by one thread (or one group of GPU lanes) in a fixed order, so
+    results are reproducible bit for bit, and it is fast on GPUs where float64
+    atomics are slow.
+
+    Parameters
+    ----------
+    values : array
+        Per-pair values, shape ``(npairs, ...)``; float32, float64, int32 or
+        int64, C-contiguous. numpy, or a device array (cupy, jax, torch).
+    seed : array
+        Row starts of length ``n + 1``, int64, on the same device as
+        ``values`` (:func:`first_neighbours` of the pair list's ``i``).
+    total : bool, optional
+        Also return the sum over all atoms, computed on the same device (on
+        GPUs this avoids a separate full reduction, which can be slow; see
+        the benchmark page's notes on performance portability).
+    array_namespace : module or "dlpack", optional
+        Framework of the results (default: that of ``values``).
+
+    Returns
+    -------
+    array or (array, array)
+        The per-atom sums, shape ``(n, ...)``, and with ``total=True`` also
+        the total, shape ``values.shape[1:]``.
+    """
+    on_device = _is_on_device(values)
+    if on_device:
+        if not getattr(_ext, "_has_gpu", 0):
+            raise RuntimeError("Device input requires a GPU build "
+                               "(-DENABLE_CUDA=ON or -DENABLE_HIP=ON).")
+        if not _is_on_device(seed):
+            raise ValueError("seed must be on the same device as values.")
+        dev = _dlpack_device(values)
+        trailing = tuple(int(s) for s in values.shape[1:])
+    else:
+        values = np.ascontiguousarray(values)
+        seed = np.ascontiguousarray(seed, dtype=np.int64)
+        dev = (_DLPACK_CPU, 0)
+        trailing = values.shape[1:]
+    cap_out, cap_total = _ext.segment_sum_dlpack(values, seed, bool(total))
+    if array_namespace is None:
+        array_namespace = _namespace_of(values) if on_device else np
+    wrappers = [DLPackTensor(cap_out, dev)]
+    if total:
+        wrappers.append(DLPackTensor(cap_total, dev))
+    arrays = _consume(wrappers, array_namespace, on_device)
+    if array_namespace == "dlpack":
+        return tuple(arrays) if total else arrays[0]
+    n = int(arrays[0].shape[0])
+    out = arrays[0].reshape((n,) + tuple(trailing))
+    if not total:
+        return out
+    return out, arrays[1].reshape(tuple(trailing))
+
+
+def mabincount(x, weights, minlength, axis=0):
+    """Multi-axis bin count, compatible with ``matscipy.numpy_tricks.mabincount``.
+
+    Sums ``weights`` along ``axis`` into ``minlength`` bins given by ``x``.
+    Unlike matscipy's version, ``x`` must be **sorted** (as the first index of
+    a neighbour list is); the bins are then contiguous segments and are summed
+    with :func:`segment_sum`, on the GPU for device input. Raises
+    ``ValueError`` if ``x`` is not sorted or has an entry outside
+    ``[0, minlength)``.
+
+    Parameters
+    ----------
+    x : array
+        Sorted bin indices, one per entry of ``weights`` along ``axis``.
+    weights : array
+        Weights to be binned (numpy, or a device array: cupy, jax, torch).
+    minlength : int
+        Number of bins.
+    axis : int, optional
+        Axis of ``weights`` along which to bin. (Default: 0)
+
+    Returns
+    -------
+    array
+        Same dimensions and dtype as ``weights``, with dimension ``axis`` of
+        length ``minlength``.
+    """
+    on_device = _is_on_device(weights)
+    if on_device:
+        xp = _namespace_of(weights)
+    else:
+        xp = np
+        weights = np.asarray(weights)
+        x = np.asarray(x)
+    if _is_torch(x):
+        x = x.to(xp.int64)
+    else:
+        x = x.astype(xp.int64)
+    seed = first_neighbours(int(minlength), x)
+    if axis != 0:
+        weights = xp.moveaxis(weights, axis, 0)
+    if _is_torch(weights):
+        weights = weights.contiguous()
+    elif hasattr(xp, "ascontiguousarray"):
+        weights = xp.ascontiguousarray(weights)
+    out = segment_sum(weights, seed)
+    if axis != 0:
+        out = xp.moveaxis(out, 0, axis)
+    return out
 
 
 def _shrink_wrapped_cell(positions):

@@ -38,6 +38,7 @@
 #include "memory_space.hh"
 #include "neighbour_list.hh"
 #include "neighbour_list_gpu.hh"
+#include "segment_sum.hh"
 #include "types.hh"
 
 using namespace matscipy;
@@ -241,6 +242,65 @@ int import_index_dlpack(PyObject *arr, ImportedDLPack *imp,
     imp->device_type = static_cast<int>(t.device.device_type);
     imp->device_id = t.device.device_id;
     imp->nat = t.shape[0];
+    PyCapsule_SetName(cap.get(), "used_dltensor");
+    return 0;
+}
+
+/* A C-contiguous tensor of any dtype and device imported through DLPack (host
+   or device). Owns the consumed managed tensor until destruction. */
+struct ImportedTensor {
+    DLManagedTensor *mt = nullptr;
+    void *data = nullptr;
+    DLDataType dtype{};
+    std::vector<int64_t> shape;
+    int device_type = 0;
+    int device_id = 0;
+    ImportedTensor() = default;
+    ImportedTensor(const ImportedTensor &) = delete;
+    ImportedTensor &operator=(const ImportedTensor &) = delete;
+    ~ImportedTensor() {
+        if (mt && mt->deleter) mt->deleter(mt);
+    }
+    bool on_host() const { return device_type == kDLCPU; }
+};
+
+/* Import `arr` (anything with __dlpack__) as a C-contiguous tensor named
+   `what` in error messages. Device tensors must be addressable by this build's
+   runtime. Returns 0, or -1 with a Python error set. */
+int import_tensor_dlpack(PyObject *arr, const char *what, ImportedTensor *imp) {
+    PyRef cap(PyObject_CallMethod(arr, "__dlpack__", NULL));
+    if (!cap) return -1;
+    if (!PyCapsule_IsValid(cap.get(), "dltensor")) {
+        PyErr_Format(PyExc_TypeError,
+                     "%s did not yield an unversioned DLPack capsule", what);
+        return -1;
+    }
+    auto *mt = static_cast<DLManagedTensor *>(
+        PyCapsule_GetPointer(cap.get(), "dltensor"));
+    if (!mt) return -1;
+    const DLTensor &t = mt->dl_tensor;
+    bool contiguous = t.dtype.lanes == 1;
+    bool empty = false;  /* no elements: the strides are meaningless */
+    for (int k = 0; k < t.ndim; k++) empty = empty || t.shape[k] == 0;
+    if (contiguous && t.strides && !empty) {
+        int64_t expect = 1;
+        for (int k = t.ndim - 1; k >= 0; k--) {
+            if (t.shape[k] > 1 && t.strides[k] != expect) contiguous = false;
+            expect *= t.shape[k];
+        }
+    }
+    if (!contiguous) {
+        PyErr_Format(PyExc_TypeError, "%s must be C-contiguous", what);
+        return -1;
+    }
+    const int dev_type = static_cast<int>(t.device.device_type);
+    if (dev_type != kDLCPU && !check_device_access(dev_type, what)) return -1;
+    imp->mt = mt;
+    imp->data = static_cast<char *>(t.data) + t.byte_offset;
+    imp->dtype = t.dtype;
+    imp->shape.assign(t.shape, t.shape + t.ndim);
+    imp->device_type = dev_type;
+    imp->device_id = t.device.device_id;
     PyCapsule_SetName(cap.get(), "used_dltensor");
     return 0;
 }
@@ -560,6 +620,91 @@ PyObject *first_neighbours_dlpack_impl(PyObject *, PyObject *args) {
 #endif
 }
 
+/* Per-segment sums of `values` (rows x d) over the row starts `seed`, plus the
+   total if requested; host or device, matching the input. */
+template <typename T>
+PyObject *segment_sum_typed(const ImportedTensor &values,
+                            const ImportedTensor &seed, int64_t nrows,
+                            int64_t d, bool want_total, uint8_t code) {
+    const index_t n = static_cast<index_t>(seed.shape[0]) - 1;
+    const auto *s = static_cast<const index_t *>(seed.data);
+    const auto *v = static_cast<const T *>(values.data);
+    constexpr uint8_t bits = sizeof(T) * 8;
+    PyRef cap_out, cap_total;
+    if (values.on_host()) {
+        std::vector<T> out(static_cast<std::size_t>(n) * d), total(d);
+        error_t st = segment_sum<T>(n, s, nrows, d, v, out.data(),
+                                    want_total ? total.data() : nullptr);
+        if (st != NL_SUCCESS) {
+            raise_core_error(st);
+            return NULL;
+        }
+        cap_out = host_capsule(std::move(out), 2, n, d, code, bits);
+        if (want_total) cap_total = host_capsule(std::move(total), 1, d, 1, code, bits);
+    } else {
+#if defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP)
+        Array<T, DeviceSpace> out, total;
+        error_t st = segment_sum_gpu_device<T>(n, s, nrows, d, v, out,
+                                               want_total ? &total : nullptr,
+                                               values.device_id);
+        if (st != NL_SUCCESS) {
+            raise_core_error(st);
+            return NULL;
+        }
+        cap_out = device_capsule(std::move(out), 2, n, d, code, bits,
+                                 values.device_id);
+        if (want_total)
+            cap_total = device_capsule(std::move(total), 1, d, 1, code, bits,
+                                       values.device_id);
+#else
+        return no_gpu_backend();
+#endif
+    }
+    if (!cap_out || (want_total && !cap_total)) return NULL;
+    return PyTuple_Pack(2, cap_out.get(), want_total ? cap_total.get() : Py_None);
+}
+
+PyObject *segment_sum_dlpack_impl(PyObject *, PyObject *args) {
+    PyObject *py_values, *py_seed;
+    int want_total = 0;
+    if (!PyArg_ParseTuple(args, "OO|p", &py_values, &py_seed, &want_total))
+        return NULL;
+    ImportedTensor values, seed;
+    if (import_tensor_dlpack(py_values, "values", &values) != 0) return NULL;
+    if (import_tensor_dlpack(py_seed, "seed", &seed) != 0) return NULL;
+    if (seed.shape.size() != 1 || seed.shape[0] < 1 ||
+        seed.dtype.code != kDLInt || seed.dtype.bits != kIntBits) {
+        PyErr_SetString(PyExc_TypeError,
+                        "seed must be a 1-D int64 array of length n + 1");
+        return NULL;
+    }
+    if (values.shape.empty()) {
+        PyErr_SetString(PyExc_TypeError, "values must have at least one dimension");
+        return NULL;
+    }
+    if (values.device_type != seed.device_type ||
+        (!values.on_host() && values.device_id != seed.device_id)) {
+        PyErr_SetString(PyExc_ValueError,
+                        "values and seed must be on the same device");
+        return NULL;
+    }
+    const int64_t nrows = values.shape[0];
+    int64_t d = 1;
+    for (std::size_t k = 1; k < values.shape.size(); k++) d *= values.shape[k];
+    const uint8_t code = values.dtype.code, bits = values.dtype.bits;
+    if (code == kDLFloat && bits == 64)
+        return segment_sum_typed<double>(values, seed, nrows, d, want_total, code);
+    if (code == kDLFloat && bits == 32)
+        return segment_sum_typed<float>(values, seed, nrows, d, want_total, code);
+    if (code == kDLInt && bits == 64)
+        return segment_sum_typed<std::int64_t>(values, seed, nrows, d, want_total, code);
+    if (code == kDLInt && bits == 32)
+        return segment_sum_typed<std::int32_t>(values, seed, nrows, d, want_total, code);
+    PyErr_SetString(PyExc_TypeError,
+                    "values must be float32, float64, int32 or int64");
+    return NULL;
+}
+
 /* Return the GPU memory cached by the library's allocator to the driver
    (no-op without a GPU backend). */
 PyObject *empty_gpu_cache_impl(PyObject *, PyObject *) {
@@ -587,6 +732,10 @@ PyObject *py_neighbour_matrix_dlpack(PyObject *self, PyObject *args) {
 
 PyObject *py_first_neighbours_dlpack(PyObject *self, PyObject *args) {
     return guarded(first_neighbours_dlpack_impl, self, args);
+}
+
+PyObject *py_segment_sum_dlpack(PyObject *self, PyObject *args) {
+    return guarded(segment_sum_dlpack_impl, self, args);
 }
 
 PyObject *py_empty_gpu_cache(PyObject *self, PyObject *args) {

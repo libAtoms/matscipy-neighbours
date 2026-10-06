@@ -9,6 +9,7 @@ add_library(neighbours STATIC
     cell_list.cc
     neighbour_list.cc
     first_neighbours.cc
+    segment_sum.cc
     triplet_list.cc
 )
 
@@ -20,6 +21,7 @@ set(_gpu_sources
     memory_space_gpu.cc
     device_primitives.cc
     neighbour_list_gpu.cc
+    segment_sum_gpu.cc
 )
 if(ENABLE_CUDA)
     target_sources(neighbours PRIVATE ${_gpu_sources})

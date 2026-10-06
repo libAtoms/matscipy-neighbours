@@ -14,9 +14,11 @@ from .neighbours import (
     empty_gpu_cache,
     first_neighbours,
     get_jump_indicies,
+    mabincount,
     mic,
     neighbour_list,
     neighbour_matrix,
+    segment_sum,
     triplet_list,
 )
 
@@ -24,6 +26,8 @@ __all__ = [
     "neighbour_list",
     "neighbour_matrix",
     "first_neighbours",
+    "segment_sum",
+    "mabincount",
     "get_jump_indicies",
     "triplet_list",
     "mic",

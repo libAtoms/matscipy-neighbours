@@ -41,31 +41,6 @@ inline int grid_for(index_t n) { return static_cast<int>((n + BLOCK - 1) / BLOCK
    kernels below add the GPU-specific build (atomic histogram / hash) and the
    two-pass driver. */
 
-/* RAII: switch to `dev` for the duration of the build, restore on exit. A
-   negative id means "use the current device, don't switch" (host-input path). */
-struct DeviceGuard {
-    int prev = -1;
-    explicit DeviceGuard(int dev) {
-        if (dev >= 0) {
-            int cur = 0;
-            GPU_CHECK(gpuGetDevice(&cur));
-            if (dev != cur) {
-                GPU_CHECK(gpuSetDevice(dev));
-                prev = cur;
-            }
-        }
-    }
-    ~DeviceGuard() {
-        if (prev < 0) return;
-        /* Restoring the caller's device cannot fail meaningfully at this
-           point; report rather than abort from a destructor. */
-        const gpuError_t err = gpuSetDevice(prev);
-        if (err != gpuSuccess) {
-            std::fprintf(stderr, "[matscipy] could not restore GPU device %d: %s\n",
-                         prev, gpuGetErrorString(err));
-        }
-    }
-};
 
 
 /* Per-pair sinks for the shared visit_neighbours traversal. HD so the

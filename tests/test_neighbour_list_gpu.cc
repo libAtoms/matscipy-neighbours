@@ -26,6 +26,7 @@
 #include "memory_space.hh"
 #include "neighbour_list.hh"
 #include "neighbour_list_gpu.hh"
+#include "segment_sum.hh"
 
 #if defined(MATSCIPY_ENABLE_CUDA)
 #include <cuda_runtime.h>
@@ -425,6 +426,90 @@ TEST(FirstNeighboursGpu, RejectsUnsortedAndOutOfRange) {
                   NL_INVALID_ARGUMENT);
         EXPECT_EQ(d_seed.size(), 0u);  /* untouched */
     }
+}
+
+/* --- segment_sum ----------------------------------------------------------- */
+
+namespace {
+
+/* Random sorted first indices over n atoms with empty atoms at both ends and
+   inside, as a seed array, plus values; the device result of every kernel
+   variant must equal the host result. */
+template <typename T>
+void check_segment_sum_device(index_t d, T scale) {
+    std::mt19937 rng(11);
+    const index_t n = 3000;
+    std::vector<index_t> i_n;
+    for (index_t a = 5; a < n - 7; a++) {
+        if (rng() % 6 == 0) continue;
+        i_n.insert(i_n.end(), rng() % 90, a);
+    }
+    const index_t nn = static_cast<index_t>(i_n.size());
+    std::vector<index_t> seed(n + 1);
+    ASSERT_EQ(first_neighbours(n, nn, i_n.data(), seed.data()), NL_SUCCESS);
+    std::vector<T> v(nn * d);
+    for (auto &x : v) x = static_cast<T>(static_cast<int>(rng() % 2001) - 1000) * scale;
+    std::vector<T> want(n * d), want_total(d);
+    ASSERT_EQ(segment_sum(n, seed.data(), nn, d, v.data(), want.data(),
+                          want_total.data()),
+              NL_SUCCESS);
+
+    Array<index_t> h_seed(n + 1);
+    std::copy(seed.begin(), seed.end(), h_seed.data());
+    Array<T> h_v(nn * d);
+    std::copy(v.begin(), v.end(), h_v.data());
+    Array<index_t, DeviceSpace> d_seed(n + 1);
+    Array<T, DeviceSpace> d_v(nn * d), d_out, d_total;
+    deep_copy(d_seed, h_seed);
+    deep_copy(d_v, h_v);
+    struct Variant { SegmentSumKernel k; int g; };
+    for (Variant var : {Variant{SegmentSumKernel::Auto, 0},
+                        Variant{SegmentSumKernel::ThreadPerRow, 0},
+                        Variant{SegmentSumKernel::Group, 2},
+                        Variant{SegmentSumKernel::Group, 8},
+                        Variant{SegmentSumKernel::Group, 32}}) {
+        ASSERT_EQ(segment_sum_gpu_device(n, d_seed.data(), nn, d, d_v.data(),
+                                         d_out, &d_total, -1, var.k, var.g),
+                  NL_SUCCESS);
+        const std::vector<T> got = to_host(d_out), got_total = to_host(d_total);
+        ASSERT_EQ(got.size(), want.size());
+        for (std::size_t k = 0; k < got.size(); k++)
+            ASSERT_NEAR(static_cast<double>(got[k]), static_cast<double>(want[k]),
+                        1e-9 * (1 + std::abs(static_cast<double>(want[k]))))
+                << "kernel " << static_cast<int>(var.k) << " group " << var.g
+                << " at " << k;
+        for (index_t c = 0; c < d; c++)
+            ASSERT_NEAR(static_cast<double>(got_total[c]),
+                        static_cast<double>(want_total[c]),
+                        1e-9 * (1 + std::abs(static_cast<double>(want_total[c]))));
+    }
+}
+
+}  // namespace
+
+TEST(SegmentSumGpu, MatchesHostDouble) {
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
+    check_segment_sum_device<double>(3, 0.001);
+    check_segment_sum_device<double>(1, 0.001);
+    check_segment_sum_device<double>(9, 0.001);
+}
+
+TEST(SegmentSumGpu, MatchesHostIntegerExactly) {
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
+    check_segment_sum_device<std::int64_t>(3, 1);
+    check_segment_sum_device<std::int32_t>(2, 1);
+}
+
+TEST(SegmentSumGpu, RejectsBadRowStarts) {
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device";
+    const std::vector<index_t> bad = {0, 3, 2};
+    Array<index_t> h(bad.size());
+    std::copy(bad.begin(), bad.end(), h.data());
+    Array<index_t, DeviceSpace> d_seed(bad.size());
+    deep_copy(d_seed, h);
+    Array<double, DeviceSpace> d_v(4), d_out;
+    EXPECT_EQ(segment_sum_gpu_device(2, d_seed.data(), 4, 1, d_v.data(), d_out),
+              NL_INVALID_ARGUMENT);
 }
 
 /* --- device primitives ----------------------------------------------------- */

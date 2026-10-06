@@ -137,6 +137,47 @@ inline void gpu_check_launch(const char *file, int line) {
     } while (0)
 #endif
 
+/* RAII: switch to `dev` for the duration of a call, restore on exit. A
+   negative id means "use the current device, don't switch" (host-input path). */
+struct DeviceGuard {
+    int prev = -1;
+    explicit DeviceGuard(int dev) {
+        if (dev >= 0) {
+            int cur = 0;
+            GPU_CHECK(gpuGetDevice(&cur));
+            if (dev != cur) {
+                GPU_CHECK(gpuSetDevice(dev));
+                prev = cur;
+            }
+        }
+    }
+    ~DeviceGuard() {
+        if (prev < 0) return;
+        /* Restoring the caller's device cannot fail meaningfully at this
+           point; report rather than abort from a destructor. */
+        const gpuError_t err = gpuSetDevice(prev);
+        if (err != gpuSuccess) {
+            std::fprintf(stderr, "[matscipy] could not restore GPU device %d: %s\n",
+                         prev, gpuGetErrorString(err));
+        }
+    }
+};
+
+/* Sum `v` down the lanes of each group of `width` consecutive lanes (a power
+   of two up to the warp size); lane 0 of each group holds the group's sum.
+   Every lane of the warp must call it. */
+template <typename T>
+__device__ inline T group_sum(T v, int width) {
+    for (int off = width / 2; off > 0; off /= 2) {
+#if defined(MATSCIPY_ENABLE_CUDA)
+        v += __shfl_down_sync(0xffffffffu, v, off, width);
+#else
+        v += __shfl_down(v, off, width);
+#endif
+    }
+    return v;
+}
+
 }  // namespace matscipy
 
 #endif
