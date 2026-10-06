@@ -5,8 +5,9 @@
  * SPDX-License-Identifier: MIT
  *
  * Unit tests for the memory-space abstraction (Array<T, Space> + deep_copy).
- * Host paths run everywhere; the device round-trip is compiled only when a GPU
- * backend is enabled, and skips at runtime if no device is present.
+ * Host paths run everywhere; the device tests are compiled only when a GPU
+ * backend (CUDA or HIP) is enabled, and skip at runtime if no device is
+ * present.
  */
 
 #include <gtest/gtest.h>
@@ -16,11 +17,28 @@
 
 #include "memory_space.hh"
 
-#ifdef MATSCIPY_ENABLE_CUDA
+#if defined(MATSCIPY_ENABLE_CUDA)
 #include <cuda_runtime.h>
+#elif defined(MATSCIPY_ENABLE_HIP)
+#include <hip/hip_runtime.h>
 #endif
 
 using namespace matscipy;
+
+#if defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP)
+namespace {
+
+bool gpu_device_present() {
+    int n = 0;
+#if defined(MATSCIPY_ENABLE_CUDA)
+    return cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
+#else
+    return hipGetDeviceCount(&n) == hipSuccess && n > 0;
+#endif
+}
+
+}  // namespace
+#endif
 
 TEST(MemorySpace, DeviceTypeCodesMatchDLPack) {
     /* Each space's device code matches the DLPack device type:
@@ -82,15 +100,12 @@ TEST(MemorySpace, DeepCopyEmptyIsNoop) {
     SUCCEED();
 }
 
-#ifdef MATSCIPY_ENABLE_CUDA
+#if defined(MATSCIPY_ENABLE_CUDA) || defined(MATSCIPY_ENABLE_HIP)
 TEST(MemorySpace, DeviceRoundTrip) {
-    int n_devices = 0;
-    if (cudaGetDeviceCount(&n_devices) != cudaSuccess || n_devices == 0) {
-        GTEST_SKIP() << "no CUDA device available";
-    }
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device available";
     const std::size_t n = 1024;
     Array<int> host_in(n), host_out(n);
-    Array<int, CudaSpace> dev(n);
+    Array<int, DeviceSpace> dev(n);
     std::iota(host_in.data(), host_in.data() + n, 0);
 
     deep_copy(dev, host_in);       /* H2D */
@@ -100,13 +115,10 @@ TEST(MemorySpace, DeviceRoundTrip) {
 }
 
 TEST(MemorySpace, DeviceToDeviceCopy) {
-    int n_devices = 0;
-    if (cudaGetDeviceCount(&n_devices) != cudaSuccess || n_devices == 0) {
-        GTEST_SKIP() << "no CUDA device available";
-    }
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device available";
     const std::size_t n = 256;
     Array<double> host_in(n), host_out(n);
-    Array<double, CudaSpace> d1(n), d2(n);
+    Array<double, DeviceSpace> d1(n), d2(n);
     for (std::size_t i = 0; i < n; i++) host_in.data()[i] = 2.0 * i + 1.0;
 
     deep_copy(d1, host_in);   /* H2D */
@@ -114,5 +126,33 @@ TEST(MemorySpace, DeviceToDeviceCopy) {
     deep_copy(host_out, d2);  /* D2H */
     for (std::size_t i = 0; i < n; i++)
         ASSERT_EQ(host_out.data()[i], 2.0 * i + 1.0);
+}
+#endif
+
+#if defined(MATSCIPY_ENABLE_HIP)
+/* HIP keeps its own cache of device blocks (memory_space_gpu.cc): a freed
+   block is handed to the next request of the same size class, which is what
+   makes repeated neighbour-list builds cheap; empty_gpu_cache() releases it. */
+TEST(MemorySpace, HipCacheReusesFreedBlock) {
+    if (!gpu_device_present()) GTEST_SKIP() << "no GPU device available";
+    const std::size_t n = (std::size_t(3) << 20) / sizeof(double);  /* 3 MiB */
+    const void *first = nullptr;
+    {
+        Array<double, DeviceSpace> a(n - 1000);
+        first = a.data();
+    }
+    {
+        /* Slightly larger, same size class: 3 MiB is one of the eight sizes
+           per power of two, and both requests round up to it. */
+        Array<double, DeviceSpace> b(n);
+        EXPECT_EQ(b.data(), first);
+    }
+    empty_gpu_cache();
+    Array<double> host_in(n), host_out(n);
+    std::iota(host_in.data(), host_in.data() + n, 0.0);
+    Array<double, DeviceSpace> c(n);
+    deep_copy(c, host_in);
+    deep_copy(host_out, c);
+    EXPECT_EQ(host_out.data()[n - 1], static_cast<double>(n - 1));
 }
 #endif
