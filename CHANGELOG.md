@@ -30,6 +30,19 @@ project adheres to [Semantic Versioning](https://semver.org/).
   points return as the new `NL_OUT_OF_MEMORY` code and Python raises as
   `MemoryError`. On the GPU the cache is emptied and the allocation retried
   once first.
+- On HIP the GPU buffers come from a per-device cache of `hipMalloc` blocks
+  (free lists by size, requests rounded up to one of eight sizes per power of
+  two) instead of the stream-ordered pool: ROCm 6.4's pools did not reliably
+  reuse freed blocks, so every call mapped its outputs afresh. A GPU pair list
+  of 10⁶ atoms on an MI300A builds in about 20 ms instead of 160 ms. CUDA is
+  unchanged.
+- `tests/test_neighbour_list_gpu.cc` builds and runs with the HIP backend, and
+  the device tests of `tests/test_memory_space.cc` run on HIP too, plus a test
+  that the HIP block cache reuses freed blocks.
+- `first_neighbours` accepts a device index array (CuPy, JAX, PyTorch via
+  DLPack) and computes the row-start array on its GPU, returning it there in
+  the input's framework (`array_namespace` overrides); host input is
+  unchanged. The C++ core gains `first_neighbours_gpu_device`.
 
 ### Examples and benchmark
 
@@ -39,6 +52,26 @@ project adheres to [Semantic Versioning](https://semver.org/).
   vacuum. The fused Warp and C++ kernels consume the cell-shift array `S` of
   the list for the periodic case; the array and JAX kernels are unchanged
   because the shifts are folded into the distance vectors.
+- The array example sums the pair forces per atom with a segment sum over the
+  `i`-sorted pairs instead of a weighted `bincount` per component, whose
+  float64 atomic scatter is very slow on ROCm (about 440 ms against 1.5 ms at
+  10⁶ atoms on an MI300A): `first_neighbours` gives the segment starts, and a
+  small CuPy kernel (one thread per atom) sums each segment on the GPU,
+  `add.reduceat` on the CPU. CuPy's `add.reduceat` was not used on the GPU: it
+  computes a cumulative sum of all pairs, a temporary the size of the pair
+  forces, and loses accuracy to it. Results files record
+  the method (`array_force_sum`); the GPU comparison labels the array curves
+  with it.
+- The benchmark page gains a section on performance portability between
+  NVIDIA and AMD GPUs: caching allocators, float64 atomics, CuPy's backend
+  defaults, the MI300A's unified memory, and installing the ROCm stack.
+- `benchmark.py` compares GPUs: `--add-machine RESULTS.json` stores a run as
+  an additional machine in an existing results file (keyed by `--machine`,
+  default the detected GPU) without touching its main results, and
+  `--kernels`, `--lists` and `--devices` restrict a run to a subset. A new
+  figure (`docs/benchmark_gpus.png`) shows the array and JAX kernels on the
+  matscipy-neighbours GPU list for every machine in the file. AMD GPUs are
+  detected through `rocm-smi`.
 - `benchmark.py` sweeps both systems and writes one figure per system
   (`docs/benchmark_liquid.png`, `docs/benchmark_droplet.png`; panels ordered
   array / JAX / Warp / C++) plus a kernel-comparison figure

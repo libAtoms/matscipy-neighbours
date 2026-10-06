@@ -1763,5 +1763,199 @@
     "supported": false
    }
   ]
+ },
+ "machines": {
+  "AMD Instinct MI300A": {
+   "meta": {
+    "cpu": "AMD Instinct MI300A Accelerator (23 usable cores)",
+    "gpu": "AMD Instinct MI300A",
+    "ncores": 23,
+    "systems": [
+     "liquid",
+     "droplet"
+    ],
+    "density": 0.8442,
+    "sizes": [
+     100,
+     1000,
+     10000,
+     100000,
+     1000000,
+     3000000,
+     10000000,
+     30000000
+    ],
+    "steps": 40,
+    "timeout": 300,
+    "max_run_seconds": 60,
+    "max_atoms_cpu": null,
+    "thrash_growth": 0.0,
+    "kernels": [
+     "array",
+     "jax"
+    ],
+    "lists": [
+     "matscipy"
+    ],
+    "devices": [
+     "gpu"
+    ],
+    "array_force_sum": "segment sum"
+   },
+   "systems": {
+    "liquid": [
+     {
+      "kernel": "array",
+      "nl": "matscipy",
+      "device": "gpu",
+      "threads": null,
+      "fmt": "list",
+      "supported": true,
+      "points": [
+       [
+        100,
+        2.979
+       ],
+       [
+        1000,
+        1.975
+       ],
+       [
+        10000,
+        3.439
+       ],
+       [
+        100000,
+        14.434
+       ],
+       [
+        1000000,
+        188.164
+       ],
+       [
+        3000000,
+        553.877
+       ],
+       [
+        10000000,
+        1778.752
+       ]
+      ],
+      "done": true
+     },
+     {
+      "kernel": "jax",
+      "nl": "matscipy",
+      "device": "gpu",
+      "threads": null,
+      "fmt": "list",
+      "supported": true,
+      "points": [
+       [
+        100,
+        2.031
+       ],
+       [
+        1000,
+        1.405
+       ],
+       [
+        10000,
+        1.586
+       ],
+       [
+        100000,
+        2.975
+       ],
+       [
+        1000000,
+        26.989
+       ],
+       [
+        3000000,
+        76.493
+       ]
+      ],
+      "done": true
+     }
+    ],
+    "droplet": [
+     {
+      "kernel": "array",
+      "nl": "matscipy",
+      "device": "gpu",
+      "threads": null,
+      "fmt": "list",
+      "supported": true,
+      "points": [
+       [
+        100,
+        1.806
+       ],
+       [
+        1000,
+        2.2
+       ],
+       [
+        10000,
+        3.767
+       ],
+       [
+        100000,
+        15.42
+       ],
+       [
+        1000000,
+        184.677
+       ],
+       [
+        3000000,
+        548.079
+       ],
+       [
+        10000000,
+        1772.615
+       ]
+      ],
+      "done": true
+     },
+     {
+      "kernel": "jax",
+      "nl": "matscipy",
+      "device": "gpu",
+      "threads": null,
+      "fmt": "list",
+      "supported": true,
+      "points": [
+       [
+        100,
+        1.212
+       ],
+       [
+        1000,
+        1.305
+       ],
+       [
+        10000,
+        1.434
+       ],
+       [
+        100000,
+        3.047
+       ],
+       [
+        1000000,
+        25.808
+       ],
+       [
+        3000000,
+        76.118
+       ]
+      ],
+      "done": true
+     }
+    ]
+   }
+  }
  }
 }
