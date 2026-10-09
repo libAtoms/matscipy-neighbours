@@ -622,17 +622,16 @@ the matscipy-neighbours GPU list (pair list for the array kernels,
 
 How to read it:
 
-- The legend says how each run's array kernel sums the pair forces per atom:
-  a weighted `bincount` per component plus full reductions for the energy and
-  virial (the H200 curves, measured before `segment_sum` existed), or
-  `segment_sum`, which sums forces, energies and virials per atom without
-  atomics and returns the totals with them (the MI300A curves). On the MI300A
-  the old scheme took 700 ms per step at 10⁶ atoms, the new one 28 ms.
+- The array kernels of all runs sum the pair forces, energies and virials per
+  atom with `segment_sum`, without atomics, and get the totals with them. The
+  earlier scheme, a weighted `bincount` per component plus full reductions for
+  the energy and virial, took 700 ms per step at 10⁶ atoms on the MI300A
+  (`segment_sum`: 28 ms) and 22 ms on the H200 (`segment_sum`: 20 ms).
 - On the **AMD Instinct MI300A** (ROCm 6.4, JAX 0.4.35 from AMD's ROCm wheels,
   CuPy 13.6 built from source) both kernels are on par with the H200 up to
   10⁴ atoms, where launch latency dominates. At 10⁶ atoms the array kernel
-  takes 28 ms per step (H200: 22 ms with the old scheme) and JAX 26 ms (H200:
-  11 ms); at 10⁷ atoms the array kernel takes 250 ms (H200: 190 ms).
+  takes 28 ms per step (H200: 20 ms) and JAX 26 ms (H200: 11 ms); at 10⁷
+  atoms the array kernel takes 250 ms (H200: 160 ms).
 - On the MI300A, JAX runs out of memory at 10⁷ atoms and the array kernel at
   3×10⁷: plain device allocations reach only the ~63 GiB coarse-grained window
   of the 128 GB of HBM the APU shares with its CPUs, and the neighbour matrix
