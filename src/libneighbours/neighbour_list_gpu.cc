@@ -20,6 +20,7 @@
 #include <cstdio>
 
 #include "cell_list.hh"          /* shared cell_hash, morton3, Dense/SparseQuery */
+#include "cell_list_gpu.hh"      /* shared histogram/scatter and hash kernels */
 #include "device.hh"
 #include "device_primitives.hh"
 #include "error.hh"
@@ -103,15 +104,6 @@ struct MatrixFiller {
     }
 };
 
-/* Atomic post-increment of a 64-bit index (histogram / cursor / row counters).
-   CUDA and HIP provide 64-bit atomicAdd only for unsigned long long. */
-__device__ inline index_t atomic_inc(index_t *p) {
-    static_assert(sizeof(index_t) == sizeof(unsigned long long),
-                  "atomic_inc assumes a 64-bit index_t");
-    return static_cast<index_t>(
-        atomicAdd(reinterpret_cast<unsigned long long *>(p), 1ull));
-}
-
 /* --- kernels --------------------------------------------------------------- */
 
 /* Also flags any non-finite coordinate (every offending thread stores the same
@@ -127,27 +119,6 @@ __global__ void k_cell_index(const real_t *origin, const real_t *inv,
     }
     position_to_cell_index(origin, inv, &r[3 * a], n1, n2, n3, &raw[3 * a],
                   &raw[3 * a + 1], &raw[3 * a + 2]);
-}
-
-__global__ void k_fold_lin_hist(const index_t *raw, int pbc0, int pbc1, int pbc2,
-                                index_t n1, index_t n2, index_t n3, index_t nat,
-                                index_t *lin, index_t *cell_count) {
-    index_t a = blockIdx.x * blockDim.x + threadIdx.x;
-    if (a >= nat) return;
-    index_t c1 = pbc0 ? bin_wrap(raw[3 * a], n1) : bin_trunc(raw[3 * a], n1);
-    index_t c2 = pbc1 ? bin_wrap(raw[3 * a + 1], n2) : bin_trunc(raw[3 * a + 1], n2);
-    index_t c3 = pbc2 ? bin_wrap(raw[3 * a + 2], n3) : bin_trunc(raw[3 * a + 2], n3);
-    index_t l = c1 + n1 * (c2 + n2 * c3);
-    lin[a] = l;
-    atomic_inc(&cell_count[l]);
-}
-
-__global__ void k_scatter(const index_t *lin, index_t nat, index_t *cursor,
-                          index_t *sorted_atom) {
-    index_t a = blockIdx.x * blockDim.x + threadIdx.x;
-    if (a >= nat) return;
-    index_t pos = atomic_inc(&cursor[lin[a]]);
-    sorted_atom[pos] = a;
 }
 
 __global__ void k_iota(index_t *v, index_t n) {
@@ -177,56 +148,6 @@ __global__ void k_cell_first_from_runs(const index_t *sorted_atom,
     if (s >= nat) return;
     index_t c = lin[sorted_atom[s]];
     if (s == 0 || lin[sorted_atom[s - 1]] != c) cell_first[c] = s;
-}
-
-/* --- sparse (hashed compact) cell list, for huge/sparse grids --------------
-   Open addressing keyed by the 64-bit linear cell index; built in parallel with
-   atomicCAS inserts. Used when the dense histogram/array path would need
-   O(ncells) memory (or overflow a 32-bit index). */
-
-__global__ void k_fold_key64(const index_t *raw, int pbc0, int pbc1, int pbc2,
-                            index_t n1, index_t n2, index_t n3, index_t nat,
-                            std::int64_t *key) {
-    index_t a = blockIdx.x * blockDim.x + threadIdx.x;
-    if (a >= nat) return;
-    index_t c1 = pbc0 ? bin_wrap(raw[3 * a], n1) : bin_trunc(raw[3 * a], n1);
-    index_t c2 = pbc1 ? bin_wrap(raw[3 * a + 1], n2) : bin_trunc(raw[3 * a + 1], n2);
-    index_t c3 = pbc2 ? bin_wrap(raw[3 * a + 2], n3) : bin_trunc(raw[3 * a + 2], n3);
-    key[a] = static_cast<std::int64_t>(c1) +
-             static_cast<std::int64_t>(n1) *
-                 (static_cast<std::int64_t>(c2) + static_cast<std::int64_t>(n2) * c3);
-}
-
-__global__ void k_hash_insert(const std::int64_t *key, index_t nat,
-                             std::int64_t mask, std::int64_t *hkey,
-                             index_t *hcount) {
-    index_t a = blockIdx.x * blockDim.x + threadIdx.x;
-    if (a >= nat) return;
-    std::int64_t k = key[a];
-    std::int64_t h = cell_hash(k) & mask;
-    auto *slot = reinterpret_cast<unsigned long long *>(hkey);
-    const unsigned long long empty = static_cast<unsigned long long>(-1);
-    while (true) {
-        unsigned long long old =
-            atomicCAS(&slot[h], empty, static_cast<unsigned long long>(k));
-        if (old == empty || static_cast<std::int64_t>(old) == k) {
-            atomic_inc(&hcount[h]);
-            return;
-        }
-        h = (h + 1) & mask;
-    }
-}
-
-__global__ void k_hash_scatter(const std::int64_t *key, index_t nat,
-                              std::int64_t mask, const std::int64_t *hkey,
-                              index_t *cursor, index_t *sorted_atom) {
-    index_t a = blockIdx.x * blockDim.x + threadIdx.x;
-    if (a >= nat) return;
-    std::int64_t k = key[a];
-    std::int64_t h = cell_hash(k) & mask;
-    while (hkey[h] != k) h = (h + 1) & mask;  /* key is guaranteed present */
-    index_t pos = atomic_inc(&cursor[h]);
-    sorted_atom[pos] = a;
 }
 
 __global__ void k_gather(const index_t *sorted_atom, const index_t *raw,

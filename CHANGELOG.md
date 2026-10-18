@@ -4,6 +4,33 @@ All notable changes to matscipy-neighbours are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Core
+
+- EXPERIMENTAL planned GPU neighbour matrix (`neighbour_matrix_planned.hh`):
+  `plan_neighbour_matrix` fixes the cell grid, the dense or hashed cell lookup
+  and the workspace on the host from a reference cell;
+  `neighbour_matrix_gpu_planned` enqueues the build on a caller's stream with no
+  host synchronisation, allocation or read-back, reading the current cell from
+  device memory (so it may change between builds) and leaving its flags
+  (overflow, invalid input) on the device. Global or per-type cutoffs, float32
+  or float64 inputs, int32 outputs. Capturable in a CUDA graph, conditional
+  bodies included (kernel nodes only).
+- The GPU cell-list build kernels (histogram, scatter, hash table) moved to
+  `cell_list_gpu.hh`, shared by the regular and planned builds.
+- The error state (`has_error`, `error_string`) is per thread, so callers on
+  other threads (XLA runs FFI handlers on its own threads, without the GIL) do
+  not mix messages.
+
+### Python
+
+- EXPERIMENTAL `matscipy_neighbours.xla`: `neighbour_matrix` as an XLA FFI call
+  for JAX, usable inside `jit` on the CPU and CUDA (built when CMake is given
+  `JAX_FFI_INCLUDE_DIR`), and `plan` + `neighbour_matrix_planned`, the
+  device-only CUDA build. `tests/test_xla.py` checks every path against
+  `neighbour_list`.
+
 ## [1.1.0] - 2026-10-06
 
 ### Core

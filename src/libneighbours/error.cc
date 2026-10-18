@@ -16,8 +16,8 @@
 
 namespace matscipy {
 
-bool has_error = false;
-char error_string[MAX_ERROR_STRING] = {0};
+thread_local bool has_error = false;
+thread_local char error_string[MAX_ERROR_STRING] = {0};
 
 static void copy_message(char *dst, const char *msg) {
     std::strncpy(dst, msg, MAX_ERROR_STRING - 1);
