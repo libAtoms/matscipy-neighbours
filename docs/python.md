@@ -145,6 +145,53 @@ dist = jnp.where(mask[..., None], dist, 0.0)              # select, don't multip
 r2 = jnp.where(mask, (dist * dist).sum(-1), 1.0)          # masked, jit-friendly
 ```
 
+## JAX inside `jit`: `matscipy_neighbours.xla` (experimental)
+
+`neighbour_matrix` above is called from Python, between jitted steps. The
+`matscipy_neighbours.xla` module registers it as an XLA FFI call instead, so a
+JAX program can build its list *inside* `jit` — under `lax.cond`, in a
+`lax.fori_loop` — on the CPU or a CUDA GPU. It needs the handler library, built
+when CMake is given JAX's FFI headers:
+
+```bash
+pip install . -C cmake.define.JAX_FFI_INCLUDE_DIR="$(python -c 'import jax.ffi; print(jax.ffi.include_dir())')"
+#   add -C cmake.define.ENABLE_CUDA=ON for the CUDA handlers
+```
+
+```python
+from matscipy_neighbours import xla
+
+idx, shift, count, overflow = xla.neighbour_matrix(positions, cell, cutoff=6.0,
+                                                   pbc=(True, True, True), max_neighbours=96)
+mask = jnp.arange(96)[None, :] < count[:, None]
+D = positions[idx] - positions[:, None] + shift @ cell     # differentiable in positions
+```
+
+Positions and cell (rows: lattice vectors) are float32 or float64; the search
+runs in float64. The outputs are int32: `shift` is the cell shift of each slot,
+so cells smaller than the cutoff work, and `D` can be formed from the positions
+being differentiated. `overflow` (a device scalar) is 1 when a row was clipped.
+Per-type cutoffs: pass `types` (int, `[n]`) and `cutoffs` (`[m, m]`, symmetric,
+not squared).
+
+On CUDA the regular build waits for and reads back from the device several
+times per call (sizes, flags, the cell). `xla.plan` + `xla.neighbour_matrix_planned`
+remove that: the cell grid, the dense or hashed cell lookup and a workspace are
+fixed once on the host from a reference cell, and each build is enqueued on
+XLA's stream with no host synchronisation, allocation or read-back. It is
+declared CUDA-graph compatible, so a rebuild inside `lax.cond` in a jitted MD
+loop stays on the device (no host round trip per step). The cell may change
+between builds (NPT); plan again if it changes a lot. Its flags are a device
+array `status = (overflow, invalid)`: invalid input (non-finite positions, a
+degenerate cell, a type out of range) sets `invalid` where the regular build
+raises.
+
+```python
+plan = xla.plan(len(positions), cell, 6.0, (True, True, True), 96)
+idx, shift, count, status = xla.neighbour_matrix_planned(positions, cell, 6.0,
+                                                         (True, True, True), 96, plan)
+```
+
 ## GPU memory
 
 The GPU backend allocates from its own caching memory pool: freed buffers stay
