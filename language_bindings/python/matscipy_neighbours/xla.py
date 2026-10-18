@@ -1,0 +1,154 @@
+"""EXPERIMENTAL: the neighbour matrix as a JAX primitive (XLA FFI), callable
+inside `jit`, `lax.cond` and `lax.fori_loop`, on the CPU or a CUDA GPU, without
+leaving the device.
+
+    idx, shift, count, overflow = neighbour_matrix(positions, cell, cutoff=6.0,
+                                                   pbc=(True, True, True), max_neighbours=64)
+    D = positions[idx] - positions[:, None] + shift @ cell   # where slot < count
+
+positions [n, 3] and cell [3, 3] (rows: lattice vectors) are float32 or float64
+arrays (the search itself runs in float64); cutoff, pbc and max_neighbours are
+static.  Per-type cutoffs: `types` [n] (int) and `cutoffs` [m, m] (symmetric,
+not squared); `cutoff` is then their largest unless given.  Returns int32 idx
+[n, K], shift [n, K, 3] (cell shifts S: periodic images of any order, so the
+cell may be smaller than the cutoff), count [n] (the true count, which may
+exceed K) and overflow [] (1: some row was clipped; build again with a larger
+K).  Slots past min(count, K) are unspecified: select with the mask, do not
+multiply by it.
+
+`plan` + `neighbour_matrix_planned` (CUDA only) is the device-only build: the
+cell grid and workspace are fixed once on the host, and the build runs on XLA's
+stream with no host synchronisation, so it can sit inside a CUDA graph (e.g. a
+`lax.cond` in a jitted MD loop) at no host round trip.
+
+Needs the handler library `_matscipy_neighbours_xla` (built when CMake is given
+JAX_FFI_INCLUDE_DIR); the CUDA handlers exist only in a CUDA build.
+"""
+import ctypes
+import functools
+import os
+import pathlib
+
+import numpy as np
+
+_TARGET = "matscipy_neighbour_matrix"
+_PLANNED = "matscipy_neighbour_matrix_planned"
+_LIB = {}
+
+
+@functools.cache
+def _register():
+    """Load the handler library and register its targets: the platforms it serves."""
+    import jax
+    here = pathlib.Path(__file__).parent
+    lib_path = os.environ.get("MATSCIPY_NEIGHBOURS_XLA_LIB") or next(
+        (str(p) for p in here.glob("_matscipy_neighbours_xla*.so")), None)
+    if lib_path is None:
+        raise ImportError("matscipy-neighbours was built without the XLA FFI library "
+                          "(_matscipy_neighbours_xla); rebuild with -DJAX_FFI_INCLUDE_DIR=...")
+    lib = ctypes.cdll.LoadLibrary(lib_path)
+    platforms = ["cpu"]
+    jax.ffi.register_ffi_target(_TARGET, jax.ffi.pycapsule(lib.MatscipyNeighbourMatrixCpu), platform="cpu")
+    if hasattr(lib, "MatscipyNeighbourMatrixCuda"):
+        jax.ffi.register_ffi_target(_TARGET, jax.ffi.pycapsule(lib.MatscipyNeighbourMatrixCuda),
+                                    platform="CUDA")
+        platforms.append("cuda")
+    if hasattr(lib, "MatscipyNeighbourMatrixPlannedCuda"):
+        jax.ffi.register_ffi_target(_PLANNED, jax.ffi.pycapsule(lib.MatscipyNeighbourMatrixPlannedCuda),
+                                    platform="CUDA")
+        lib.MatscipyPlanNeighbourMatrix.argtypes = [
+            ctypes.c_int64, ctypes.POINTER(ctypes.c_double), ctypes.c_int64, ctypes.c_double,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.POINTER(ctypes.c_int64)]
+        lib.MatscipyLastError.restype = ctypes.c_char_p
+        _LIB["planned"] = lib
+    return tuple(platforms)
+
+
+def _pbc(pbc):
+    pbc = tuple(bool(b) for b in (pbc if hasattr(pbc, "__len__") else (pbc,) * 3))
+    return pbc, sum(1 << k for k, b in enumerate(pbc) if b)
+
+
+def _inputs(positions, cell, cutoff, types, cutoffs):
+    """(positions, cell, types, cutoffs, cutoff) as the handlers take them: one float
+    dtype, int32 types, and empty per-type inputs for a global cutoff."""
+    import jax.numpy as jnp
+    positions = jnp.asarray(positions)
+    dt = positions.dtype if positions.dtype in (jnp.float32, jnp.float64) else jnp.float64
+    positions, cell = positions.astype(dt), jnp.asarray(cell, dt)
+    if (types is None) != (cutoffs is None):
+        raise ValueError("per-type cutoffs need both `types` and `cutoffs`")
+    if types is None:
+        if cutoff is None:
+            raise ValueError("give `cutoff`, or `types` and `cutoffs`")
+        return positions, cell, jnp.zeros((0,), jnp.int32), jnp.zeros((0, 0), dt), float(cutoff)
+    cutoffs_np = np.asarray(cutoffs, float) if not hasattr(cutoffs, "aval") else None
+    if cutoff is None:
+        if cutoffs_np is None:
+            raise ValueError("traced `cutoffs`: give `cutoff` (the largest), which sizes the grid")
+        cutoff = float(cutoffs_np.max())
+    return positions, cell, jnp.asarray(types, jnp.int32), jnp.asarray(cutoffs, dt), float(cutoff)
+
+
+def neighbour_matrix(positions, cell, cutoff, pbc, max_neighbours, types=None, cutoffs=None):
+    import jax
+    import jax.numpy as jnp
+    _register()
+    n, K = positions.shape[0], int(max_neighbours)
+    positions, cell, types, cutoffs, cutoff = _inputs(positions, cell, cutoff, types, cutoffs)
+    _, mask = _pbc(pbc)
+    i32 = jnp.int32
+    out = (jax.ShapeDtypeStruct((n, K), i32), jax.ShapeDtypeStruct((n, K, 3), i32),
+           jax.ShapeDtypeStruct((n,), i32), jax.ShapeDtypeStruct((), i32))
+    call = jax.ffi.ffi_call(_TARGET, out, vmap_method="sequential")
+    return call(positions, cell, types, cutoffs, cutoff=cutoff, pbc=mask)
+
+
+# ------------------------------------------------------------------ planned (EXPERIMENTAL, CUDA)
+def plan(n_atoms, cell, cutoff, pbc, max_neighbours, ncutoffs=0, dtype=np.float64):
+    """Host-side plan of the device-only build: (n1, n2, n3, hashed, workspace_bytes).
+    The cell grid (and the dense or hashed cell lookup) is fixed from this
+    (reference) `cell` [3, 3] and `cutoff` (the largest, with per-type cutoffs);
+    `ncutoffs` is the per-type matrix's side (0: global cutoff) and `dtype` the
+    positions' (float32 or float64).  Plan again when the cell changes a lot: the
+    build stays correct but scans more or fewer cells than needed."""
+    _register()
+    if "planned" not in _LIB:
+        raise ImportError("this matscipy-neighbours XLA library has no planned (CUDA) build")
+    lib = _LIB["planned"]
+    _, mask = _pbc(pbc)
+    c = np.ascontiguousarray(cell, np.float64)
+    out = (ctypes.c_int64 * 5)()
+    single = int(np.dtype(dtype) == np.float32)
+    rc = lib.MatscipyPlanNeighbourMatrix(int(n_atoms), c.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                                         mask, float(cutoff), int(max_neighbours), int(ncutoffs), single, out)
+    if rc:
+        raise ValueError(lib.MatscipyLastError().decode())
+    return tuple(int(v) for v in out)
+
+
+def neighbour_matrix_planned(positions, cell, cutoff, pbc, max_neighbours, plan, types=None, cutoffs=None):
+    """`neighbour_matrix` (CUDA only) built entirely on XLA's stream: no host
+    synchronisation, allocation or read-back, and declared CUDA-graph compatible,
+    so under jit a rebuild inside `lax.cond` needs no host round trip.  `plan`
+    from `plan(...)` with the same n_atoms, cutoff, pbc, max_neighbours, number of
+    types and dtype.  Returns idx, shift, count and status [2] = (overflow,
+    invalid): non-finite positions, a degenerate cell, a type out of range or a
+    per-type cutoff above `cutoff` set invalid (counts are then 0), where the
+    regular build raises."""
+    import jax
+    import jax.numpy as jnp
+    _register()
+    n, K = positions.shape[0], int(max_neighbours)
+    positions, cell, types, cutoffs, cutoff = _inputs(positions, cell, cutoff, types, cutoffs)
+    n1, n2, n3, hashed, ws = plan
+    _, mask = _pbc(pbc)
+    i32 = jnp.int32
+    out = (jax.ShapeDtypeStruct((n, K), i32), jax.ShapeDtypeStruct((n, K, 3), i32),
+           jax.ShapeDtypeStruct((n,), i32), jax.ShapeDtypeStruct((2,), i32),
+           jax.ShapeDtypeStruct((ws,), jnp.uint8))
+    call = jax.ffi.ffi_call(_PLANNED, out, vmap_method="sequential")
+    idx, shift, count, status, _ = call(positions, cell, types, cutoffs, cutoff=cutoff, pbc=mask,
+                                        n1=np.int64(n1), n2=np.int64(n2), n3=np.int64(n3),
+                                        hashed=np.int64(hashed))
+    return idx, shift, count, status

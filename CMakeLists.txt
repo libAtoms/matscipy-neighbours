@@ -73,6 +73,14 @@ find_package(Python REQUIRED
 add_subdirectory(language_bindings/python)
 
 # ----------------------------------------------------------------------
+# XLA FFI handlers for JAX (optional: needs JAX's FFI headers)
+# ----------------------------------------------------------------------
+set(JAX_FFI_INCLUDE_DIR "" CACHE PATH "jax.ffi.include_dir(); empty: skip the XLA FFI library")
+if(JAX_FFI_INCLUDE_DIR)
+    add_subdirectory(language_bindings/jax)
+endif()
+
+# ----------------------------------------------------------------------
 # Benchmarks
 # ----------------------------------------------------------------------
 option(BUILD_BENCHMARKS "Build the core benchmark executable" ON)
