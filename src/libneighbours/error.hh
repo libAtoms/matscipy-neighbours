@@ -21,14 +21,15 @@ namespace matscipy {
    return NL_ERROR (an internal/runtime failure), NL_INVALID_ARGUMENT (the
    caller passed something unusable) or NL_OUT_OF_MEMORY (an allocation, host
    or GPU, failed); the binding layer turns these into a Python RuntimeError /
-   ValueError / MemoryError. The state is global (protected by the GIL
-   when called from Python) and is cleared at the start of each top-level core
-   call. */
+   ValueError / MemoryError. The state is per thread, so concurrent callers
+   (XLA runs FFI handlers on its own threads, without the GIL) never see each
+   other's messages; a caller reads it on the thread that made the call. It is
+   cleared at the start of each top-level core call. */
 
 constexpr int MAX_ERROR_STRING = 1024;
 
-extern bool has_error;
-extern char error_string[MAX_ERROR_STRING];
+extern thread_local bool has_error;
+extern thread_local char error_string[MAX_ERROR_STRING];
 
 /* Record an error message. Returns NL_ERROR so callers can `return
    set_error(...)`. */
