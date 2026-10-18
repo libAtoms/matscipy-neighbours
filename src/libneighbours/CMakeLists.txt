@@ -21,6 +21,7 @@ set(_gpu_sources
     memory_space_gpu.cc
     device_primitives.cc
     neighbour_list_gpu.cc
+    neighbour_matrix_planned_gpu.cc
     segment_sum_gpu.cc
 )
 if(ENABLE_CUDA)
