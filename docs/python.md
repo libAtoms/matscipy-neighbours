@@ -192,6 +192,33 @@ idx, shift, count, status = xla.neighbour_matrix_planned(positions, cell, 6.0,
                                                          (True, True, True), 96, plan)
 ```
 
+### Many small structures at once
+
+Each build above has a fixed cost per call (a cell grid, a scan, launches),
+which dominates for unit cells and small supercells. Evaluating many of them is
+then limited by the list, not the model. `xla.neighbour_matrix_batched` builds
+the lists of a padded batch of independent structures in one call: one CUDA
+launch (or one OpenMP loop) over every row of the batch.
+
+```python
+# positions [B, N, 3] (padded), cells [B, 3, 3], n_atoms [B] live atoms each
+idx, shift, count, status = xla.neighbour_matrix_batched(positions, cells, 6.0,
+                                                         (True, True, True), 96, n_atoms=n_atoms)
+# idx [B, N, K], shift [B, N, K, 3], count [B, N] (0 on padding rows), status [B, 2]
+```
+
+The search is brute force over the images within the cutoff, O(n^2) per
+structure: right for small cells, wrong for large ones (use the cell-list
+builds). Positions need not lie in the cell, and a cell may be smaller than the
+cutoff. `pbc` is a 3-tuple for all or a `[B, 3]` boolean array; `types` is `[B, N]`.
+`status` is per structure, `(overflow, invalid)`: one bad structure (non-finite
+positions, a degenerate cell) gets no neighbours and leaves the others built.
+
+`jax.vmap` of `neighbour_matrix` or `neighbour_matrix_planned` calls the batched
+build, so a vmapped single-structure program gets it without changes. On an
+RTX 4000 Ada a batch of 1024 64-atom Si cells (cutoff 6 Å) builds in 4 ms
+(3.9 µs a cell), and 1024 2-atom primitive cells in 0.09 ms.
+
 ## GPU memory
 
 The GPU backend allocates from its own caching memory pool: freed buffers stay

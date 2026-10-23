@@ -33,6 +33,7 @@
 
 #include "error.hh"
 #include "neighbour_list_gpu.hh"
+#include "neighbour_matrix_batched.hh"
 #include "neighbour_matrix_planned.hh"
 #include "types.hh"
 
@@ -216,6 +217,48 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(MatscipyNeighbourMatrixPlannedCuda, NeighbourMatri
                                   .Ret<ffi::Buffer<ffi::S32>>()   // count
                                   .Ret<ffi::Buffer<ffi::S32>>()   // status [overflow, invalid]
                                   .Ret<ffi::Buffer<ffi::U8>>(),   // workspace (dropped)
+                              {ffi::Traits::kCmdBufferCompatible});
+
+/* ------------------------------------------------------------------ batched build (EXPERIMENTAL) */
+/* As MatscipyNeighbourMatrixBatchedCpu, enqueued on XLA's stream (three kernels, no host
+   synchronisation): CUDA-graph compatible. A bad n_atoms marks its structure invalid. */
+static ffi::Error NeighbourMatrixBatchedCuda(cudaStream_t stream, ffi::AnyBuffer pos, ffi::AnyBuffer cell,
+                                             ffi::Buffer<ffi::S32> n_atoms, ffi::Buffer<ffi::S32> pbc,
+                                             ffi::Buffer<ffi::S32> types, ffi::AnyBuffer cutoffs,
+                                             double cutoff, ffi::ResultBuffer<ffi::S32> idx,
+                                             ffi::ResultBuffer<ffi::S32> shift,
+                                             ffi::ResultBuffer<ffi::S32> count,
+                                             ffi::ResultBuffer<ffi::S32> status) {
+    const auto od = idx->dimensions();
+    const int64_t B = od[0], N = od[1], K = od[2];
+    int64_t m = 0;
+    if (auto e = check_batched_inputs(pos, cell, n_atoms, pbc, types, cutoffs, B, N, K, m); e.failure())
+        return e;
+    if (matscipy::neighbour_matrix_batched_gpu(B, N, n_atoms.typed_data(), pos.untyped_data(),
+                                               cell.untyped_data(), pos.element_type() == ffi::DataType::F32,
+                                               pbc.typed_data(), cutoff, m > 0 ? types.typed_data() : nullptr,
+                                               m > 0 ? cutoffs.untyped_data() : nullptr, m, K, stream,
+                                               idx->typed_data(), shift->typed_data(), count->typed_data(),
+                                               status->typed_data()) != matscipy::NL_SUCCESS)
+        return ffi::Error(ffi::ErrorCode::kInternal,
+                          std::string("matscipy-neighbours: ") + matscipy::error_string);
+    return ffi::Error::Success();
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(MatscipyNeighbourMatrixBatchedCuda, NeighbourMatrixBatchedCuda,
+                              ffi::Ffi::Bind()
+                                  .Ctx<ffi::PlatformStream<cudaStream_t>>()
+                                  .Arg<ffi::AnyBuffer>()          // positions [B, N, 3]
+                                  .Arg<ffi::AnyBuffer>()          // cell [B, 3, 3]
+                                  .Arg<ffi::Buffer<ffi::S32>>()   // n_atoms [B]
+                                  .Arg<ffi::Buffer<ffi::S32>>()   // pbc [B]
+                                  .Arg<ffi::Buffer<ffi::S32>>()   // types [B, N] (or [0])
+                                  .Arg<ffi::AnyBuffer>()          // cutoffs (or [0, 0])
+                                  .Attr<double>("cutoff")
+                                  .Ret<ffi::Buffer<ffi::S32>>()   // idx [B, N, K]
+                                  .Ret<ffi::Buffer<ffi::S32>>()   // shift [B, N, K, 3]
+                                  .Ret<ffi::Buffer<ffi::S32>>()   // count [B, N]
+                                  .Ret<ffi::Buffer<ffi::S32>>(),  // status [B, 2]
                               {ffi::Traits::kCmdBufferCompatible});
 
 /* Plan on the host (ctypes): out = {n1, n2, n3, hashed, workspace_bytes}. Returns the core's

@@ -35,6 +35,7 @@
 
 #include "error.hh"
 #include "neighbour_list.hh"
+#include "neighbour_matrix_batched.hh"
 
 namespace xla_neighbours {
 
@@ -83,6 +84,34 @@ ffi::Error check_inputs(const ffi::AnyBuffer &pos, const ffi::AnyBuffer &cell,
     if (!none && !some)
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "matscipy-neighbours: per-type cutoffs need types [n] int32 and a square "
+                          "cutoff matrix of the positions' dtype (or both empty)");
+    return ffi::Error::Success();
+}
+
+ffi::Error check_batched_inputs(const ffi::AnyBuffer &pos, const ffi::AnyBuffer &cell,
+                                const ffi::Buffer<ffi::S32> &n_atoms, const ffi::Buffer<ffi::S32> &pbc,
+                                const ffi::Buffer<ffi::S32> &types, const ffi::AnyBuffer &cutoffs,
+                                int64_t B, int64_t N, int64_t K, int64_t &ncutoffs) {
+    auto pd = pos.dimensions(), cd = cell.dimensions(), td = types.dimensions(), md = cutoffs.dimensions();
+    if (pd.size() != 3 || pd[0] != B || pd[1] != N || pd[2] != 3 || cd.size() != 3 || cd[0] != B ||
+        cd[1] != 3 || cd[2] != 3 || n_atoms.element_count() != B || pbc.element_count() != B)
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "matscipy-neighbours: batched inputs must be positions [B, N, 3], cell [B, 3, 3], "
+                          "n_atoms [B] and pbc [B]");
+    const auto dt = pos.element_type();
+    if ((dt != ffi::DataType::F64 && dt != ffi::DataType::F32) || cell.element_type() != dt)
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "matscipy-neighbours: positions and cell must both be float32 or float64");
+    if (K < 1)
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "matscipy-neighbours: max_neighbours must be positive");
+    ncutoffs = md.size() == 2 ? md[0] : 0;
+    const bool none = types.element_count() == 0 && ncutoffs == 0;
+    const bool some = td.size() == 2 && td[0] == B && td[1] == N && md.size() == 2 && md[0] == md[1] &&
+                      ncutoffs > 0 && cutoffs.element_type() == dt;
+    if (!none && !some)
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "matscipy-neighbours: per-type cutoffs need types [B, N] int32 and a square "
                           "cutoff matrix of the positions' dtype (or both empty)");
     return ffi::Error::Success();
 }
@@ -152,3 +181,44 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(MatscipyNeighbourMatrixCpu, NeighbourMatrixCpu,
                                   .Ret<ffi::Buffer<ffi::S32>>()   // shift
                                   .Ret<ffi::Buffer<ffi::S32>>()   // count
                                   .Ret<ffi::Buffer<ffi::S32>>()); // overflow
+
+/* ------------------------------------------------------------------ batched build (EXPERIMENTAL) */
+/* B structures padded to N atoms in one call (neighbour_matrix_batched.hh): positions [B, N, 3],
+   cell [B, 3, 3], n_atoms [B], pbc [B] (bit masks), types [B, N] / cutoffs [m, m] or empty; attr
+   cutoff; outputs idx [B, N, K], shift [B, N, K, 3], count [B, N], status [B, 2] = per structure
+   (overflow, invalid). */
+static ffi::Error NeighbourMatrixBatchedCpu(ffi::AnyBuffer pos, ffi::AnyBuffer cell,
+                                            ffi::Buffer<ffi::S32> n_atoms, ffi::Buffer<ffi::S32> pbc,
+                                            ffi::Buffer<ffi::S32> types, ffi::AnyBuffer cutoffs, double cutoff,
+                                            ffi::ResultBuffer<ffi::S32> idx,
+                                            ffi::ResultBuffer<ffi::S32> shift,
+                                            ffi::ResultBuffer<ffi::S32> count,
+                                            ffi::ResultBuffer<ffi::S32> status) {
+    const auto od = idx->dimensions();
+    const int64_t B = od[0], N = od[1], K = od[2];
+    int64_t m = 0;
+    if (auto e = check_batched_inputs(pos, cell, n_atoms, pbc, types, cutoffs, B, N, K, m); e.failure())
+        return e;
+    if (matscipy::neighbour_matrix_batched(B, N, n_atoms.typed_data(), pos.untyped_data(), cell.untyped_data(),
+                                           pos.element_type() == ffi::DataType::F32, pbc.typed_data(), cutoff,
+                                           m > 0 ? types.typed_data() : nullptr,
+                                           m > 0 ? cutoffs.untyped_data() : nullptr, m, K, idx->typed_data(),
+                                           shift->typed_data(), count->typed_data(),
+                                           status->typed_data()) != matscipy::NL_SUCCESS)
+        return core_error();
+    return ffi::Error::Success();
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(MatscipyNeighbourMatrixBatchedCpu, NeighbourMatrixBatchedCpu,
+                              ffi::Ffi::Bind()
+                                  .Arg<ffi::AnyBuffer>()          // positions [B, N, 3]
+                                  .Arg<ffi::AnyBuffer>()          // cell [B, 3, 3]
+                                  .Arg<ffi::Buffer<ffi::S32>>()   // n_atoms [B]
+                                  .Arg<ffi::Buffer<ffi::S32>>()   // pbc [B]
+                                  .Arg<ffi::Buffer<ffi::S32>>()   // types [B, N] (or [0])
+                                  .Arg<ffi::AnyBuffer>()          // cutoffs (or [0, 0])
+                                  .Attr<double>("cutoff")
+                                  .Ret<ffi::Buffer<ffi::S32>>()   // idx [B, N, K]
+                                  .Ret<ffi::Buffer<ffi::S32>>()   // shift [B, N, K, 3]
+                                  .Ret<ffi::Buffer<ffi::S32>>()   // count [B, N]
+                                  .Ret<ffi::Buffer<ffi::S32>>()); // status [B, 2]

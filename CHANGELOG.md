@@ -17,6 +17,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
   (overflow, invalid input) on the device. Global or per-type cutoffs, float32
   or float64 inputs, int32 outputs. Capturable in a CUDA graph, conditional
   bodies included (kernel nodes only).
+- EXPERIMENTAL batched neighbour matrix (`neighbour_matrix_batched.hh`): the
+  lists of a padded batch of independent small structures in one call
+  (`neighbour_matrix_batched`, OpenMP; `neighbour_matrix_batched_gpu`, three
+  launches on a caller's stream, kernel nodes only). Brute force over the
+  images within the cutoff (only those across planes nearer than the cutoff),
+  any cell and periodicity per structure, global or per-type cutoffs, per-structure
+  status (overflow, invalid).
 - The GPU cell-list build kernels (histogram, scatter, hash table) moved to
   `cell_list_gpu.hh`, shared by the regular and planned builds.
 - The error state (`has_error`, `error_string`) is per thread, so callers on
@@ -30,6 +37,9 @@ project adheres to [Semantic Versioning](https://semver.org/).
   `JAX_FFI_INCLUDE_DIR`), and `plan` + `neighbour_matrix_planned`, the
   device-only CUDA build. `tests/test_xla.py` checks every path against
   `neighbour_list`.
+- EXPERIMENTAL `xla.neighbour_matrix_batched`, and `jax.vmap` of
+  `neighbour_matrix` / `neighbour_matrix_planned` routed to it (`custom_vmap`),
+  so a batch is one build rather than one per structure.
 
 ## [1.1.0] - 2026-10-06
 
