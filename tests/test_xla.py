@@ -166,3 +166,112 @@ def test_planned_build_inside_a_conditional_in_a_loop():
     out = loop(build(R0))
     R_last = np.asarray(R0 + 0.2 * jax.random.normal(jax.random.fold_in(key, 19), R0.shape))
     assert _rows(*out) == _reference(R_last, c, pbc, 6.0)
+
+
+# ------------------------------------------------------------------ batched (EXPERIMENTAL)
+def _batch_structures():
+    """Small cells of mixed size, shape and periodicity: the batched build's use case."""
+    rng = np.random.default_rng(1)
+    a = 5.43
+    prim = np.array([[0, a / 2, a / 2], [a / 2, 0, a / 2], [a / 2, a / 2, 0]])
+    out = [(np.array([[0, 0, 0], [a / 4] * 3]), prim, (True, True, True))]          # 2 atoms, cell << cutoff
+    r, c = _diamond((1, 1, 1))
+    out.append((r, c, (True, True, True)))                                          # 8 atoms
+    r, c = _diamond((2, 1, 1))
+    c = c + np.array([[0, 0, 0], [1.5, 0, 0], [0.7, 1.1, 0]])                       # sheared, 16 atoms
+    r = r @ np.linalg.solve(np.diag([2 * a, a, a]), c)
+    out.append((r, c, (True, True, True)))
+    r, c = _diamond((2, 2, 1))
+    c[2, 2] += 10.0                                                                 # slab, 32 atoms
+    out.append((r + [0, 0, 5.0], c, (True, True, False)))
+    r, c = _diamond((2, 2, 2))
+    out.append((r + 3 * c[0] - 2 * c[2], c, (True, True, True)))                    # unwrapped positions
+    return [(r + rng.normal(0, 0.05, r.shape), c, p) for r, c, p in out]
+
+
+BATCH = _batch_structures()
+
+
+def _pad(structs, dtype):
+    N = max(len(r) for r, _, _ in structs)
+    R = np.zeros((len(structs), N, 3))
+    for b, (r, _, _) in enumerate(structs):
+        R[b, :len(r)] = r
+    C = np.stack([c for _, c, _ in structs])
+    P = np.array([p for _, _, p in structs])
+    n = np.array([len(r) for r, _, _ in structs], np.int32)
+    return jnp.asarray(R, dtype), jnp.asarray(C, dtype), P, n
+
+
+def _batched_rows(idx, shift, count, b):
+    return _rows(np.asarray(idx)[b], np.asarray(shift)[b], np.asarray(count)[b])
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("per_type", [False, True])
+@pytest.mark.parametrize("dtype", ["float64", "float32"])
+def test_batched_build_matches_the_pair_list_per_structure(device, per_type, dtype):
+    """One build for a padded batch of mixed small cells (2-atom primitive Si below the cutoff, sheared,
+    a slab, unwrapped positions; mixed periodicity): each structure's rows are exactly neighbour_list's."""
+    with jax.default_device(jax.devices("gpu" if device == "cuda" else "cpu")[0]):
+        R, C, P, n = _pad(BATCH, dtype)
+        types = None
+        kw = {}
+        if per_type:
+            types = np.stack([np.pad(_types(len(r)), (0, R.shape[1] - len(r))) for r, _, _ in BATCH])
+            kw = dict(types=types, cutoffs=TYPE_CUTOFFS)
+        f = jax.jit(lambda R, C: xla.neighbour_matrix_batched(R, C, None if per_type else 6.0, P, 160,
+                                                              n_atoms=n, **kw))
+        idx, shift, count, status = f(R, C)
+    assert np.asarray(status).tolist() == [[0, 0]] * len(BATCH)
+    for b, (r, c, pbc) in enumerate(BATCH):
+        nb = len(r)
+        assert np.all(np.asarray(count)[b, nb:] == 0)                  # padding rows have no neighbours
+        r_ref, c_ref = np.asarray(R[b, :nb], float), np.asarray(C[b], float)
+        t = types[b, :nb] if per_type else None
+        assert _batched_rows(idx, shift, count, b) == _reference(r_ref, c_ref, pbc, 6.0, t), b
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_batched_build_flags_overflow_and_invalid_per_structure(device):
+    """Status is per structure: a clipped row flags only its structure; a NaN position, a degenerate cell
+    or a bad n_atoms invalidates only its own (counts 0), the others are still built."""
+    with jax.default_device(jax.devices("gpu" if device == "cuda" else "cpu")[0]):
+        R, C, P, n = _pad(BATCH[:3], "float64")
+        R = R.at[1, 0, 0].set(jnp.nan)                                 # structure 1: a NaN position
+        C = C.at[2].set(jnp.zeros((3, 3)))                             # structure 2: a degenerate cell
+        idx, shift, count, status = xla.neighbour_matrix_batched(R, C, 6.0, P, 160, n_atoms=n)
+        assert np.asarray(status).tolist() == [[0, 0], [0, 1], [0, 1]]
+        assert np.all(np.asarray(count)[1:] == 0)
+        _, _, count, status = xla.neighbour_matrix_batched(R[:1], C[:1], 6.0, P[:1], 4, n_atoms=n[:1])
+        assert np.asarray(status).tolist() == [[1, 0]] and int(np.asarray(count).max()) > 4
+    if device == "cuda":                                               # the host build refuses it instead
+        with jax.default_device(jax.devices("gpu")[0]):
+            _, _, _, status = xla.neighbour_matrix_batched(R[:1], C[:1], 6.0, P[:1], 160,
+                                                           n_atoms=np.array([99], np.int32))
+        assert np.asarray(status).tolist() == [[0, 1]]
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_vmap_of_neighbour_matrix_is_one_batched_build(device):
+    """jax.vmap of neighbour_matrix (and, on CUDA, of the planned build) routes to the batched handler --
+    one custom call for the batch, not B -- with each structure's rows exactly as built alone."""
+    structs = [s for s in BATCH if s[2] == (True, True, True) and len(s[0]) == 8] * 3
+    with jax.default_device(jax.devices("gpu" if device == "cuda" else "cpu")[0]):
+        R = jnp.asarray(np.stack([r + 0.01 * k for k, (r, _, _) in enumerate(structs)]))
+        C = jnp.asarray(np.stack([c for _, c, _ in structs]))
+        f = jax.jit(jax.vmap(lambda r, c: xla.neighbour_matrix(r, c, 6.0, (True,) * 3, 160)))
+        hlo = f.lower(R, C).as_text()
+        assert xla._BATCHED in hlo and hlo.count("custom_call_target=\"" + xla._TARGET + "\"") == 0
+        idx, shift, count, ov = f(R, C)
+        assert np.asarray(ov).tolist() == [0] * len(structs)
+        for b in range(len(structs)):
+            alone = xla.neighbour_matrix(R[b], C[b], 6.0, (True,) * 3, 160)
+            assert _batched_rows(idx, shift, count, b) == _rows(*alone[:3])
+        if device == "cuda" and PLANNED:
+            P = xla.plan(8, np.asarray(C[0]), 6.0, (True,) * 3, 160)
+            g = jax.jit(jax.vmap(lambda r, c: xla.neighbour_matrix_planned(r, c, 6.0, (True,) * 3, 160, P)))
+            idx2, shift2, count2, status2 = g(R, C)
+            assert np.asarray(status2).tolist() == [[0, 0]] * len(structs)
+            for b in range(len(structs)):
+                assert _batched_rows(idx2, shift2, count2, b) == _batched_rows(idx, shift, count, b)
