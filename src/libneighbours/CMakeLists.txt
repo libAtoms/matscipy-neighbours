@@ -8,6 +8,7 @@ add_library(neighbours STATIC
     memory_space.cc
     cell_list.cc
     neighbour_list.cc
+    neighbour_matrix_batched.cc
     first_neighbours.cc
     segment_sum.cc
     triplet_list.cc
@@ -22,6 +23,7 @@ set(_gpu_sources
     device_primitives.cc
     neighbour_list_gpu.cc
     neighbour_matrix_planned_gpu.cc
+    neighbour_matrix_batched_gpu.cc
     segment_sum_gpu.cc
 )
 if(ENABLE_CUDA)

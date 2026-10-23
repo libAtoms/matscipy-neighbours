@@ -30,6 +30,14 @@ ffi::Error check_inputs(const ffi::AnyBuffer &pos, const ffi::AnyBuffer &cell,
                         const ffi::Buffer<ffi::S32> &types, const ffi::AnyBuffer &cutoffs,
                         int64_t n, int64_t K, int64_t &ncutoffs);
 
+/* The batched build's inputs: positions [B, N, 3], cell [B, 3, 3], n_atoms [B]
+   and pbc [B] int32, per-type types [B, N] and cutoffs [m, m] or both empty;
+   B, N from the outputs (count [B, N]). */
+ffi::Error check_batched_inputs(const ffi::AnyBuffer &pos, const ffi::AnyBuffer &cell,
+                                const ffi::Buffer<ffi::S32> &n_atoms, const ffi::Buffer<ffi::S32> &pbc,
+                                const ffi::Buffer<ffi::S32> &types, const ffi::AnyBuffer &cutoffs,
+                                int64_t B, int64_t N, int64_t K, int64_t &ncutoffs);
+
 /* A host float32 or float64 buffer as doubles. */
 void to_double(const ffi::AnyBuffer &b, std::vector<double> &out);
 
