@@ -1,0 +1,85 @@
+name: GPU simulator
+
+# Optional, non-required check. The hosted runners have no GPU, so the GPU
+# GoogleTest binaries (test_neighbour_list_gpu and test_memory_space) are built
+# with nvcc and run on a simulated NVIDIA H100
+# (https://github.com/pantheongpu/pantheonsim). gpu-compile.yml only compiles
+# them; the tests skip themselves when no device is present, so this job also
+# fails if any test is skipped. A simulator cannot reproduce hardware-specific
+# behavior or timing, so it complements real-GPU testing and does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/libneighbours/**"
+      - "tests/test_neighbour_list_gpu.cc"
+      - "tests/test_memory_space.cc"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: gpu-sim-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gtest-gpu:
+    name: CUDA 13.0 and simulated H100
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@ca87fe3143b29166822b923d6050945c5179408c # v0.1.5
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        # The top-level CMakeLists.txt needs NumPy to configure, even though
+        # only the C++ test binaries are built and run here.
+        run: python -m pip install --upgrade pip numpy
+
+      - name: Configure (CUDA enabled)
+        # 90-virtual embeds PTX only, which is what the simulator runs (the
+        # project default list ends in "native", which needs a present GPU).
+        # The simulator needs a shared CUDA runtime.
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc
+          -DENABLE_CUDA=ON
+          -DCMAKE_CUDA_ARCHITECTURES=90-virtual
+          -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared
+          -DBUILD_BENCHMARKS=OFF
+          -DBUILD_EXAMPLES=OFF
+          -DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST
+          -DPython_EXECUTABLE="$(which python)"
+
+      - name: Build
+        run: cmake --build build -j3 --target test_neighbour_list_gpu test_memory_space
+
+      - name: Test
+        # The binaries are run directly so that a GTEST_SKIP (no device found)
+        # is visible: ctest would count a skipped test as passed.
+        run: |
+          set -o pipefail
+          for t in test_neighbour_list_gpu test_memory_space; do
+            vgpu run --gpu nvidia/h100 ./build/$t 2>&1 | tee "$t.log"
+            if grep -q "SKIPPED" "$t.log"; then
+              echo "::error::$t skipped tests, the simulated device was not used"
+              exit 1
+            fi
+          done
